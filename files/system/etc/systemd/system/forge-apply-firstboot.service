@@ -1,0 +1,14 @@
+[Unit]
+Description=Apply Forge OS settings on first boot
+After=network-online.target NetworkManager.service firewalld.service
+Wants=network-online.target
+ConditionPathExists=!/etc/forge/.applied
+
+[Service]
+Type=oneshot
+ExecStartPre=/usr/bin/mkdir -p /etc/forge
+ExecStart=/usr/libexec/forge-apply
+ExecStartPost=/usr/bin/touch /etc/forge/.applied
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# forge-mode: switch the whole PC between workloads with one command.
+#   forge-mode gaming | agents | creative | quiet | status
+# What each mode does is set in Forge Settings (Performance modes).
+set -uo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/forge"
+mkdir -p "$STATE_DIR"
+cfg() { forge-config get "$1"; }
+
+mode="${1:-status}"
+case "$mode" in
+  gaming|agents|creative|quiet) ;;
+  status) echo "mode: $(cat "$STATE_DIR/mode" 2>/dev/null || echo default)"; exit 0 ;;
+  *) sed -n '2,4p' "$0"; exit 1 ;;
+esac
+
+if [ "$(cfg "modes.$mode.unload_models")" = "on" ] && command -v ollama >/dev/null; then
+  ollama ps 2>/dev/null | awk 'NR>1 {print $1}' | while read -r m; do ollama stop "$m"; done
+fi
+
+pkexec systemctl set-property --runtime agents.slice \
+  CPUWeight="$(cfg "modes.$mode.cpu_weight")" \
+  MemoryHigh="$(cfg "modes.$mode.memory_high_gb")G"
+
+powerprofilesctl set "$(cfg "modes.$mode.power")" 2>/dev/null \
+  || echo "note: power profile not available"
+
+echo "$mode" > "$STATE_DIR/mode"
+echo "$(date -Is) mode=$mode" >> "$STATE_DIR/activity.log"
+echo "Switched to $mode mode."

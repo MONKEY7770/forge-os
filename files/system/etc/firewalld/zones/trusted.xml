@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Only your own Tailscale devices are trusted. Remote access (Sunshine,
+     RustDesk, Ollama) is reached through Tailscale, not opened to the network. -->
+<zone target="ACCEPT">
+  <short>Trusted</short>
+  <description>Your own devices on Tailscale.</description>
+  <interface name="tailscale0"/>
+</zone>

@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""forge-config: change any Forge OS setting from the terminal.
+
+  forge-config list [TAG]      show settings (optionally only one tag)
+  forge-config tags            show all tags
+  forge-config get KEY         print one value
+  forge-config set KEY VALUE   change a setting and apply it
+  forge-config reset [KEY]     back to default (one setting, or all)
+  forge-config undo            restore the settings from before the last save
+  forge-config file            print where your settings file is
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, "/usr/lib/forge")
+import forgecfg  # noqa: E402
+
+APPLY = os.environ.get("FORGE_APPLY", "/usr/libexec/forge-apply")
+
+
+def fmt(v):
+    return "on" if v is True else "off" if v is False else str(v)
+
+
+def save(new_values):
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(new_values, f)
+        tmp = f.name
+    os.chmod(tmp, 0o644)
+    cmd = [APPLY, "--import", tmp]
+    if os.geteuid() != 0:
+        cmd = ["pkexec"] + cmd
+    r = subprocess.run(cmd)
+    os.unlink(tmp)
+    return r.returncode
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    schema = forgecfg.load_schema()
+    defs = forgecfg.settings_by_key(schema)
+    vals = forgecfg.values(schema)
+    cmd = a[0]
+
+    if cmd == "list":
+        tag = a[1] if len(a) > 1 else None
+        for k, s in defs.items():
+            if tag and tag not in s["tags"]:
+                continue
+            mark = "*" if vals[k] != s["default"] else " "
+            print(f"{mark} {k:34} {fmt(vals[k]):22} [{', '.join(s['tags'])}]")
+        print("\n* = changed from default")
+        return 0
+    if cmd == "tags":
+        print("\n".join(sorted({t for s in defs.values() for t in s["tags"]})))
+        return 0
+    if cmd == "get" and len(a) == 2:
+        if a[1] not in vals:
+            print(f"Unknown setting: {a[1]}", file=sys.stderr)
+            return 1
+        print(fmt(vals[a[1]]))
+        return 0
+    if cmd == "set" and len(a) == 3:
+        if a[1] not in defs:
+            print(f"Unknown setting: {a[1]}", file=sys.stderr)
+            return 1
+        try:
+            vals[a[1]] = forgecfg.coerce(defs[a[1]], a[2])
+        except ValueError as e:
+            print(e, file=sys.stderr)
+            return 1
+        return save(vals)
+    if cmd == "reset":
+        if len(a) == 2:
+            if a[1] not in defs:
+                print(f"Unknown setting: {a[1]}", file=sys.stderr)
+                return 1
+            vals[a[1]] = defs[a[1]]["default"]
+        else:
+            vals = {k: s["default"] for k, s in defs.items()}
+        return save(vals)
+    if cmd == "undo":
+        bak = forgecfg.OVERRIDES_PATH + ".bak"
+        if not os.path.exists(bak):
+            print("Nothing to undo.")
+            return 0
+        with open(bak) as f:
+            return save(forgecfg.values(schema, json.load(f)))
+    if cmd == "file":
+        print(forgecfg.OVERRIDES_PATH)
+        return 0
+    print(__doc__.strip())
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

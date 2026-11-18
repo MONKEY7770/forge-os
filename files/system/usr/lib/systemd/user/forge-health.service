@@ -1,0 +1,7 @@
+[Unit]
+Description=Forge OS health check
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/forge-health
+Nice=19

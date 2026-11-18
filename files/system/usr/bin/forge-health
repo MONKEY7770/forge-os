@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# forge-health: quick self check, run by a timer (interval set in Forge Settings).
+# Writes to ~/.local/state/forge/health.log and shows a desktop
+# notification only when something needs attention.
+set -uo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/forge"
+LOG="$STATE_DIR/health.log"
+mkdir -p "$STATE_DIR"
+cfg() { forge-config get "$1"; }
+
+GPU_WARN=$(cfg monitor.gpu_temp_warn)
+DISK_WARN=$(cfg monitor.disk_warn_pct)
+MEM_WARN=$(cfg monitor.mem_warn_gb)
+problems=()
+
+# Failed system services
+failed=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' | xargs)
+[ -n "$failed" ] && problems+=("Failed services: $failed")
+
+# Disk space
+while read -r use mount; do
+  [ "${use%\%}" -ge "$DISK_WARN" ] && problems+=("Disk $mount is $use full")
+done < <(df -h --output=pcent,target -x tmpfs -x devtmpfs -x overlay 2>/dev/null | tail -n +2)
+
+# GPU temperature and VRAM
+if command -v nvidia-smi >/dev/null; then
+  read -r temp used total < <(nvidia-smi --query-gpu=temperature.gpu,memory.used,memory.total \
+    --format=csv,noheader,nounits 2>/dev/null | tr -d ',')
+  [ -n "${temp:-}" ] && [ "$temp" -ge "$GPU_WARN" ] && problems+=("GPU is hot: ${temp}C")
+  gpu_line="gpu=${temp:-?}C vram=${used:-?}/${total:-?}MB"
+fi
+
+# Memory
+mem_avail=$(awk '/MemAvailable/ {print int($2/1024/1024)}' /proc/meminfo)
+[ "$mem_avail" -lt "$MEM_WARN" ] && problems+=("Low memory: ${mem_avail} GB free")
+
+# Ollama (only if it's turned on)
+if [ "$(cfg ai.ollama)" = "on" ] && [ "$(cfg monitor.check_ollama)" = "on" ]; then
+  systemctl is-active --quiet ollama || problems+=("Ollama is not running")
+fi
+
+# Log every run, notify only on problems
+if [ ${#problems[@]} -eq 0 ]; then
+  echo "$(date -Is) ok ${gpu_line:-} mem_free=${mem_avail}G" >> "$LOG"
+else
+  msg=$(printf '%s\n' "${problems[@]}")
+  echo "$(date -Is) PROBLEM ${msg//$'\n'/; }" >> "$LOG"
+  if [ "$(cfg monitor.notify)" = "on" ] && command -v notify-send >/dev/null; then
+    notify-send -u critical "Forge OS health" "$msg"
+  fi
+fi
+
+# Keep the log small
+tail -n 5000 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"

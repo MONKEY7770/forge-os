@@ -1,0 +1,12 @@
+# Resource group for AI agents and local models.
+# Agents can use most of the machine, but games and the desktop always win
+# when there is a fight for CPU or memory.
+[Unit]
+Description=AI agents and local models
+
+[Slice]
+CPUWeight=50
+IOWeight=50
+# 64 GB RAM: agents slow down past 40 GB and are hard-capped at 48 GB.
+MemoryHigh=40G
+MemoryMax=48G

@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""Forge Settings: one place to see and change every Forge OS option.
+
+Opens a local page in your browser. It only listens on this PC
+(127.0.0.1) and needs a secret token, so no other device or website
+can use it. It closes itself a couple of minutes after you close the tab.
+"""
+import json
+import os
+import secrets
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+sys.path.insert(0, os.environ.get("FORGE_LIB", "/usr/lib/forge"))
+import forgecfg  # noqa: E402
+
+APPLY = os.environ.get("FORGE_APPLY", "/usr/libexec/forge-apply")
+TOKEN = secrets.token_urlsafe(24)
+last_seen = time.time()
+
+
+def run_apply(args):
+    cmd = [APPLY] + args
+    if os.geteuid() != 0:
+        cmd = ["pkexec"] + cmd
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode == 126 or r.returncode == 127 and "pkexec" in cmd:
+        return False, "Cancelled: password was not entered."
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def save(values):
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(values, f)
+        tmp = f.name
+    os.chmod(tmp, 0o644)
+    try:
+        return run_apply(["--import", tmp])
+    finally:
+        os.unlink(tmp)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def send(self, code, body, ctype="application/json"):
+        data = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def authed(self):
+        return secrets.compare_digest(self.headers.get("X-Forge-Token", ""), TOKEN)
+
+    def do_GET(self):
+        global last_seen
+        last_seen = time.time()
+        if self.path.split("?")[0] == "/":
+            self.send(200, PAGE.replace("__TOKEN__", TOKEN), "text/html; charset=utf-8")
+        elif self.path == "/api/settings" and self.authed():
+            schema = forgecfg.load_schema()
+            self.send(200, json.dumps({
+                "schema": schema,
+                "values": forgecfg.values(schema),
+                "file": forgecfg.OVERRIDES_PATH,
+                "can_undo": os.path.exists(forgecfg.OVERRIDES_PATH + ".bak"),
+            }))
+        elif self.path == "/api/ping" and self.authed():
+            self.send(200, "{}")
+        else:
+            self.send(404, "{}")
+
+    def do_POST(self):
+        global last_seen
+        last_seen = time.time()
+        if not self.authed():
+            return self.send(403, "{}")
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        if self.path == "/api/save":
+            schema = forgecfg.load_schema()
+            clean, errors = forgecfg.validate(body.get("values", {}), schema)
+            if errors:
+                return self.send(200, json.dumps({"ok": False, "output": "\n".join(errors)}))
+            ok, out = save(clean)
+            self.send(200, json.dumps({"ok": ok, "output": out}))
+        elif self.path == "/api/undo":
+            bak = forgecfg.OVERRIDES_PATH + ".bak"
+            if not os.path.exists(bak):
+                return self.send(200, json.dumps({"ok": False, "output": "Nothing to undo."}))
+            with open(bak) as f:
+                ok, out = save(forgecfg.values(None, json.load(f)))
+            self.send(200, json.dumps({"ok": ok, "output": out}))
+        else:
+            self.send(404, "{}")
+
+
+def watchdog(server):
+    while True:
+        time.sleep(15)
+        if time.time() - last_seen > 120:
+            server.shutdown()
+            return
+
+
+def main():
+    server = ThreadingHTTPServer(("127.0.0.1", int(os.environ.get("FORGE_PORT", "0"))), Handler)
+    url = f"http://127.0.0.1:{server.server_address[1]}/"
+    print(f"Forge Settings: {url}")
+    threading.Thread(target=watchdog, args=(server,), daemon=True).start()
+    if not os.environ.get("FORGE_NO_BROWSER"):
+        subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    server.serve_forever()
+
+
+PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Forge Settings</title>
+<style>
+:root {
+  --bg: #f6f6f4; --panel: #ffffff; --text: #1c1c1e; --muted: #6b6b70; --line: #e4e4e0;
+  --accent: #d9622b; --accent-soft: #fbe9e0; --ok: #2f8f5b; --bad: #c0392b;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #141416; --panel: #1d1d20; --text: #ececee; --muted: #9a9aa2; --line: #2c2c31;
+          --accent: #ff7a3d; --accent-soft: #3a2418; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+       font: 14px/1.45 system-ui, "Noto Sans", "Noto Sans Thai", sans-serif; }
+header { position: sticky; top: 0; z-index: 2; background: var(--bg); border-bottom: 1px solid var(--line);
+         padding: 16px 24px 12px; }
+.top { display: flex; align-items: center; gap: 16px; max-width: 1100px; margin: 0 auto; }
+h1 { font-size: 18px; margin: 0; letter-spacing: .2px; white-space: nowrap; }
+h1 span { color: var(--accent); }
+#search { flex: 1; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px;
+          background: var(--panel); color: var(--text); font: inherit; }
+#search:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.tags { display: flex; flex-wrap: wrap; gap: 6px; max-width: 1100px; margin: 10px auto 0; }
+.chip { border: 1px solid var(--line); background: var(--panel); color: var(--muted); border-radius: 999px;
+        padding: 3px 10px; font-size: 12px; cursor: pointer; }
+.chip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.wrap { display: grid; grid-template-columns: 200px 1fr; gap: 24px; max-width: 1100px; margin: 0 auto; padding: 20px 24px 120px; }
+nav { position: sticky; top: 120px; align-self: start; display: flex; flex-direction: column; gap: 2px; }
+nav a { color: var(--muted); text-decoration: none; padding: 6px 10px; border-radius: 6px; }
+nav a:hover { background: var(--panel); color: var(--text); }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; margin-bottom: 18px; overflow: hidden; }
+section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted);
+             margin: 0; padding: 14px 18px 10px; }
+.row { display: grid; grid-template-columns: 1fr auto; gap: 16px; align-items: center;
+       padding: 12px 18px; border-top: 1px solid var(--line); }
+.label { font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); display: none; }
+.row.changed .dot { display: inline-block; }
+.help { color: var(--muted); font-size: 13px; margin-top: 2px; }
+.rtags { margin-top: 5px; display: flex; gap: 4px; flex-wrap: wrap; }
+.rtags span { font-size: 11px; color: var(--muted); background: var(--bg); border-radius: 4px; padding: 1px 6px; cursor: pointer; }
+.ctl { display: flex; align-items: center; gap: 8px; }
+.reset { border: none; background: none; color: var(--muted); cursor: pointer; font-size: 12px; visibility: hidden; }
+.row.custom .reset { visibility: visible; }
+.reset:hover { color: var(--accent); }
+input[type=number], input[type=text], select { padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg); color: var(--text); font: inherit; }
+input[type=number] { width: 90px; }
+input[type=text] { width: 260px; }
+.switch { position: relative; width: 40px; height: 22px; display: inline-block; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.slider { position: absolute; inset: 0; background: var(--line); border-radius: 22px; cursor: pointer; transition: .15s; }
+.slider:before { content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px;
+                 background: #fff; border-radius: 50%; transition: .15s; }
+.switch input:checked + .slider { background: var(--accent); }
+.switch input:checked + .slider:before { transform: translateX(18px); }
+.switch input:focus-visible + .slider { outline: 2px solid var(--accent); outline-offset: 2px; }
+.bar { position: fixed; left: 0; right: 0; bottom: 0; background: var(--panel); border-top: 1px solid var(--line);
+       padding: 12px 24px; display: flex; justify-content: center; }
+.bar .in { max-width: 1100px; width: 100%; display: flex; align-items: center; gap: 12px; }
+.bar .count { flex: 1; color: var(--muted); }
+button.btn { font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line);
+             background: var(--bg); color: var(--text); cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+button:disabled { opacity: .45; cursor: default; }
+#out { white-space: pre-wrap; font: 12px/1.4 ui-monospace, monospace; background: var(--bg); border-radius: 8px;
+       padding: 10px 12px; margin: 0 24px 12px; max-width: 1052px; display: none; }
+#out.ok { border-left: 3px solid var(--ok); } #out.bad { border-left: 3px solid var(--bad); }
+.empty { color: var(--muted); padding: 30px; text-align: center; display: none; }
+.file { color: var(--muted); font-size: 12px; }
+code { font-size: 12px; }
+@media (max-width: 760px) { .wrap { grid-template-columns: 1fr; } nav { display: none; }
+  .row { grid-template-columns: 1fr; } input[type=text] { width: 100%; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="top">
+    <h1>Forge <span>Settings</span></h1>
+    <input id="search" placeholder="Search settings, or type a tag like gaming, privacy, vram" autocomplete="off">
+  </div>
+  <div class="tags" id="tags"></div>
+</header>
+<div class="wrap">
+  <nav id="nav"></nav>
+  <main id="main"><div class="empty" id="empty">No settings match.</div></main>
+</div>
+<div class="bar"><div class="in" style="flex-direction:column;align-items:stretch">
+  <pre id="out"></pre>
+  <div style="display:flex;align-items:center;gap:12px">
+    <span class="count" id="count">No unsaved changes. <span class="file" id="file"></span></span>
+    <button class="btn" id="undo" title="Restore the settings from before your last save">Undo last save</button>
+    <button class="btn" id="discard" disabled>Discard</button>
+    <button class="btn primary" id="save" disabled>Save and apply</button>
+  </div>
+</div></div>
+<script>
+const TOKEN = "__TOKEN__";
+const H = {"X-Forge-Token": TOKEN, "Content-Type": "application/json"};
+let schema, saved, current, activeTags = new Set();
+
+const $ = s => document.querySelector(s);
+const el = (tag, attrs = {}, kids = []) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) k === "text" ? e.textContent = v : e.setAttribute(k, v);
+  kids.forEach(k => e.append(k)); return e;
+};
+
+async function load() {
+  const r = await fetch("/api/settings", {headers: H});
+  const d = await r.json();
+  schema = d.schema; saved = {...d.values}; current = {...d.values};
+  $("#file").textContent = "Your settings file: " + d.file;
+  $("#undo").disabled = !d.can_undo;
+  render();
+}
+
+function control(s) {
+  const v = current[s.key];
+  let input;
+  if (s.type === "toggle") {
+    input = el("input", {type: "checkbox", "aria-label": s.label});
+    input.checked = v;
+    input.onchange = () => set(s.key, input.checked);
+    return el("label", {class: "switch"}, [input, el("span", {class: "slider"})]);
+  }
+  if (s.type === "select") {
+    input = el("select", {"aria-label": s.label});
+    s.options.forEach(o => { const op = el("option", {value: o, text: o}); if (o === v) op.selected = true; input.append(op); });
+    input.onchange = () => set(s.key, input.value);
+    return input;
+  }
+  input = el("input", {type: s.type === "number" ? "number" : "text", "aria-label": s.label});
+  if (s.min !== undefined) input.min = s.min;
+  if (s.max !== undefined) input.max = s.max;
+  input.value = v;
+  input.oninput = () => set(s.key, s.type === "number" ? Number(input.value) : input.value);
+  return input;
+}
+
+function render() {
+  const main = $("#main"), nav = $("#nav");
+  main.querySelectorAll("section").forEach(x => x.remove()); nav.innerHTML = "";
+  const tags = [...new Set(schema.settings.flatMap(s => s.tags))].sort();
+  const tagBox = $("#tags"); tagBox.innerHTML = "";
+  tags.forEach(t => {
+    const c = el("button", {class: "chip" + (activeTags.has(t) ? " on" : ""), text: t});
+    c.onclick = () => { activeTags.has(t) ? activeTags.delete(t) : activeTags.add(t); render(); };
+    tagBox.append(c);
+  });
+  const q = $("#search").value.trim().toLowerCase();
+  let shown = 0;
+  schema.groups.forEach(g => {
+    const items = schema.settings.filter(s => s.group === g.id).filter(s => {
+      const hay = (s.label + " " + s.help + " " + s.key + " " + s.tags.join(" ")).toLowerCase();
+      return (!q || hay.includes(q)) && [...activeTags].every(t => s.tags.includes(t));
+    });
+    if (!items.length) return;
+    shown += items.length;
+    const sec = el("section", {id: "g-" + g.id}, [el("h2", {text: g.label})]);
+    items.forEach(s => {
+      const changed = JSON.stringify(current[s.key]) !== JSON.stringify(saved[s.key]);
+      const custom = JSON.stringify(current[s.key]) !== JSON.stringify(s.default);
+      const reset = el("button", {class: "reset", title: "Back to default: " + fmt(s.default), text: "Reset"});
+      reset.onclick = () => set(s.key, s.default, true);
+      const rtags = el("div", {class: "rtags"}, s.tags.map(t => {
+        const sp = el("span", {text: "#" + t}); sp.onclick = () => { activeTags.add(t); render(); }; return sp; }));
+      const info = el("div", {}, [el("div", {class: "label"}, [el("span", {class: "dot"}), el("span", {text: s.label})])]);
+      if (s.help) info.append(el("div", {class: "help", text: s.help}));
+      info.append(rtags);
+      sec.append(el("div", {class: "row" + (changed ? " changed" : "") + (custom ? " custom" : "")},
+                    [info, el("div", {class: "ctl"}, [reset, control(s)])]));
+    });
+    main.append(sec);
+    nav.append(el("a", {href: "#g-" + g.id, text: g.label}));
+  });
+  $("#empty").style.display = shown ? "none" : "block";
+  updateBar();
+}
+
+const fmt = v => v === true ? "on" : v === false ? "off" : String(v);
+
+function set(key, value, rerender) {
+  current[key] = value;
+  if (rerender) return render();
+  const s = schema.settings.find(x => x.key === key);
+  // update just this row's markers so typing isn't interrupted
+  document.querySelectorAll(".row").forEach(r => {
+    if (r.querySelector("[aria-label]")?.getAttribute("aria-label") === s.label) {
+      r.classList.toggle("changed", JSON.stringify(value) !== JSON.stringify(saved[key]));
+      r.classList.toggle("custom", JSON.stringify(value) !== JSON.stringify(s.default));
+    }
+  });
+  updateBar();
+}
+
+function changes() { return Object.keys(current).filter(k => JSON.stringify(current[k]) !== JSON.stringify(saved[k])); }
+
+function updateBar() {
+  const n = changes().length;
+  $("#save").disabled = $("#discard").disabled = n === 0;
+  $("#count").firstChild.textContent = n ? n + " unsaved change" + (n > 1 ? "s" : "") + ". " : "No unsaved changes. ";
+}
+
+function show(ok, text) {
+  const o = $("#out"); o.style.display = "block"; o.className = ok ? "ok" : "bad";
+  o.textContent = (ok ? "Saved and applied.\n" : "Not applied.\n") + (text || "");
+}
+
+async function post(path, body) {
+  $("#save").disabled = true; $("#save").textContent = "Applying...";
+  try {
+    const r = await fetch(path, {method: "POST", headers: H, body: JSON.stringify(body || {})});
+    const d = await r.json(); show(d.ok, d.output); if (d.ok) await load(); else updateBar();
+  } catch (e) { show(false, String(e)); }
+  $("#save").textContent = "Save and apply";
+}
+
+$("#save").onclick = () => post("/api/save", {values: current});
+$("#undo").onclick = () => post("/api/undo");
+$("#discard").onclick = () => { current = {...saved}; render(); };
+$("#search").oninput = render;
+setInterval(() => fetch("/api/ping", {headers: H}), 30000);
+window.onbeforeunload = e => { if (changes().length) e.preventDefault(); };
+load();
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    main()

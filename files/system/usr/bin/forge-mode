@@ -21,7 +21,7 @@ fi
 
 pkexec systemctl set-property --runtime agents.slice \
   CPUWeight="$(cfg "modes.$mode.cpu_weight")" \
-  MemoryHigh="$(cfg "modes.$mode.memory_high_gb")G"
+  MemoryHigh="$(cfg "modes.$mode.memory_high_pct")%"
 
 powerprofilesctl set "$(cfg "modes.$mode.power")" 2>/dev/null \
   || echo "note: power profile not available"

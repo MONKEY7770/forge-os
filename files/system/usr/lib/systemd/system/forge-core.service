@@ -1,0 +1,27 @@
+[Unit]
+Description=Forge Core API (settings, monitoring, AI models)
+After=network.target ollama.service
+
+[Service]
+User=forge
+Group=forge
+# Runs as root once before start, to create the API token if it's missing.
+ExecStartPre=+/usr/libexec/forge-core-init
+ExecStart=/usr/bin/python3 /usr/lib/forge/forgecore/app.py
+StateDirectory=forge
+# Agent runs, audit logs and workspaces are private to Forge Core.
+StateDirectoryMode=0700
+UMask=0077
+RuntimeDirectory=forge-core
+Environment=PYTHONPATH=/usr/lib/forge
+Environment=FORGE_CORE_RUN=/run/forge-core
+# Port and sampling interval. Forge Settings overrides these in forge-core.service.d/90-forge.conf.
+Environment=FORGE_CORE_PORT=47900
+Environment=FORGE_CORE_INTERVAL=15
+PrivateTmp=yes
+Nice=5
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

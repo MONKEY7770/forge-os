@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=https://schema.blue-build.org/recipe-v1.json
+# Forge OS for AMD or Intel graphics, most laptops without NVIDIA, and virtual machines.
+version: 1
+name: forge-os-universal
+description: Forge OS (AMD, Intel and virtual machines). Bazzite KDE with AI agents, remote access, Roblox and creative apps preinstalled.
+
+base-image: ghcr.io/ublue-os/bazzite
+image-version: stable
+
+modules:
+  - from-file: common-modules.yml

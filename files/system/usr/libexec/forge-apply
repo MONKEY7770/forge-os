@@ -8,11 +8,13 @@ its name, so you can always see and remove what it changed.
   forge-apply              apply current settings now
   forge-apply --import F   validate settings file F, save it, then apply
 """
+import fcntl
 import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, "/usr/lib/forge")
 import forgecfg  # noqa: E402
@@ -35,11 +37,26 @@ def path(p):
 
 
 def write(p, text):
+    # Last line of defence: generated files never get injected lines.
+    if any(ord(c) < 32 and c != "\n" for c in text) or "\x7f" in text:
+        raise SystemExit(f"Refusing to write {p}: unexpected control characters")
     full = path(p)
     os.makedirs(os.path.dirname(full), exist_ok=True)
     with open(full, "w") as f:
         f.write(HEADER + text)
     log.append(f"wrote {p}")
+
+
+def write_if_changed(p, text):
+    """Like write(), but returns False and does nothing if the file already matches."""
+    try:
+        with open(path(p)) as f:
+            if f.read() == HEADER + text:
+                return False
+    except OSError:
+        pass
+    write(p, text)
+    return True
 
 
 def remove(p):
@@ -61,6 +78,53 @@ def run(*cmd):
 def service(name, on, user=False):
     scope = ["--global"] if user else ["--now"]
     run("systemctl", "enable" if on else "disable", *scope, name)
+
+
+def usb_crypttab(v):
+    """Point encrypted volumes at the USB key file, or back to password only.
+
+    Only touches lines whose key field is "none" or our own forge_key entry,
+    so any key setup you made by hand is left alone.
+    """
+    p = path("/etc/crypttab")
+    if not os.path.exists(p):
+        log.append("note: no /etc/crypttab (disk not encrypted), USB unlock skipped")
+        return
+    with open(p) as f:
+        lines = f.read().splitlines()
+    ours = f"/forge_key:LABEL={v['security.usb_key_label']}"
+    out, changed = [], False
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 2 or parts[0].startswith("#"):
+            out.append(line)
+            continue
+        while len(parts) < 4:
+            parts.append("none" if len(parts) == 2 else "")
+        key = parts[2]
+        if key != "none" and not key.startswith("/forge_key:"):
+            out.append(line)
+            continue
+        if not v["security.usb_unlock"] and key == "none" and "keyfile-timeout=" not in line:
+            out.append(line)   # already password only
+            continue
+        opts = [o for o in parts[3].split(",") if o and not o.startswith("keyfile-timeout=")]
+        if v["security.usb_unlock"]:
+            key = ours
+            opts.append(f"keyfile-timeout={v['security.usb_key_timeout_sec']}s")
+        else:
+            key = "none"
+        new = " ".join([parts[0], parts[1], key] + ([",".join(opts)] if opts else []))
+        changed |= new != line
+        out.append(new)
+    if not changed:
+        return
+    shutil.copy2(p, p + ".forge.bak")
+    with open(p, "w") as f:
+        f.write("\n".join(out) + "\n")
+    log.append("wrote /etc/crypttab (backup: /etc/crypttab.forge.bak)")
+    # The disk is unlocked before the system starts, so the boot image needs this file too.
+    run("rpm-ostree", "initramfs-etc", "--track=/etc/crypttab")
 
 
 def apply(v):
@@ -96,15 +160,21 @@ def apply(v):
           f"Environment=OLLAMA_MODELS={v['ai.models_dir']}\n"
           f"ReadWritePaths={v['ai.models_dir']}\n")
     if not DRY:
-        os.makedirs(path(v["ai.models_dir"]), exist_ok=True)
-        run("chown", "-R", "ollama:ollama", path(v["ai.models_dir"]))
+        d = path(v["ai.models_dir"])
+        if os.path.islink(d):
+            log.append(f"note: {v['ai.models_dir']} is a link, not changing its owner")
+        elif not os.path.exists(d):
+            os.makedirs(d)
+            run("chown", "ollama:ollama", d)   # only a folder we just made, never recursive
+        else:
+            log.append(f"note: {v['ai.models_dir']} already exists; make sure the ollama user can write to it")
 
     # Agents: resource limits
     write("/etc/systemd/system/agents.slice.d/90-forge.conf",
           "[Slice]\n"
           f"CPUWeight={v['agents.cpu_weight']}\n"
-          f"MemoryHigh={v['agents.memory_high_gb']}G\n"
-          f"MemoryMax={v['agents.memory_max_gb']}G\n")
+          f"MemoryHigh={v['agents.memory_high_pct']}%\n"
+          f"MemoryMax={v['agents.memory_max_pct']}%\n")
 
     # Monitoring
     write("/etc/systemd/user/forge-health.timer.d/90-forge.conf",
@@ -117,6 +187,28 @@ def apply(v):
     if shutil.which("bluebuild-flatpak-manager"):
         run("bluebuild-flatpak-manager", "enable" if v["apps.auto_reinstall"] else "disable", "all")
 
+    # Devices and location
+    service("bluetooth.service", v["devices.bluetooth"])
+    service("cups.socket", v["devices.printing"])
+    service("ModemManager.service", v["devices.mobile_data"])
+    if v["location.services"]:
+        run("systemctl", "unmask", "geoclue.service")
+    else:
+        run("systemctl", "mask", "--now", "geoclue.service")
+    if v["location.services"] and v["location.wifi_lookup"]:
+        write("/etc/geoclue/conf.d/90-forge.conf",
+              "[wifi]\nenable=true\nurl=https://api.beacondb.net/v1/geolocate\n")
+    else:
+        remove("/etc/geoclue/conf.d/90-forge.conf")
+    # KDE's location-based time zone module, default for every user (each user can still change it).
+    write("/etc/xdg/kded6rc",
+          "[Module-geotimezoned]\n"
+          f"autoload={'true' if v['location.services'] and v['location.auto_timezone'] else 'false'}\n")
+    run("timedatectl", "set-ntp", "true")   # keep the clock itself synced
+
+    # Security: USB key unlock for the encrypted disk
+    usb_crypttab(v)
+
     run("systemctl", "daemon-reload")
     run("systemctl", "try-reload-or-restart", "systemd-resolved.service")
     run("systemctl", "try-reload-or-restart", "NetworkManager.service")
@@ -124,13 +216,45 @@ def apply(v):
     if v["ai.ollama"]:
         run("systemctl", "restart", "ollama.service")
 
+    # Forge Core API (last, because this may be running inside Forge Core itself)
+    core_conf = ("[Service]\n"
+                 f"Environment=FORGE_CORE_PORT={v['core.port']}\n"
+                 f"Environment=FORGE_CORE_INTERVAL={v['core.metrics_interval_s']}\n"
+                 f"Environment=FORGE_AGENTS_SCHEDULER={'1' if v['agents.scheduler'] else '0'}\n"
+                 f"Environment=FORGE_AGENTS_MAX_PARALLEL={v['agents.max_parallel']}\n")
+    core_changed = write_if_changed("/etc/systemd/system/forge-core.service.d/90-forge.conf", core_conf)
+    run("systemctl", "daemon-reload")
+    later = ["systemd-run", "--no-block", "--on-active=2", f"--unit=forge-core-{time.time_ns()}",
+             "--timer-property=RemainAfterElapse=no", "systemctl"]
+    if not v["core.enabled"]:
+        run(*later, "disable", "--now", "forge-core.service")
+    elif core_changed:
+        run("systemctl", "enable", "forge-core.service")
+        run(*later, "restart", "forge-core.service")
+    else:
+        run("systemctl", "enable", "--now", "forge-core.service")
+
 
 def main():
     args = sys.argv[1:]
     schema = forgecfg.load_schema()
 
+    # One apply at a time (Settings app, terminal and API may all call this).
+    os.makedirs(path("/run"), exist_ok=True)
+    lock = open(path("/run/forge-apply.lock"), "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+
+    if os.environ.get("SUDO_USER") == "forge" and (len(args) != 2 or args[0] != "--import"):
+        print("Not saved: Forge Core may only run forge-apply --import <file>", file=sys.stderr)
+        return 2
+
     if "--import" in args:
         src = args[args.index("--import") + 1]
+        # Forge Core (sudo as "forge") may only hand over files from its own private folder.
+        if os.environ.get("SUDO_USER") == "forge":
+            if os.path.dirname(os.path.realpath(src)) != "/run/forge-core":
+                print("Not saved: Forge Core may only import from /run/forge-core", file=sys.stderr)
+                return 2
         with open(src) as f:
             incoming = json.load(f)
         merged = forgecfg.values(schema, incoming)

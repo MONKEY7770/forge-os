@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""forge-hwcheck: notice when the hardware changes, and adapt.
+
+Runs at every boot. It records a short hardware profile (CPU, RAM, GPUs,
+disks, battery, virtual machine or not) in /var/lib/forge-hw/hardware.json.
+If anything changed since the last boot, it:
+  - logs the change in /var/lib/forge-hw/hardware-changes.log
+  - re-applies all Forge settings, so limits and services fit the new hardware
+  - leaves a notice that forge-health shows you as a desktop notification
+
+Memory limits are shares of total RAM, so they grow or shrink with your RAM
+on their own. This check makes sure everything else is re-applied too.
+"""
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+
+STATE = os.environ.get("FORGE_HW_STATE", "/var/lib/forge-hw")
+SYS = os.environ.get("FORGE_SYS", "")          # for testing only
+APPLY = os.environ.get("FORGE_HW_APPLY", "/usr/libexec/forge-apply")
+LAPTOP_CHASSIS = {"8", "9", "10", "11", "14", "30", "31", "32"}
+
+
+def read(p, default=""):
+    try:
+        with open(SYS + p) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def cpu():
+    model = ""
+    for line in read("/proc/cpuinfo").splitlines():
+        if line.startswith("model name"):
+            model = line.split(":", 1)[1].strip()
+            break
+    cores = sum(1 for line in read("/proc/cpuinfo").splitlines() if line.startswith("processor"))
+    return f"{model} ({cores} threads)" if model else f"{cores} threads"
+
+
+def ram_gb():
+    for line in read("/proc/meminfo").splitlines():
+        if line.startswith("MemTotal:"):
+            return round(int(line.split()[1]) / 1024 / 1024)
+    return 0
+
+
+def gpus():
+    out = []
+    try:
+        r = subprocess.run(["lspci", "-mm"], capture_output=True, text=True, timeout=5)
+        for line in r.stdout.splitlines():
+            if '"VGA compatible controller"' in line or '"3D controller"' in line or '"Display controller"' in line:
+                parts = line.split('"')
+                out.append(f"{parts[3]} {parts[5]}".strip())
+    except (OSError, subprocess.TimeoutExpired, IndexError):
+        pass
+    if not out:   # no lspci: fall back to PCI ids
+        for dev in sorted(glob.glob(SYS + "/sys/class/drm/card[0-9]/device")):
+            out.append(f"{read(dev[len(SYS):] + '/vendor')}:{read(dev[len(SYS):] + '/device')}")
+    return sorted(out)
+
+
+def disks():
+    out = []
+    for blk in sorted(glob.glob(SYS + "/sys/block/*")):
+        name = os.path.basename(blk)
+        if name.startswith(("loop", "zram", "dm-", "sr", "ram", "md")):
+            continue
+        sectors = read(f"/sys/block/{name}/size", "0")
+        size_gb = round(int(sectors or 0) * 512 / 1e9)
+        if size_gb == 0:
+            continue
+        model = read(f"/sys/block/{name}/device/model") or name
+        out.append(f"{model} ({size_gb} GB)")
+    return out
+
+
+def profile():
+    virt = "none"
+    try:
+        virt = subprocess.run(["systemd-detect-virt"], capture_output=True, text=True,
+                              timeout=5).stdout.strip() or "none"
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    battery = any(read(p[len(SYS):] + "/type") == "Battery"
+                  for p in glob.glob(SYS + "/sys/class/power_supply/*"))
+    chassis = read("/sys/class/dmi/id/chassis_type")
+    kind = "virtual machine" if virt != "none" else (
+        "laptop" if battery or chassis in LAPTOP_CHASSIS else "desktop")
+    return {"type": kind, "virtualization": virt, "cpu": cpu(), "ram_gb": ram_gb(),
+            "gpus": gpus(), "disks": disks(), "battery": battery}
+
+
+LABELS = {"type": "Device type", "virtualization": "Virtualization", "cpu": "CPU",
+          "ram_gb": "RAM (GB)", "gpus": "Graphics", "disks": "Disks", "battery": "Battery"}
+
+
+def describe(key, old, new):
+    fmt = lambda v: ", ".join(v) if isinstance(v, list) else ("yes" if v is True else "no" if v is False else str(v))
+    return f"{LABELS.get(key, key)} changed from {fmt(old) or 'none'} to {fmt(new) or 'none'}"
+
+
+def main():
+    os.makedirs(STATE, exist_ok=True)
+    path = os.path.join(STATE, "hardware.json")
+    now = profile()
+    try:
+        with open(path) as f:
+            before = json.load(f)
+    except (OSError, ValueError):
+        before = None
+
+    with open(path, "w") as f:
+        json.dump(now, f, indent=2)
+    os.chmod(path, 0o644)
+
+    if before is None:
+        print("First hardware profile recorded.")
+        return 0
+    changes = [describe(k, before.get(k), now[k]) for k in now if before.get(k) != now[k]]
+    if not changes:
+        return 0
+
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(os.path.join(STATE, "hardware-changes.log"), "a") as f:
+        for c in changes:
+            f.write(f"{stamp} {c}\n")
+    notice = os.path.join(STATE, "hardware-notice.json")
+    with open(notice, "w") as f:
+        json.dump({"ts": int(time.time()), "changes": changes}, f)
+    os.chmod(notice, 0o644)
+    print("\n".join(changes))
+
+    # Re-apply every setting so services and limits match the new hardware.
+    r = subprocess.run([APPLY], capture_output=True, text=True)
+    print(r.stdout.strip())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

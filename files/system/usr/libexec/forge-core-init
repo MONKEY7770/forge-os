@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Creates the Forge Core API token on first start.
+# Readable by the forge user (the API) and the wheel group (admin users, for forge-api).
+set -euo pipefail
+TOKEN=/etc/forge/core.token
+mkdir -p /etc/forge
+if [ ! -s "$TOKEN" ]; then
+  umask 077
+  head -c 32 /dev/urandom | base64 | tr -d '/+=\n' > "$TOKEN"
+fi
+chown forge:wheel "$TOKEN"
+chmod 0640 "$TOKEN"

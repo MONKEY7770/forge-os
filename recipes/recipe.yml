@@ -1,86 +1,12 @@
 # yaml-language-server: $schema=https://schema.blue-build.org/recipe-v1.json
-# Forge OS: custom Bazzite image for AI agents, creative work and gaming.
-# Rename "forge-os" anywhere you like; it is only a working name.
+# Forge OS for PCs and laptops with an NVIDIA GPU (GTX 16 series and newer, RTX 50 included).
 version: 1
 name: forge-os
-description: Bazzite (KDE, NVIDIA open driver) with AI agents, remote access, Roblox and creative apps preinstalled.
+description: Forge OS (NVIDIA). Bazzite KDE with AI agents, remote access, Roblox and creative apps preinstalled.
 
 # RTX 50 series cards only work with the NVIDIA open driver, so this base is required.
 base-image: ghcr.io/ublue-os/bazzite-nvidia-open
 image-version: stable
 
 modules:
-  # 1. Forge tools, Settings app, Ollama service, agent resource slice.
-  - type: files
-    files:
-      - source: system
-        destination: /
-
-  # 2. System packages (part of the image, updated with it).
-  - type: dnf
-    repos:
-      files:
-        # Claude Desktop: official Anthropic app, repackaged as .rpm by the
-        # claude-desktop-debian project (Anthropic only ships a .deb).
-        - https://pkg.claude-desktop-debian.dev/rpm/claude-desktop-unofficial.repo
-        - https://pkgs.tailscale.com/stable/fedora/tailscale.repo
-    install:
-      packages:
-        - claude-desktop-unofficial
-        - tailscale
-        - smartmontools   # disk health warnings
-        - lm_sensors      # CPU and board temperatures
-
-  # 3. Ollama (local models with CUDA), plus making the Forge tools executable.
-  - type: script
-    scripts:
-      - install-ollama.sh
-      - finalize.sh
-
-  # 4. Services that start on boot.
-  - type: systemd
-    system:
-      enabled:
-        - tailscaled.service
-        - ollama.service
-        - smartd.service
-        - forge-apply-firstboot.service
-    user:
-      enabled:
-        - forge-health.timer
-
-  # 5. Desktop apps (Flatpaks, installed on first boot, updated separately).
-  - type: default-flatpaks
-    configurations:
-      - scope: system
-        notify: true
-        install:
-          # Essentials
-          - org.mozilla.firefox
-          - com.discordapp.Discord
-          - com.visualstudio.code
-          - io.github.shiftey.Desktop        # GitHub Desktop
-          - org.videolan.VLC
-          - com.obsproject.Studio            # recording and streaming
-          - org.kde.kdenlive                 # video editing (game trailers, promos)
-          - org.localsend.localsend_app      # send files between phone and PCs
-          # Privacy
-          - com.bitwarden.desktop            # password manager
-          - com.github.tchx84.Flatseal       # control what each app can access
-          # Roblox
-          - org.vinegarhq.Sober       # Roblox Player
-          - org.vinegarhq.Vinegar     # Roblox Studio
-          # Creative apps (same apps your MCP hub talks to)
-          - org.blender.Blender
-          - net.blockbench.Blockbench
-          - org.kde.krita                    # textures, UI art, thumbnails
-          - org.audacityteam.Audacity        # sound effects
-          # Minecraft Bedrock (for the realm); needs the game bought on Google Play
-          - io.mrarm.mcpelauncher
-          # Remote access
-          - com.moonlight_stream.Moonlight
-          - com.rustdesk.RustDesk
-          # System tools
-          - io.missioncenter.MissionCenter   # see CPU, GPU, VRAM per app
-
-  - type: signing
+  - from-file: common-modules.yml

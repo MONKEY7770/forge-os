@@ -7,6 +7,7 @@ Description=AI agents and local models
 [Slice]
 CPUWeight=50
 IOWeight=50
-# 64 GB RAM: agents slow down past 40 GB and are hard-capped at 48 GB.
-MemoryHigh=40G
-MemoryMax=48G
+# Shares of total RAM, so the limits adjust when RAM is added or removed.
+# Forge Settings overrides these in agents.slice.d/90-forge.conf.
+MemoryHigh=62%
+MemoryMax=75%

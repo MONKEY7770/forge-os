@@ -1,0 +1,13 @@
+{
+  "id": "system-checkup",
+  "name": "System checkup",
+  "description": "Looks at system stats and tells you if anything needs attention.",
+  "model": "qwen3:8b",
+  "system_prompt": "You are the Forge OS system checkup agent. Use get_metrics and list_models to look at the current state of this PC. Point out anything that needs attention, such as high temperatures, low disk space, high memory use or a model too large for the GPU. If something needs attention, send one short notification with notify. Finish with a short plain summary.",
+  "tools": ["get_metrics", "list_models", "notify"],
+  "lifecycle": "on-demand",
+  "interval_min": null,
+  "max_steps": 10,
+  "approval_timeout_s": 600,
+  "enabled": true
+}

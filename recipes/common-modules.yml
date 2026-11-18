@@ -1,0 +1,100 @@
+# Everything Forge OS adds on top of Bazzite. Shared by every Forge OS image,
+# so the NVIDIA and universal images always stay the same apart from the base.
+modules:
+  # 1. Forge tools, Settings app, Ollama service, agent resource slice.
+  - type: files
+    files:
+      - source: system
+        destination: /
+
+  # 2. System packages (part of the image, updated with it).
+  - type: dnf
+    repos:
+      files:
+        # Claude Desktop: official Anthropic app, repackaged as .rpm by the
+        # claude-desktop-debian project (Anthropic only ships a .deb).
+        - https://pkg.claude-desktop-debian.dev/rpm/claude-desktop-unofficial.repo
+        - https://pkgs.tailscale.com/stable/fedora/tailscale.repo
+    install:
+      packages:
+        - claude-desktop-unofficial
+        - tailscale
+        - smartmontools   # disk health warnings
+        - lm_sensors      # CPU and board temperatures
+        - python3-fastapi # Forge Core API
+        - python3-uvicorn
+        - python3-httpx   # AI gateway
+        # Essentials. Bazzite normally has these already; listing them makes sure.
+        - NetworkManager-wifi       # Wi-Fi
+        - NetworkManager-bluetooth  # internet through a phone over Bluetooth
+        - ModemManager              # mobile data (4G/5G) on laptops
+        - bluez                     # Bluetooth
+        - bluez-obexd               # send files over Bluetooth
+        - geoclue2                  # location for apps that ask (night light, maps, time zone)
+        - cups                      # printing
+        - sane-backends             # scanners
+        - fwupd                     # firmware updates for BIOS, SSDs, docks
+        - fprintd                   # fingerprint readers on laptops
+        - iio-sensor-proxy          # screen rotation and light sensors on laptops
+        # Virtual machine guest tools. Each one only starts inside its own kind of VM.
+        - qemu-guest-agent        # QEMU / KVM / Proxmox / GNOME Boxes
+        - spice-vdagent           # shared clipboard and screen resize in QEMU
+        - open-vm-tools-desktop   # VMware
+        - hyperv-daemons          # Hyper-V
+        - virtualbox-guest-additions  # VirtualBox
+
+  # 3. Ollama (local models; uses the GPU when it can, CPU otherwise), plus making the Forge tools executable.
+  - type: script
+    scripts:
+      - install-ollama.sh
+      - finalize.sh
+
+  # 4. Services that start on boot.
+  - type: systemd
+    system:
+      enabled:
+        - tailscaled.service
+        - ollama.service
+        - smartd.service
+        - forge-apply-firstboot.service
+        - forge-core.service
+        - forge-hwcheck.service
+    user:
+      enabled:
+        - forge-health.timer
+
+  # 5. Desktop apps (Flatpaks, installed on first boot, updated separately).
+  - type: default-flatpaks
+    configurations:
+      - scope: system
+        notify: true
+        install:
+          # Essentials
+          - org.mozilla.firefox
+          - com.discordapp.Discord
+          - com.visualstudio.code
+          - io.github.shiftey.Desktop        # GitHub Desktop
+          - org.videolan.VLC
+          - com.obsproject.Studio            # recording and streaming
+          - org.kde.kdenlive                 # video editing (game trailers, promos)
+          - org.localsend.localsend_app      # send files between phone and PCs
+          # Privacy
+          - com.bitwarden.desktop            # password manager
+          - com.github.tchx84.Flatseal       # control what each app can access
+          # Roblox
+          - org.vinegarhq.Sober       # Roblox Player
+          - org.vinegarhq.Vinegar     # Roblox Studio
+          # Creative apps (same apps your MCP hub talks to)
+          - org.blender.Blender
+          - net.blockbench.Blockbench
+          - org.kde.krita                    # textures, UI art, thumbnails
+          - org.audacityteam.Audacity        # sound effects
+          # Minecraft Bedrock (for the realm); needs the game bought on Google Play
+          - io.mrarm.mcpelauncher
+          # Remote access
+          - com.moonlight_stream.Moonlight
+          - com.rustdesk.RustDesk
+          # System tools
+          - io.missioncenter.MissionCenter   # see CPU, GPU, VRAM per app
+
+  - type: signing

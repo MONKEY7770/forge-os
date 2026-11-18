@@ -5,10 +5,17 @@ Your changes live in /etc/forge/settings.json and only hold the keys
 you changed, so you can edit that file by hand at any time.
 """
 import json
+import math
 import os
+import re
 
 SCHEMA_PATH = os.environ.get("FORGE_SCHEMA", "/usr/share/forge/settings.json")
 OVERRIDES_PATH = os.environ.get("FORGE_CONF", "/etc/forge/settings.json")
+
+
+# Where model folders may live. Anything else (like / or /etc) is refused.
+# The first entry is the default folder itself; the others need a subfolder.
+MODEL_DIR_PREFIXES = ["/var/lib/ollama", "/var/mnt", "/mnt", "/var/home", "/home", "/run/media"]
 
 
 def load_schema():
@@ -59,9 +66,15 @@ def coerce(setting, raw):
     if t == "number":
         try:
             n = float(raw)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise ValueError(f"{setting['key']}: must be a number")
-        n = int(n) if n == int(n) else n
+        if not math.isfinite(n):
+            raise ValueError(f"{setting['key']}: must be a number")
+        # Every number setting is a whole number unless the schema says "float": true.
+        if not setting.get("float"):
+            if n != int(n):
+                raise ValueError(f"{setting['key']}: must be a whole number")
+            n = int(n)
         lo, hi = setting.get("min"), setting.get("max")
         if lo is not None and n < lo or hi is not None and n > hi:
             raise ValueError(f"{setting['key']}: must be between {lo} and {hi}")
@@ -72,8 +85,13 @@ def coerce(setting, raw):
             raise ValueError(f"{setting['key']}: choose one of {', '.join(setting['options'])}")
         return s
     s = str(raw).strip()
+    # Values end up in system files, so line breaks and control characters are never allowed.
+    if any(ord(c) < 32 or ord(c) == 127 for c in s):
+        raise ValueError(f"{setting['key']}: line breaks and control characters are not allowed")
     if not s:
         raise ValueError(f"{setting['key']}: cannot be empty")
+    if setting.get("pattern") and not re.fullmatch(setting["pattern"], s):
+        raise ValueError(f"{setting['key']}: {setting.get('help') or 'invalid value'}")
     return s
 
 
@@ -86,10 +104,16 @@ def validate(new_values, schema=None):
             clean[k] = coerce(s, new_values.get(k, s["default"]))
         except ValueError as e:
             errors.append(str(e))
-    if not errors and clean["agents.memory_high_gb"] > clean["agents.memory_max_gb"]:
-        errors.append("agents.memory_high_gb: soft limit must not be above the hard cap")
-    if not errors and not clean["ai.models_dir"].startswith("/"):
-        errors.append("ai.models_dir: must be a full path starting with /")
+    if not errors and clean["agents.memory_high_pct"] > clean["agents.memory_max_pct"]:
+        errors.append("agents.memory_high_pct: soft limit must not be above the hard cap")
+    if not errors:
+        d = clean["ai.models_dir"].rstrip("/")
+        if (not re.fullmatch(r"/[A-Za-z0-9._/-]+", d) or "/../" in d + "/" or "/./" in d + "/"
+                or not any(d == p or d.startswith(p + "/") for p in MODEL_DIR_PREFIXES)
+                or d in MODEL_DIR_PREFIXES[1:]):
+            errors.append("ai.models_dir: must be a folder inside /var/lib/ollama, /var/mnt, /mnt, "
+                          "/var/home, /home or /run/media (letters, numbers, . _ - / only)")
+        clean["ai.models_dir"] = d
     return clean, errors
 
 

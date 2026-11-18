@@ -1,0 +1,3 @@
+# Forge Core may apply settings, and nothing else, as root.
+# forge-apply validates every value against the settings schema before applying it.
+forge ALL=(root) NOPASSWD: /usr/libexec/forge-apply --import /run/forge-core/*

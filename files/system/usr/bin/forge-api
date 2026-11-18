@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""forge-api: call the Forge Core API from the terminal.
+
+  forge-api GET /api/metrics/now
+  forge-api GET "/api/metrics/history?metric=vram_used_mb&since=86400&step=900"
+  forge-api GET /api/models
+  forge-api POST /api/models/pull '{"name": "qwen3:8b"}'
+  forge-api PUT /api/settings '{"values": {"ai.keep_alive_min": 10}}'
+
+The token is read from /etc/forge/core.token (readable by admin users).
+All endpoints are listed at http://127.0.0.1:47900/docs
+"""
+import os
+import pwd
+import sys
+import urllib.error
+import urllib.request
+
+TOKEN_PATH = os.environ.get("FORGE_CORE_TOKEN", "/etc/forge/core.token")
+
+
+def port():
+    try:
+        out = os.popen("forge-config get core.port 2>/dev/null").read().strip()
+        return int(out)
+    except ValueError:
+        return 47900
+
+
+def listener_is_forge(port):
+    """True if the process listening on 127.0.0.1:<port> belongs to the forge user.
+    Stops another local user from catching the token by taking the port first."""
+    try:
+        forge_uid = pwd.getpwnam("forge").pw_uid
+    except KeyError:
+        return os.environ.get("FORGE_API_SKIP_OWNER_CHECK") == "1"
+    want = f"0100007F:{port:04X}"
+    try:
+        with open("/proc/net/tcp") as f:
+            for line in f.readlines()[1:]:
+                cols = line.split()
+                if cols[1] == want and cols[3] == "0A":   # 0A means listening
+                    return int(cols[7]) == forge_uid
+    except OSError:
+        pass
+    return False
+
+
+def main():
+    a = sys.argv[1:]
+    if len(a) < 2 or a[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0 if a else 1
+    method, path = a[0].upper(), a[1]
+    body = a[2].encode() if len(a) > 2 else None
+    try:
+        token = open(TOKEN_PATH).read().strip()
+    except OSError:
+        print(f"Can't read {TOKEN_PATH}. Admin users can read it; try with sudo.", file=sys.stderr)
+        return 1
+    p = port()
+    if not listener_is_forge(p):
+        print("Forge Core is not running (or something else is using its port). Not sending the token.",
+              file=sys.stderr)
+        return 1
+    req = urllib.request.Request(f"http://127.0.0.1:{p}{path}", data=body, method=method,
+                                 headers={"Authorization": f"Bearer {token}",
+                                          "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=None) as r:
+            for line in r:
+                sys.stdout.write(line.decode())
+            sys.stdout.write("\n")
+    except urllib.error.HTTPError as e:
+        print(f"Error {e.code}: {e.read().decode()}", file=sys.stderr)
+        return 1
+    except urllib.error.URLError:
+        print("Forge Core is not running. Check: systemctl status forge-core", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

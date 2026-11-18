@@ -40,6 +40,35 @@ if [ "$(cfg ai.ollama)" = "on" ] && [ "$(cfg monitor.check_ollama)" = "on" ]; th
   systemctl is-active --quiet ollama || problems+=("Ollama is not running")
 fi
 
+# Hardware changes found at boot (shown once per user)
+HW_NOTICE=/var/lib/forge-hw/hardware-notice.json
+if [ -r "$HW_NOTICE" ] && [ "$HW_NOTICE" -nt "$STATE_DIR/hw-seen" ]; then
+  hw_msg=$(python3 -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1]))["changes"]))' "$HW_NOTICE" 2>/dev/null)
+  if [ -n "$hw_msg" ]; then
+    echo "$(date -Is) HARDWARE ${hw_msg//$'\n'/; }" >> "$LOG"
+    command -v notify-send >/dev/null && notify-send "Forge OS: hardware changed" "$hw_msg
+Settings were re-applied to match."
+  fi
+  touch "$STATE_DIR/hw-seen"
+fi
+
+# Agent messages and approvals waiting for you (needs the Forge Core token, readable by admins)
+if [ "$(cfg core.enabled)" = "on" ] && [ -r /etc/forge/core.token ] && command -v notify-send >/dev/null; then
+  seen=$(cat "$STATE_DIR/notices-seen" 2>/dev/null || echo 0)
+  forge-api GET "/api/notices?since=$seen" 2>/dev/null | python3 -c '
+import html, json, subprocess, sys
+items = json.load(sys.stdin) if sys.stdin.readable() else []
+for i in items[-5:]:
+    # Escaped, so an agent cannot put links or formatting in a notification.
+    subprocess.run(["notify-send", "Forge agent", html.escape(i["message"])])
+print(max([i["ts"] for i in items], default=int(sys.argv[1])))' "$seen" > "$STATE_DIR/notices-seen.tmp" 2>/dev/null \
+    && mv "$STATE_DIR/notices-seen.tmp" "$STATE_DIR/notices-seen"
+  pending=$(forge-api GET "/api/approvals?status=pending" 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null)
+  if [ -n "$pending" ] && [ "$pending" -gt 0 ]; then
+    notify-send -u critical "Forge: $pending agent action(s) need your OK" "Open http://127.0.0.1:$(cfg core.port)/docs or run: forge-api GET /api/approvals"
+  fi
+fi
+
 # Log every run, notify only on problems
 if [ ${#problems[@]} -eq 0 ]; then
   echo "$(date -Is) ok ${gpu_line:-} mem_free=${mem_avail}G" >> "$LOG"

@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""forge-usbkey: unlock the encrypted Forge OS disk with a USB stick.
+
+The USB stick needs:
+  - the drive name (label) set in Forge Settings (default FORGEKEY)
+  - a file called forge_key in its top folder, holding your secret text
+
+At boot, Forge OS waits a few seconds for that USB. If it's there, the disk
+unlocks by itself. If not, you type your normal password, which always works.
+
+  sudo forge-usbkey setup    add the USB file as an extra unlock key
+  sudo forge-usbkey status   show whether USB unlock is set up
+  sudo forge-usbkey test     check the USB file opens the disk (changes nothing)
+  sudo forge-usbkey remove   stop using the USB (password still works)
+
+Important: the key is the file's exact contents. If you edit or re-save
+forge_key, it stops matching. Run setup again after any change.
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, "/usr/lib/forge")
+import forgecfg  # noqa: E402
+
+CRYPTTAB = "/etc/crypttab"
+KEY_NAME = "forge_key"
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def luks_devices():
+    """Encrypted volumes listed in /etc/crypttab: (name, device path)."""
+    out = []
+    try:
+        with open(CRYPTTAB) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 2 or parts[0].startswith("#"):
+                    continue
+                dev = parts[1]
+                if dev.startswith("UUID="):
+                    dev = "/dev/disk/by-uuid/" + dev[5:]
+                out.append((parts[0], dev))
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def find_usb(label):
+    """Return (key file path, temp mount dir or None)."""
+    dev = os.path.realpath(f"/dev/disk/by-label/{label}")
+    if not os.path.exists(f"/dev/disk/by-label/{label}"):
+        die(f"No drive named {label} found. Plug in the USB stick and check its drive name.")
+    with open("/proc/mounts") as f:
+        for line in f:
+            src, mnt = line.split()[:2]
+            if os.path.realpath(src) == dev:
+                return os.path.join(mnt.replace("\\040", " "), KEY_NAME), None
+    tmp = tempfile.mkdtemp(prefix="forge-usbkey-")
+    if subprocess.run(["mount", "-o", "ro", dev, tmp]).returncode != 0:
+        os.rmdir(tmp)
+        die(f"Could not open the USB drive {label}.")
+    return os.path.join(tmp, KEY_NAME), tmp
+
+
+def release(tmp):
+    if tmp:
+        subprocess.run(["umount", tmp])
+        os.rmdir(tmp)
+
+
+def check_key_file(path):
+    if not os.path.isfile(path):
+        die(f"The USB has no file called {KEY_NAME} in its top folder.")
+    data = open(path, "rb").read()
+    if len(data) < 16:
+        die(f"{KEY_NAME} is too short. Use at least 16 characters (64 random ones is best).")
+    if data.endswith(b"\n"):
+        print("Note: forge_key ends with a line break. That's fine, it becomes part of the key.")
+
+
+def opens(dev, keyfile):
+    r = subprocess.run(["cryptsetup", "open", "--test-passphrase", "--key-file", keyfile, dev],
+                       capture_output=True)
+    return r.returncode == 0
+
+
+def set_setting(on):
+    vals = forgecfg.values()
+    vals["security.usb_unlock"] = on
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(vals, f)
+        tmp = f.name
+    r = subprocess.run(["/usr/libexec/forge-apply", "--import", tmp])
+    os.unlink(tmp)
+    return r.returncode == 0
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if os.geteuid() != 0:
+        die("Run this with sudo, for example: sudo forge-usbkey setup")
+
+    vals = forgecfg.values()
+    label = vals["security.usb_key_label"]
+    devs = luks_devices()
+    if not devs:
+        die("No encrypted disk found in /etc/crypttab. USB unlock only works on an encrypted install.")
+
+    if cmd == "status":
+        print(f"USB unlock setting: {'on' if vals['security.usb_unlock'] else 'off'}")
+        print(f"USB drive name: {label}, wait time: {vals['security.usb_key_timeout_sec']}s")
+        for name, dev in devs:
+            print(f"Encrypted volume: {name} ({dev})")
+        print("Run 'sudo forge-usbkey test' with the USB plugged in to check the key works.")
+        return 0
+
+    if cmd == "remove" and not os.path.exists(f"/dev/disk/by-label/{label}"):
+        # Lost or unplugged USB: stop using it at boot. The old key slot stays
+        # until you run remove again with the USB, but nothing looks for it.
+        set_setting(False)
+        print("USB unlock turned off. Plug the USB in and run remove again to fully delete its key.")
+        return 0
+
+    keyfile, tmp = find_usb(label)
+    try:
+        check_key_file(keyfile)
+        if cmd == "test":
+            for name, dev in devs:
+                print(f"{name}: {'USB key works' if opens(dev, keyfile) else 'USB key does NOT open this disk'}")
+            return 0
+        if cmd == "setup":
+            for name, dev in devs:
+                if opens(dev, keyfile):
+                    print(f"{name}: USB key already added.")
+                    continue
+                print(f"{name}: enter your current disk password to add the USB key.")
+                if subprocess.run(["cryptsetup", "luksAddKey", dev, keyfile]).returncode != 0:
+                    die("Could not add the USB key. Nothing else was changed.")
+            if not set_setting(True):
+                die("The key was added, but turning on USB unlock failed. Check Forge Settings.")
+            print("Done. Reboot with the USB plugged in to test it. Your password still works too.")
+            return 0
+        if cmd == "remove":
+            set_setting(False)
+            for name, dev in devs:
+                if opens(dev, keyfile):
+                    subprocess.run(["cryptsetup", "luksRemoveKey", dev, keyfile])
+                    print(f"{name}: USB key removed.")
+            print("Done. Only your password unlocks the disk now.")
+            return 0
+    finally:
+        release(tmp)
+    print(__doc__.strip())
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

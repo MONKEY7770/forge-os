@@ -746,7 +746,8 @@ class RunHistoryRedactionRound2Test(Base):
         r = self.runner([bad, answer("ok")])
         rid = r.start_run("helper", "t")
         self.assertTrue(wait_for(lambda: r.get_run(rid)["status"] in ("done", "failed")))
-        self.assertEqual(r.get_run(rid)["status"], "done")
+        run = r.get_run(rid)
+        self.assertEqual(run["status"], "done", f"run failed: {run.get('error')!r}")
 
     def test_scheduler_cleanup_waits_for_a_trusted_clock(self):
         r = self.runner([answer("ok")])

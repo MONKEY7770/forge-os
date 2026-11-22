@@ -7,6 +7,7 @@ a missing sensor just gives None.
 
 import os
 import shutil
+import random
 import sqlite3
 import subprocess
 import threading
@@ -200,6 +201,24 @@ class Collector:
         os.makedirs(parent, exist_ok=True)
         # One shared connection, only ever used while holding self._lock.
         self._db = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
+        # Switching to WAL and the column upgrade can answer "database is locked" at once (without the
+        # busy wait) while a second collector does the same: retry for a while instead of failing.
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                self._setup_tables()
+                break
+            except sqlite3.OperationalError as e:
+                try:
+                    self._db.rollback()
+                except sqlite3.Error:
+                    pass
+                busy = "locked" in str(e) or "busy" in str(e)
+                if not busy or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05 + random.random() * 0.1)
+
+    def _setup_tables(self):
         with self._lock:
             self._db.execute("PRAGMA journal_mode=WAL")
             cols = ", ".join(f"{n} REAL" for n in NAMES)

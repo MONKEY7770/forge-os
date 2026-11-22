@@ -312,7 +312,10 @@ class CiGateTests(unittest.TestCase):
         self.assertRegex(checks, r'echo "[0-9a-f]{64}  /tmp/actionlint\.tar\.gz" \| sha256sum -c -')
         self.assertLess(checks.find("sha256sum -c"), checks.find("tar -xzf /tmp/actionlint"))
         base = self.job(self.wf("build.yml"), "base-images")
-        self.assertIn("cosign verify --key .github/keys/ublue-os-bazzite.pub", base)
+        # Bazzite's base images: pinned to its own build workflow's keyless identity and GitHub's issuer.
+        self.assertIn("cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com", base)
+        self.assertIn("--certificate-identity https://github.com/ublue-os/bazzite/.github/workflows/build.yml@refs/heads/main" , base)
+        self.assertNotIn("certificate-identity-regexp", base)
 
     def test_gate_steps_are_exact_and_cannot_be_switched_off(self):
         # Third review: text matching let "actionlint || true", "if: false", "continue-on-error",

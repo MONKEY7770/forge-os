@@ -59,7 +59,7 @@ class BuildWorkflowReleaseTests(unittest.TestCase):
 
     def test_fedora_comes_from_the_verified_base_image(self):
         base = self.jobs["base-images"]
-        verify = index_of(base, lambda s: "cosign verify --key .github/keys/ublue-os-bazzite.pub" in s.get("run", ""))
+        verify = index_of(base, lambda s: "--certificate-identity https://github.com/ublue-os/bazzite/.github/workflows/build.yml@refs/heads/main" in s.get("run", ""))
         plan = index_of(base, lambda s: "forge_release.py plan" in s.get("run", ""))
         self.assertTrue(0 <= verify < plan)
         self.assertIn("skopeo inspect", steps(base)[plan]["run"])

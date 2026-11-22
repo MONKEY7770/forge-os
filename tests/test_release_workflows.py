@@ -243,12 +243,14 @@ class IsoImageTagTests(unittest.TestCase):
         ])
         for k in ("if", "continue-on-error", "shell"):
             self.assertNotIn(k, st)
-        build = [s for s in steps(self.job) if "build-container-installer" in s.get("uses", "")]
+        build = [s for s in steps(self.job) if s.get("id") == "build"]
         self.assertEqual(len(build), 1)
-        w = build[0]["with"]
-        self.assertEqual(w["image_src"], "${{ steps.%s.outputs.src }}" % st["id"])
-        self.assertEqual(w["image_tag"], "${{ steps.%s.outputs.tag }}" % st["id"])
-        self.assertEqual(w["enable_cache_skopeo"], "false", "never an older cached copy instead of this digest")
+        w = build[0]["env"]
+        self.assertEqual(w["IMAGE_SRC"], "${{ steps.%s.outputs.src }}" % st["id"])
+        self.assertEqual(w["IMAGE_TAG"], "${{ steps.%s.outputs.tag }}" % st["id"])
+        run = build[0]["run"]
+        self.assertIn('IMAGE_SRC="$IMAGE_SRC"', run)
+        self.assertNotIn("/cache/skopeo", run, "never an older cached copy instead of this digest")
         self.assertLess(steps(self.job).index(st), steps(self.job).index(build[0]))
         self.assertNotIn("inputs.image_tag", str(build[0]))
 

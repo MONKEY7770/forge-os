@@ -131,7 +131,10 @@ class WorkflowPinTests(unittest.TestCase):
 
     def test_r14_iso_installer_pinned(self):
         text = read(os.path.join(ROOT, ".github/workflows/build-iso.yml"))
-        self.assertIn("jasonn3/build-container-installer@21ba332383d8499c2b6e3ba26cef86052d81f847", text)
+        # The builder image is pinned by digest and run directly (the archived action can't be pinned:
+        # it pulls its image by the action's own ref).
+        self.assertIn("ghcr.io/jasonn3/build-container-installer@sha256:354e6d7fd4cb1850fb5adcfc3535f2c271dcecbc127730a058c0cbedbd9d3f51" , text)
+        self.assertNotIn("uses: jasonn3/", text)
         self.assertNotIn("@main", text)
 
 
@@ -380,7 +383,7 @@ class CiGateTests(unittest.TestCase):
     def test_iso_build_only_from_a_verified_image(self):
         text = self.wf("build-iso.yml")
         self.assertIn("cosign verify --key cosign.pub", text)
-        self.assertLess(text.find("cosign verify"), text.find("build-container-installer"))
+        self.assertLess(text.find("cosign verify"), text.find("docker run --privileged"))
 
     def test_secret_scan_baseline_has_no_unreviewed_entries(self):
         base = json.load(open(os.path.join(ROOT, ".secrets.baseline")))
@@ -487,10 +490,11 @@ class IsoWorkflowTests(unittest.TestCase):
 
     def test_scheduled_runs_have_a_fedora_version(self):
         # A scheduled run has no inputs, so the version needs a fallback, and it must be a choice.
-        build = [s for s in self.jobs["iso"]["steps"] if "build-container-installer" in s.get("uses", "")]
+        build = [s for s in self.jobs["iso"]["steps"] if s.get("id") == "build"]
         self.assertEqual(len(build), 1)
-        m = re.fullmatch(r"\$\{\{ inputs\.fedora_version \|\| '([0-9]{2})' \}\}", build[0]["with"]["version"])
-        self.assertTrue(m, build[0]["with"]["version"])
+        m = re.fullmatch(r"\$\{\{ inputs\.fedora_version \|\| '([0-9]{2})' \}\}", build[0]["env"]["VERSION"])
+        self.assertTrue(m, build[0]["env"]["VERSION"])
+        self.assertIn('VERSION="$VERSION"', build[0]["run"])
         options = [str(o) for o in self.wf["on"]["workflow_dispatch"]["inputs"]["fedora_version"].get("options", [])]
         self.assertIn(m.group(1), options)
 
@@ -640,7 +644,7 @@ class GitignoreTests(unittest.TestCase):
 class FourthReviewWorkflowTests(unittest.TestCase):
     def test_iso_installs_enforce_image_signatures(self):
         text = open(os.path.join(ROOT, ".github/workflows/build-iso.yml")).read()
-        self.assertRegex(text, r"image_signed:\s*true")
+        self.assertIn('IMAGE_SIGNED="true"', text)
 
     def test_ci_shell_steps_stop_on_pipe_failures(self):
         text = open(os.path.join(ROOT, ".github/workflows/build.yml")).read()

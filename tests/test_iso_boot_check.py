@@ -497,7 +497,8 @@ class SerialCopyTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.env = dict(os.environ, MTOOLS_SKIP_CHECK="1")
 
-    def make_iso(self, name, cfg=GrubConfigTests.CFG, kernel=b"kernel" * 50000, extra=None, hidden_efi=False):
+    def make_iso(self, name, cfg=GrubConfigTests.CFG, kernel=b"kernel" * 50000, extra=None, hidden_efi=False,
+                 bios=False):
         root = os.path.join(self.tmp, name + "-root")
         for d in ("EFI/BOOT", "boot/grub2", "images/pxeboot"):
             os.makedirs(os.path.join(root, d))
@@ -522,6 +523,12 @@ class SerialCopyTests(unittest.TestCase):
         iso = os.path.join(self.tmp, name + ".iso")
         efi = (["-append_partition", "2", "0xef", img, "-appended_part_as_gpt",
                 "-e", "--interval:appended_partition_2:all::"] if hidden_efi else ["-e", "images/efiboot.img"])
+        if bios:
+            # Like Fedora: a BIOS boot image into which xorriso writes its own position.
+            with open(os.path.join(root, "images/eltorito.img"), "wb") as f:
+                f.write(os.urandom(8192))
+            efi = ["-b", "images/eltorito.img", "-no-emul-boot", "-boot-load-size", "4", "-boot-info-table",
+                   "--grub2-boot-info", "-eltorito-alt-boot", *efi]
         subprocess.run(["xorriso", "-as", "mkisofs", "-V", "Forge-OS-45", "-R", "-J", *efi,
                         "-no-emul-boot", "-o", iso, root], check=True, capture_output=True)
         return iso, root
@@ -637,6 +644,41 @@ class SerialCopyTests(unittest.TestCase):
         with self.assertRaises(self.m.CopyError) as cm:
             self.m.compare_isos(a, b, changed=set(), work=self.tmp)
         self.assertIn("BOOTX64.EFI", str(cm.exception))
+
+    def test_bios_boot_image_may_differ_only_in_its_own_position(self):
+        # CI finding: xorriso writes the BIOS boot image's own position into it (boot-info-table,
+        # bytes 8 to 23, and grub2-boot-info, bytes 2548 to 2555), so moving it changed those bytes.
+        grow = GrubConfigTests.CFG + "# " + "x" * 6000 + "\n"
+        iso, root = self.make_iso("bios", hidden_efi=True, bios=True, extra={"images/z.bin": os.urandom(100000)})
+        dest = os.path.join(self.tmp, "copy.iso")
+        with mock.patch.object(self.m, "serial_grub_cfg", lambda text, mark: (grow, 1)):
+            text = "\n".join(self.m.make_serial_copy(iso, dest, self.tmp, NONCE))
+        new = self.extract(dest, "/images/eltorito.img")
+        old = self.extract(iso, "/images/eltorito.img")
+        self.assertNotEqual(new, old, "the copy really moved it")
+        mask = lambda d: d[:8] + bytes(16) + d[24:2548] + bytes(8) + d[2556:]
+        self.assertEqual(mask(new), mask(old))
+        self.assertIn("/images/eltorito.img: bytes 8-23 and 2548-2555", text)
+
+    def test_other_bytes_of_the_bios_boot_image_are_compared(self):
+        a, _ = self.make_iso("bios-a", hidden_efi=True, bios=True)
+        b = os.path.join(self.tmp, "bios-b.iso")
+        shutil.copyfile(a, b)
+        (lba, _), = self.m.iso_files(b)["/images/eltorito.img"]
+        # Bytes right next to the two ranges (a wrong value inside them makes xorriso no longer
+        # report the option, which is refused as different options).
+        # 24 to 63 are reserved bytes xorriso writes as zeros: not part of the position (review finding).
+        for offset in (7, 24, 30, 63, 64, 100, 2547, 2556):
+            shutil.copyfile(a, b)
+            with open(b, "r+b") as f:
+                f.seek(lba * 2048 + offset)
+                byte = f.read(1)
+                f.seek(lba * 2048 + offset)
+                f.write(bytes([byte[0] ^ 0xFF]))
+            # Refused either as a changed file or, when the table's checksum no longer matches, as
+            # different options: both stop the run.
+            with self.assertRaises(self.m.CopyError, msg=offset):
+                self.m.compare_isos(a, b, changed=set(), work=self.tmp)
 
     def test_iso_without_a_kernel_line_is_refused(self):
         iso, _ = self.make_iso("nokernel", cfg='insmod png\nmenuentry "Install" { echo "nothing" }\n')

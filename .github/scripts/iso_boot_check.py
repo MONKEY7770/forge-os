@@ -467,6 +467,30 @@ def efi_boot_images(iso):
     return [p.strip() for n, p in paths if n in uefi]
 
 
+# Bytes xorriso writes into an El Torito boot image file: its own position on the disc.
+# boot-info-table: bytes 8 to 23 (disc, own block, length, checksum; 24 to 63 are reserved zeros).
+SELF_POSITION = {"boot-info-table": (8, 24), "grub2-boot-info": (2548, 2556)}
+
+
+def self_position_ranges(iso):
+    """{boot image path: [(start, end)]} of the bytes xorriso writes into it (SELF_POSITION)."""
+    out = run_tool(["xorriso", "-indev", iso, "-report_el_torito", "plain"])
+    paths = dict(re.findall(r"^El Torito img path :\s+(\d+)\s+(\S.*?)\s*$", out, re.M))
+    ranges = {}
+    for n, opts in re.findall(r"^El Torito img opts :\s+(\d+)\s+(.*?)\s*$", out, re.M):
+        found = [SELF_POSITION[o] for o in opts.split() if o in SELF_POSITION]
+        if found and n in paths:
+            ranges[paths[n]] = sorted(found)
+    return ranges
+
+
+def masked_sha256(data, ranges):
+    data = bytearray(data)
+    for start, end in ranges:
+        data[start:end] = bytes(len(data[start:end]))
+    return hashlib.sha256(data).hexdigest()
+
+
 EFI_SYSTEM_GUID = "28732ac11ff8d211ba4b00a0c93ec93b"   # as xorriso prints the EFI System type GUID
 
 
@@ -531,7 +555,15 @@ def compare_isos(iso, copy, changed, work):
         raise CopyError("the test copy has a different appended UEFI partition")
     old, new = {**old, **old_hidden}, {**new, **new_hidden}
     keep = {p: e for p, e in old.items() if p not in changed and p not in old_hidden}
-    a, b = files_sha256(iso, keep), files_sha256(copy, {p: new[p] for p in keep})
+    # Boot images may differ only in the bytes holding their own position (same options in both).
+    masked = self_position_ranges(iso)
+    if masked != self_position_ranges(copy):
+        raise CopyError("the test copy has different El Torito boot image options")
+    plain = {p: e for p, e in keep.items() if p not in masked}
+    a, b = files_sha256(iso, plain), files_sha256(copy, {p: new[p] for p in plain})
+    for p in (p for p in masked if p in keep):
+        a[p] = masked_sha256(file_bytes(iso, old[p]), masked[p])
+        b[p] = masked_sha256(file_bytes(copy, new[p]), masked[p])
     diff = sorted(p for p in keep if a[p] != b[p])
     if diff:
         raise CopyError("files changed in the test copy: " + ", ".join(diff)[:300])
@@ -613,9 +645,13 @@ def make_serial_copy(iso, dest, work, mark):
     if efi_boot_images(dest) != efi_boot_images(iso) or set(hidden_efi_images(dest)) != set(hidden):
         raise CopyError("the test copy has a different UEFI boot image")
     report.append(f"byte-identical (sha256): {len(sums)} other files, {len(inner)} files inside the UEFI boot image")
+    for path, ranges in sorted(self_position_ranges(iso).items()):
+        spans = " and ".join(f"{start}-{end - 1}" for start, end in ranges)
+        report.append(f"{path}: bytes {spans} not compared (its own position, written by xorriso)")
     boot = re.compile(r"(\.efi$|/vmlinuz|/initrd)", re.I)
+    masked = self_position_ranges(iso)
     for path, digest in sorted(list(sums.items()) + list(inner.items())):
-        if boot.search(path):
+        if boot.search(path) and path not in masked:
             report.append(f"unchanged {digest}  {path}")
     return report
 

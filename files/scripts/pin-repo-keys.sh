@@ -45,6 +45,11 @@ check_one() {
   fi
   install -d -m 0755 "$KEY_DIR"
   install -m 0644 "$tmp/key" "$KEY_DIR/forge-$name.gpg"
+  # Also trust the checked key in rpm, so dnf has no "import this key?" question to ask during the
+  # build (nobody is there to answer it, and an unanswered question fails the repo's signature check).
+  if [ -z "${FORGE_KEY_TEST_DIR:-}" ]; then
+    rpm --import "$KEY_DIR/forge-$name.gpg"
+  fi
   echo "pin-repo-keys: $name key OK ($want)"
 }
 

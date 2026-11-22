@@ -37,8 +37,6 @@ modules:
         - NetworkManager-wifi       # Wi-Fi
         - NetworkManager-bluetooth  # internet through a phone over Bluetooth
         - ModemManager              # mobile data (4G/5G) on laptops
-        - bluez                     # Bluetooth
-        - bluez-obexd               # send files over Bluetooth
         - geoclue2                  # location for apps that ask (night light, maps, time zone)
         - cups                      # printing
         - sane-backends             # scanners

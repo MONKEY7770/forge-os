@@ -1,0 +1,42 @@
+name: diag-verify
+# Temporary, test branch only: shows what is attached to Bazzite's images and how each cosign
+# version answers the key check. Read only, no secrets. Will be deleted after one run.
+on:
+  push:
+    branches: [forge-test]
+    paths: [".github/workflows/diag-verify.yml"]
+permissions:
+  contents: read
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Get cosign 2.6.5 and 3.1.3 (checked against the release checksums)
+        run: |
+          for v in v2.6.5 v3.1.3; do
+            curl -fsSL -o "/tmp/cosign-$v" "https://github.com/sigstore/cosign/releases/download/$v/cosign-linux-amd64"
+            curl -fsSL -o "/tmp/sums-$v" "https://github.com/sigstore/cosign/releases/download/$v/cosign_checksums.txt"
+            (cd /tmp && grep " cosign-linux-amd64$" "sums-$v" | sed "s/cosign-linux-amd64/cosign-$v/" | sha256sum -c -)
+            chmod +x "/tmp/cosign-$v"
+          done
+      - name: What is attached
+        run: |
+          for img in ghcr.io/ublue-os/bazzite:stable ghcr.io/ublue-os/bazzite-nvidia-open:stable; do
+            echo "== $img"
+            skopeo inspect --raw "docker://$img" | head -c 600; echo
+            /tmp/cosign-v3.1.3 tree "$img" || true
+          done
+      - name: Key check with each version
+        run: |
+          for img in ghcr.io/ublue-os/bazzite:stable ghcr.io/ublue-os/bazzite-nvidia-open:stable; do
+            for v in v2.6.5 v3.1.3; do
+              echo "== $v $img"
+              "/tmp/cosign-$v" version | grep GitVersion
+              "/tmp/cosign-$v" verify --key .github/keys/ublue-os-bazzite.pub "$img" > /dev/null && echo "OK default" || echo "FAILED default"
+            done
+            echo "== v2.6.5 legacy only"
+            /tmp/cosign-v2.6.5 verify --key .github/keys/ublue-os-bazzite.pub --new-bundle-format=false --experimental-oci11=false "$img" > /dev/null && echo "OK legacy" || echo "FAILED legacy"
+          done

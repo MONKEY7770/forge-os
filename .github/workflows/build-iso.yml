@@ -86,6 +86,11 @@ jobs:
           IMAGE_TAG: ${{ steps.image.outputs.tag }}
           VERSION: ${{ inputs.fedora_version || '45' }}   # scheduled runs have no inputs
           ISO_FILE: ${{ matrix.image }}.iso
+          # Bazzite's NVIDIA and other kernel modules are signed with this key; the installer offers to
+          # enroll it for Secure Boot. Pinned to a commit (main on 2026-11-19) so it can't change under us.
+          # sha256 of the file: 4e5c68474cb133fd8984d9599762cece9100c3e6cd8a9709aeaabd85dd9e70d1
+          # (CN=ublue kernel, O=Universal Blue, valid to 2124).
+          SECURE_BOOT_KEY_URL: https://github.com/ublue-os/akmods/raw/8231c337b7f0f6fc18b72410adabe637be5ad039/certs/public_key.der
         run: |
           mkdir -p /tmp/iso-cache/dnf /tmp/iso-cache/dnf_new
           # IMAGE_SIGNED: the installed system only accepts updates that carry our signature.
@@ -97,15 +102,10 @@ jobs:
             FLATPAK_REMOTE_NAME="flathub" FLATPAK_REMOTE_URL="https://flathub.org/repo/flathub.flatpakrepo" FLATPAK_DIR="" \
             IMAGE_NAME="$IMAGE_NAME" IMAGE_REPO="ghcr.io/monkey7770" IMAGE_SIGNED="true" \
             IMAGE_SRC="$IMAGE_SRC" IMAGE_TAG="$IMAGE_TAG" ISO_NAME="/github/workspace/$ISO_FILE" \
-            SECURE_BOOT_KEY_URL="" VARIANT="Kinoite" VERSION="$VERSION" WEB_UI="false"
+            SECURE_BOOT_KEY_URL="$SECURE_BOOT_KEY_URL" ENROLLMENT_PASSWORD="universalblue" \
+            VARIANT="Kinoite" VERSION="$VERSION" WEB_UI="false"
           echo "iso_path=." >> "$GITHUB_OUTPUT"
           echo "iso_name=$ISO_FILE" >> "$GITHUB_OUTPUT"
-          # Bazzite's NVIDIA and other kernel modules are signed with this key. Pinned to a commit
-          # (main on 2026-11-19) so it can't change under us. sha256 of the file:
-          # 4e5c68474cb133fd8984d9599762cece9100c3e6cd8a9709aeaabd85dd9e70d1
-          # (CN=ublue kernel, O=Universal Blue, valid to 2124).
-          secure_boot_key_url: https://github.com/ublue-os/akmods/raw/8231c337b7f0f6fc18b72410adabe637be5ad039/certs/public_key.der
-          enrollment_password: universalblue
 
       - name: Upload ISO
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2

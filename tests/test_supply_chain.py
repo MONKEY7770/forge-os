@@ -243,9 +243,14 @@ class WorkflowHardeningTests(unittest.TestCase):
         self.assertIn("- recipe-universal.yml", text)
 
     def test_secure_boot_key_url_pinned_to_a_commit(self):
-        m = re.search(r"secure_boot_key_url:\s*(\S+)", self.wf("build-iso.yml"))
-        self.assertTrue(m)
-        self.assertRegex(m.group(1), r"^https://github\.com/ublue-os/akmods/raw/[0-9a-f]{40}/certs/public_key\.der$")
+        wf = yaml.safe_load(self.wf("build-iso.yml"))
+        build = [s for s in wf["jobs"]["iso"]["steps"] if s.get("id") == "build"]
+        self.assertEqual(len(build), 1)
+        url = build[0]["env"]["SECURE_BOOT_KEY_URL"]
+        self.assertRegex(url, r"^https://github\.com/ublue-os/akmods/raw/[0-9a-f]{40}/certs/public_key\.der$")
+        # And the builder really gets it (a dropped argument once left the key out of the ISO).
+        self.assertIn('SECURE_BOOT_KEY_URL="$SECURE_BOOT_KEY_URL"', build[0]["run"])
+        self.assertIn('ENROLLMENT_PASSWORD="universalblue"', build[0]["run"])
 
 
 class CiGateTests(unittest.TestCase):

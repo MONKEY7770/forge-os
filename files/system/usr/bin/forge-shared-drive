@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""forge-shared-drive: open the drive you share with Windows, and keep ~/Shared pointing at it.
+
+  forge-shared-drive                 find the drive, mount it, make the Shared link (quiet if all is fine)
+  forge-shared-drive status          show what it found, without changing anything
+  forge-shared-drive status --json   the same, as JSON (for the dashboard and forge-doctor)
+
+Turn it on in Forge Settings, under "Storage and shared drive". It runs by itself when you
+log in and when a drive is plugged in. It runs as you, never as root: udisks mounts the
+drive, like opening it in Dolphin. It only accepts exFAT and NTFS drives with the name set
+in Forge Settings, and it never forces open a drive that Windows left in use.
+"""
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, os.environ.get("FORGE_LIB", "/usr/lib/forge"))
+import forgecfg  # noqa: E402
+
+MOUNTINFO = os.environ.get("FORGE_MOUNTINFO", "/proc/self/mountinfo")
+# Where udisks (or a hand-made fstab line) mounts drives. Anything else is refused.
+MEDIA = [p for p in os.environ.get("FORGE_SHARED_MEDIA", "/run/media/:/media/:/mnt/:/var/mnt/").split(":") if p]
+BOOT_ID = "/proc/sys/kernel/random/boot_id"
+LSBLK = ["lsblk", "--json", "-o", "NAME,PATH,LABEL,FSTYPE,MOUNTPOINT,UUID,PARTUUID"]
+# The ids that tell drives apart: the filesystem UUID (exFAT/NTFS serial) and the partition's own id.
+PINS = (("drive_uuid", "uuid"), ("drive_partuuid", "partuuid"))
+IDENT = re.compile(r"[0-9A-Za-z-]{1,64}")
+ALLOWED = {"exfat": "exFAT", "ntfs": "NTFS", "ntfs3": "NTFS"}
+LINUX_FS = {"ext2", "ext3", "ext4", "btrfs", "xfs", "f2fs", "jfs", "reiserfs", "swap", "crypto_LUKS",
+            "LVM2_member", "linux_raid_member", "zfs_member", "bcachefs", "erofs", "squashfs"}
+DEVICE = re.compile(r"/dev/[A-Za-z0-9][A-Za-z0-9_.:+/-]{0,200}")
+# Words udisks, ntfs3 and ntfs-3g use when Windows left an NTFS drive in use (hibernated or
+# Fast Startup). ntfs3 often only says "wrong fs type", so on NTFS that counts too.
+DIRTY = re.compile(r"dirty|unclean|hibernat|metadata kept|force|wrong fs type|bad superblock", re.I)
+
+FIX_WINDOWS = ("Windows left this drive in use, so Forge OS did not open it (forcing it could lose files). "
+               "Start Windows and shut it down fully (hold Shift while you click Shut down), or better, turn off "
+               "Fast Startup: Control Panel, Power Options, \"Choose what the power buttons do\", untick "
+               "\"Turn on fast startup\". Then log in to Forge OS again. "
+               "In short: turn off Windows Fast Startup or shut Windows down fully.")
+NEEDS = "Reformat it in Windows as exFAT or NTFS (this erases it), or pick another drive."
+
+
+def clean(text, limit=200):
+    """Text from lsblk, udisks or settings, made safe to print: no control characters."""
+    text = "".join(c if c.isprintable() else "?" for c in str(text))
+    return text[:limit]
+
+
+def state_dir():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local/state")
+    return os.path.join(base, "forge")
+
+
+def load_state():
+    try:
+        with open(os.path.join(state_dir(), "shared-drive.json")) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(data):
+    d = state_dir()
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        tmp = os.path.join(d, f".shared-drive.{os.getpid()}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, os.path.join(d, "shared-drive.json"))
+    except OSError:
+        pass   # only used to remember our own link and notices; never worth failing for
+
+
+def settings():
+    """(enabled, label or None, link). Values are checked again here: the file can be edited by hand."""
+    defs = forgecfg.settings_by_key()
+    vals = forgecfg.values()
+
+    def get(key):
+        try:
+            return forgecfg.coerce(defs[key], vals.get(key))
+        except (ValueError, TypeError):
+            return None
+    enabled = get("storage.shared_drive_enabled") is True
+    link = get("storage.shared_drive_link")
+    label = get("storage.shared_drive_label")
+    # Stricter than the shared check: the raw value must already be clean text (no spaces or
+    # line breaks trimmed away, no numbers or null turned into text).
+    if label != vals.get("storage.shared_drive_label"):
+        label = None
+    return enabled, label, link is not False
+
+
+def run(cmd, timeout):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        return 127, "", str(e)
+    return r.returncode, r.stdout or "", r.stderr or ""
+
+
+def partitions():
+    """Every block device lsblk knows, flattened. None if lsblk did not answer."""
+    rc, out, _ = run(LSBLK, 20)
+    if rc != 0:
+        return None
+    try:
+        tree = json.loads(out).get("blockdevices") or []
+    except (ValueError, AttributeError):
+        return None
+    flat, todo = [], list(tree)
+    while todo and len(flat) < 4096:
+        d = todo.pop(0)
+        if not isinstance(d, dict):
+            continue
+        flat.append(d)
+        todo.extend(d.get("children") or [])
+    return flat
+
+
+def mount_options(mountpoint):
+    """Mount options for that folder from mountinfo, or None if it isn't listed."""
+    try:
+        with open(MOUNTINFO) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    found = None
+    for line in lines:
+        parts = line.split(" ")
+        if len(parts) < 6:
+            continue
+        mp = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), parts[4])
+        if mp == mountpoint:
+            opts = set(parts[5].split(","))
+            if " - " in line:
+                opts |= set(line.split(" - ", 1)[1].split(" ")[-1].split(","))
+            found = opts   # the last line wins: that's the mount on top
+    return found
+
+
+def good_mountpoint(mp):
+    if not isinstance(mp, str) or not mp.startswith("/") or not mp.isprintable():
+        return False
+    norm = os.path.normpath(mp)
+    return norm == mp.rstrip("/") and any(norm.startswith(p) and len(norm) > len(p) for p in MEDIA)
+
+
+def is_windows_system(mp):
+    """True if the folder has Windows/System32 (any letter case)."""
+    def child(folder, name):
+        try:
+            with os.scandir(folder) as it:
+                for e in it:
+                    if e.name.lower() == name and e.is_dir(follow_symlinks=False):
+                        return e.path
+        except OSError:
+            pass
+        return None
+    win = child(mp, "windows")
+    return bool(win and child(win, "system32"))
+
+
+def find(label):
+    """Look at the drives. Returns a result dict (state, message and what was found)."""
+    devs = partitions()
+    if devs is None:
+        return {"state": "error", "message": "Not sure: lsblk did not answer, so the drives could not be listed."}
+    hits = [d for d in devs if isinstance(d.get("label"), str) and d["label"].lower() == label.lower()]
+    if not hits:
+        return {"state": "not_found",
+                "message": f"No drive named {label} found. Plug it in, or check its name in Windows."}
+    if len(hits) > 1:
+        names = ", ".join(clean(d.get("path"), 60) for d in hits[:5])
+        return {"state": "several",
+                "message": f"There is more than one drive named {label} ({names}), so Forge OS won't guess. "
+                           "Rename all but one in Windows."}
+    d = hits[0]
+    res = {"device": d.get("path"), "fstype": d.get("fstype"), "uuid": d.get("uuid"),
+           "partuuid": d.get("partuuid"), "mountpoint": d.get("mountpoint")}
+    if not isinstance(res["device"], str) or not DEVICE.fullmatch(res["device"]) or "/../" in res["device"] \
+            or "/./" in res["device"]:
+        return dict(res, device=clean(res["device"], 60), state="refused",
+                    message="The drive's device name looks wrong, so Forge OS won't touch it.")
+    fs = res["fstype"]
+    if fs == "BitLocker":
+        msg = ("It is locked with BitLocker, which Forge OS can't open. In Windows, turn BitLocker off for this "
+               "drive (a shared drive doesn't need it), or pick another drive.")
+    elif fs == "vfat":
+        msg = "It is FAT32, which can't hold files over 4 GB and loses files more easily. " + NEEDS
+    elif fs in LINUX_FS:
+        msg = f"It uses a Linux format ({clean(fs, 30)}) that Windows can't read. " + NEEDS
+    elif fs not in ALLOWED:
+        msg = (f"Its format ({clean(fs, 30)}) is not exFAT or NTFS." if fs else
+               "It has no format Forge OS can recognise (it may be empty or damaged).") + " " + NEEDS
+    else:
+        msg = None
+    if msg:
+        return dict(res, fstype=clean(fs, 30) if fs else None, state="refused",
+                    message=f"Drive {label} ({res['device']}): {msg}")
+    if res["mountpoint"] is None:
+        return dict(res, state="not_mounted", message=f"Drive {label} is not open yet.")
+    return check_mounted(res, label)
+
+
+def check_mounted(res, label):
+    mp = res["mountpoint"]
+    if not good_mountpoint(mp):
+        return dict(res, mountpoint=clean(mp, 100), state="refused",
+                    message=f"Drive {label} is open in an unexpected place ({clean(mp, 100)}), so Forge OS "
+                            "leaves it alone.")
+    if is_windows_system(mp):
+        return dict(res, state="refused", windows_system=True,
+                    message=f"Drive {label} ({res['device']}) is the Windows system drive (it has Windows\\System32). "
+                            "Never share that one: make a separate partition for shared files.")
+    opts = mount_options(mp)
+    if opts is not None and "ro" in opts:
+        extra = FIX_WINDOWS if ALLOWED.get(res["fstype"]) == "NTFS" else \
+            "It may need a check: in Windows, right-click the drive, Properties, Tools, Check."
+        return dict(res, state="read_only", message=f"Drive {label} opened read-only. " + extra)
+    return dict(res, state="mounted", message=f"Drive {label} is open at {mp}.")
+
+
+def ident(value):
+    """A drive id from lsblk, or None if there is none (an exFAT or NTFS serial of 0 shows as none)."""
+    return value if isinstance(value, str) and IDENT.fullmatch(value) else None
+
+
+def link_status(target, state, link_on):
+    link = os.path.join(os.path.expanduser("~"), "Shared")
+    if not link_on:
+        return "off"
+    if not os.path.lexists(link):
+        return "missing"
+    if not os.path.islink(link):
+        return "not_symlink"
+    cur = os.readlink(link)
+    if target and cur == target:
+        return "ok"
+    return "stale" if cur == state.get("link_target") else "foreign"
+
+
+def notify(summary, body, key):
+    """Desktop notice, at most once per problem per boot. Text is escaped (no links or markup)."""
+    st = load_state()
+    try:
+        with open(BOOT_ID) as f:
+            boot = f.read().strip()
+    except OSError:
+        boot = ""
+    if st.get("notified") == [key, boot]:
+        return
+    run(["notify-send", "-u", "critical", "-a", "Forge OS", "--", html.escape(summary), html.escape(body)], 15)
+    st["notified"] = [key, boot]
+    save_state(st)
+
+
+def make_link(target, link_on):
+    """Create or repair ~/Shared. Only ever touches a link Forge made itself."""
+    link = os.path.join(os.path.expanduser("~"), "Shared")
+    st = load_state()
+    ours = st.get("link_target")
+    if not link_on:
+        if os.path.islink(link) and ours and os.readlink(link) == ours:
+            os.unlink(link)
+            st.pop("link_target", None)
+            save_state(st)
+        return None
+    if os.path.islink(link):
+        cur = os.readlink(link)
+        if cur == target:
+            if ours != target:
+                st["link_target"] = target
+                save_state(st)
+            return None
+        if not ours or cur != ours:
+            return (f"{link} already exists and points somewhere else, so Forge OS left it alone. "
+                    f"The shared drive is at {target}.")
+        tmp = os.path.join(os.path.dirname(link), f".Shared.forge-{os.getpid()}")
+        try:
+            os.symlink(target, tmp)
+            os.replace(tmp, link)   # only the link is replaced; a folder or file here makes this fail
+        except OSError as e:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return f"Could not update {link} ({e.strerror}). The shared drive is at {target}."
+    elif os.path.lexists(link):
+        return (f"{link} already exists and is not a link, so Forge OS left it alone. "
+                f"The shared drive is at {target}.")
+    else:
+        try:
+            os.symlink(target, link)
+        except OSError as e:
+            return f"Could not make {link} ({e.strerror}). The shared drive is at {target}."
+    st["link_target"] = target
+    save_state(st)
+    return None
+
+
+def status(as_json):
+    enabled, label, link_on = settings()
+    out = {"enabled": enabled, "label": label, "link_enabled": link_on, "state": "off",
+           "device": None, "fstype": None, "uuid": None, "mountpoint": None, "link": None,
+           "message": "Shared drive is off. Turn it on in Forge Settings, under Storage and shared drive."}
+    if enabled and label is None:
+        out.update(state="bad_label", message=BAD_LABEL)
+    elif enabled:
+        out.update(find(label))
+        if out["state"] == "not_mounted":
+            out["message"] += " It opens when you log in, or run: forge-shared-drive"
+        target = out["mountpoint"] if out["state"] in ("mounted", "read_only") else None
+        out["link"] = link_status(target, load_state(), link_on)
+    for k in ("uuid", "fstype"):
+        if out[k] is not None:
+            out[k] = clean(out[k], 64)
+    if as_json:
+        print(json.dumps(out, indent=2))
+    else:
+        print(f"Shared drive: {out['state']}")
+        print(clean(out["message"], 600))
+        if out["link"]:
+            print(f"~/Shared link: {out['link']}")
+    return 0
+
+
+BAD_LABEL = ("The shared drive name in Forge Settings is not valid. Use letters, numbers, - and _ only, "
+             "up to 32 characters, then save again.")
+
+
+def problem(text, key, summary="Forge OS: shared drive not opened"):
+    print(clean(text, 1200), file=sys.stderr)
+    notify(summary, clean(text, 1200), f"{key}:{text}")
+    return 1
+
+
+def mount_now():
+    enabled, label, link_on = settings()
+    if not enabled:
+        return 0
+    if label is None:
+        return problem(BAD_LABEL, "bad_label")
+    res = find(label)
+    mounted_by_us = False
+    # Remember which drive is the shared one (its UUID, and its partition id when lsblk has one),
+    # so another drive or stick given the same name is never opened or linked without asking.
+    # Once a drive is remembered, a drive that lacks a remembered id counts as a different drive.
+    state = load_state()
+    pinned = {k: state[k] for k, _ in PINS if isinstance(state.get(k), str)}
+    if pinned and "device" in res and any(ident(res.get(col)) != pinned[k] for k, col in PINS if k in pinned):
+        return problem(f"A different drive named {label} is connected, not the one used before. It was not "
+                       "opened. If you really replaced your shared drive, run: forge-shared-drive accept",
+                       "other_drive", "Forge OS: unknown drive named " + label)
+    if res["state"] == "not_mounted" and ALLOWED.get(res["fstype"]) == "NTFS":
+        # Look first without writing: a Windows system drive is only ever opened read-only.
+        rc, out, err = run(["udisksctl", "mount", "-b", res["device"], "--no-user-interaction", "-o", "ro"], 120)
+        if rc == 0:
+            peek = find(label)
+            run(["udisksctl", "unmount", "-b", res["device"], "--no-user-interaction"], 60)
+            if peek.get("windows_system"):
+                return problem(peek["message"], "refused")
+        elif DIRTY.search((err or out).strip()):
+            return problem(FIX_WINDOWS, "dirty", "Forge OS: Windows is still using the shared drive")
+    if res["state"] == "not_mounted":
+        rc, out, err = run(["udisksctl", "mount", "-b", res["device"], "--no-user-interaction"], 120)
+        if rc != 0:
+            why = (err or out).strip()
+            if "NotAuthorized" in why or "Not authorized" in why:
+                return problem(f"Forge OS is not allowed to open drive {label} without your password. "
+                               "Save the shared drive setting again in Forge Settings so the permission is "
+                               "added, then log out and in.", "not_authorized")
+            if ALLOWED.get(res["fstype"]) == "NTFS" and DIRTY.search(why):
+                return problem(FIX_WINDOWS, "dirty", "Forge OS: Windows is still using the shared drive")
+            return problem(f"Could not open drive {label}: {clean(why, 300) or 'udisks gave no reason'}",
+                           "mount_failed")
+        mounted_by_us = True
+        res = find(label)
+        if res["state"] == "not_mounted":
+            return problem(f"Drive {label} did not show up as open after mounting. Not sure why.", "mount_failed")
+    if res["state"] == "not_found":
+        print(res["message"])
+        return 0
+    if res["state"] == "refused" and mounted_by_us and res.get("windows_system"):
+        run(["udisksctl", "unmount", "-b", res["device"], "--no-user-interaction"], 60)
+    if res["state"] == "read_only":
+        key = "dirty" if ALLOWED.get(res["fstype"]) == "NTFS" else "read_only"
+        rc = problem(res["message"], key, "Forge OS: shared drive is read-only")
+        note = make_link(res["mountpoint"], link_on)
+        if note:
+            print(clean(note, 600), file=sys.stderr)
+        return rc
+    if res["state"] != "mounted":
+        return problem(res["message"], res["state"])
+    ids = {k: ident(res.get(col)) for k, col in PINS}
+    if not pinned and any(ids.values()):
+        state = load_state()
+        state.update({k: v for k, v in ids.items() if v})
+        save_state(state)
+    elif not pinned:
+        print(f"Note: drive {label} has no id (UUID or partition id), so Forge OS can't recognise this drive "
+              "later. Another drive given the same name would be opened too. To fix it, give the drive a new "
+              "serial in Windows (reformat it as exFAT or NTFS, which erases it).")
+    note = make_link(res["mountpoint"], link_on)
+    if note:
+        print(clean(note, 600))
+    elif mounted_by_us:
+        print(clean(res["message"], 600))
+    return 0
+
+
+def main(argv):
+    if not argv or argv == ["mount"]:
+        return mount_now()
+    if argv == ["accept"]:
+        # The owner replaced the shared drive: the next drive with the name becomes the shared one.
+        state = load_state()
+        for key, _ in PINS:
+            state.pop(key, None)
+        save_state(state)
+        print("OK: the next drive with the shared drive name will be used and remembered.")
+        return 0
+    if argv[0] == "status" and argv[1:] in ([], ["--json"]):
+        return status(argv[1:] == ["--json"])
+    if argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

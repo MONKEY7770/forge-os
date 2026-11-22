@@ -1,0 +1,12 @@
+# Screenshot test image: the published Forge OS image (by digest, signature checked by the
+# workflow) plus test-only pieces. Built on the runner, used once, never pushed anywhere.
+ARG BASE
+FROM ${BASE}
+# A browser for the Forge Settings page. The real image installs Firefox as a Flatpak on first
+# boot, which needs the internet; the test VM has no network.
+RUN dnf5 -y install firefox && dnf5 clean all
+# Test account with automatic login, its browser choice, and the probe that talks to the runner.
+COPY files/ /
+RUN chmod 0755 /usr/libexec/forge-screenshot-probe \
+ && systemctl enable forge-screenshot-probe.service \
+ && rm -f /etc/xdg/autostart/forge-welcome.desktop

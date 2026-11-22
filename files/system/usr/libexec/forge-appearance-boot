@@ -1,0 +1,657 @@
+#!/usr/bin/env python3
+"""forge-appearance-boot: puts the Bootup settings from Forge Settings, Appearance into effect.
+
+Started by forge-appearance (or the "Save and apply" button) as you, never as root, with argv ["apply"]
+and the values on stdin (see the appearance contract).
+
+  Desktop splash (after login)  per user: a small look-and-feel package in
+                                ~/.local/share/plasma/look-and-feel/org.forgeos.bootsplash and ~/.config/ksplashrc
+  Lock screen                   per user: ~/.config/kscreenlockerrc
+  Boot splash, login screen     for the whole PC: converted here as you, then handed to
+                                /usr/libexec/forge-boot-apply through pkexec (admin password), only when they changed.
+
+Every file it changes in your home is remembered in ~/.local/state/forge/appearance-boot.json, and
+choosing the default again puts back exactly what was there before.
+"""
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import sys
+import tempfile
+import time
+
+sys.path.insert(0, os.environ.get("FORGE_LIB", "/usr/lib/forge"))
+import forgeappearance as fa  # noqa: E402
+import forgebootmedia as fbm  # noqa: E402
+
+ROOT = os.environ.get("FORGE_BOOT_ROOT", "")                          # tests only
+PKEXEC = os.environ.get("FORGE_BOOT_PKEXEC", "/usr/bin/pkexec")        # tests only
+HELPER = os.environ.get("FORGE_BOOT_HELPER", "/usr/libexec/forge-boot-apply")
+ROOT_STATE = "/var/lib/forge-boot/state.json"
+DM_LINK = "/etc/systemd/system/display-manager.service"
+VIDEO_PLUGIN = "luisbocanegra.smart.video.wallpaper.reborn"
+SPLASH_ID = "org.forgeos.bootsplash"
+STARTED = time.monotonic()
+TIME_BUDGET_S = 112          # forge-appearance stops a backend after 120 seconds
+
+
+def _budget():
+    try:
+        v = int(os.environ.get("FORGE_BOOT_BUDGET_S", ""))      # tests only, and only lower
+    except ValueError:
+        return TIME_BUDGET_S
+    return v if 0 < v < TIME_BUDGET_S else TIME_BUDGET_S
+
+
+BUDGET_S = _budget()
+CONVERT_SHARE_S = BUDGET_S - 15   # media conversion stops here, so the password prompt still gets time
+SIDES = {"small": 240, "medium": 360, "large": 480}
+STDIN_MAX = 4 * 1024 * 1024
+
+
+class Failed(Exception):
+    """This part was not applied. The text is for the user."""
+
+
+# Small helpers
+
+def home():
+    return os.path.expanduser("~")
+
+
+def xdg(name, fallback):
+    base = os.environ.get(name, "")
+    return base if os.path.isabs(base) else os.path.join(home(), fallback)
+
+
+def config_dir():
+    return xdg("XDG_CONFIG_HOME", ".config")
+
+
+def data_dir():
+    return xdg("XDG_DATA_HOME", ".local/share")
+
+
+def state_path():
+    return os.path.join(xdg("XDG_STATE_HOME", ".local/state"), "forge", "appearance-boot.json")
+
+
+def private_dir(path):
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise Failed(f"{path} is not a folder of yours (a link?), so nothing was changed")
+    return path
+
+
+def read_file(path, limit=1024 * 1024):
+    """Text of a regular file of yours, None if missing. Failed if it is a link or something odd."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise Failed(f"{path} is a link or can't be opened, so it was left alone")
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            raise Failed(f"{path} is not a normal settings file, so it was left alone")
+        return f.read(limit).decode("utf-8", "surrogateescape")
+
+
+def write_file(path, text, mode=0o600):
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    if os.path.islink(path):
+        raise Failed(f"{path} is a link, so it was left alone")
+    try:
+        mode = stat.S_IMODE(os.lstat(path).st_mode)
+    except FileNotFoundError:
+        pass
+    fd, tmp = tempfile.mkstemp(dir=d, prefix="." + os.path.basename(path) + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
+            f.write(text)
+            os.fchmod(f.fileno(), mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def remove(path):
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(st.st_mode):
+        shutil.rmtree(path)
+    else:
+        os.unlink(path)
+
+
+def load_state():
+    try:
+        st = json.loads(read_file(state_path()) or "{}")
+    except (ValueError, Failed):
+        st = {}
+    return st if isinstance(st, dict) else {}
+
+
+def save_state(st):
+    private_dir(os.path.dirname(os.path.dirname(state_path())))
+    private_dir(os.path.dirname(state_path()))
+    write_file(state_path(), json.dumps(st, indent=1, sort_keys=True) + "\n")
+
+
+def media_item(payload, mid):
+    """The library file for a media id, checked again: a regular file in your media folder, not a link."""
+    if not isinstance(mid, str) or not re.fullmatch(fa.MEDIA_ID_RE, mid):
+        return None
+    item = (payload.get("media") or {}).get(mid)
+    if not isinstance(item, dict) or item.get("kind") not in fa.KINDS or item.get("format") not in fa.FORMATS:
+        return None
+    path = item.get("path")
+    if not isinstance(path, str) or os.path.dirname(path) != fa.media_dir():
+        return None
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    return dict(item, id=mid, ext=fa.FORMATS[item["format"]][0][0], size=st.st_size, mtime=st.st_mtime_ns)
+
+
+def place(item, dest):
+    """Put a copy of a library file at dest (a hard link when possible: instant, and it survives removal
+    from the library)."""
+    remove(dest)
+    try:
+        os.link(item["path"], dest, follow_symlinks=False)
+    except OSError:
+        shutil.copyfile(item["path"], dest, follow_symlinks=False)
+        os.chmod(dest, 0o600)
+
+
+def video_plugin_installed():
+    return any(os.path.isfile(p + "/metadata.json") for p in (
+        ROOT + "/usr/share/plasma/wallpapers/" + VIDEO_PLUGIN,
+        os.path.join(data_dir(), "plasma/wallpapers", VIDEO_PLUGIN)))
+
+
+# KDE config files: change single keys, and remember what was there before
+
+GROUP_RE = re.compile(r"\[.*\]")
+
+
+class KFile:
+    def __init__(self, path):
+        self.path = path
+        self.original = read_file(path)
+        self.lines = (self.original or "").split("\n")
+        if self.lines and self.lines[-1] == "":
+            self.lines.pop()
+
+    def _group(self, group):
+        start = None
+        for i, line in enumerate(self.lines):
+            s = line.strip()
+            if GROUP_RE.fullmatch(s):
+                if start is not None:
+                    return start, i
+                if s == group:
+                    start = i
+        return (start, len(self.lines)) if start is not None else (None, None)
+
+    def _key_line(self, group, key):
+        start, end = self._group(group)
+        if start is None:
+            return None, None, None
+        pat = re.compile(re.escape(key) + r"(\[[^\]]*\])?\s*=")
+        for i in range(start + 1, end):
+            if pat.match(self.lines[i]):
+                return i, start, end
+        return None, start, end
+
+    def get(self, group, key):
+        i, _, _ = self._key_line(group, key)
+        return None if i is None else self.lines[i].split("=", 1)[1]
+
+    def set(self, group, key, value):
+        i, start, end = self._key_line(group, key)
+        if value is None:
+            if i is not None:
+                del self.lines[i]
+                s, e = self._group(group)
+                if s is not None and all(not x.strip() for x in self.lines[s + 1:e]):
+                    del self.lines[s:e]
+                    while self.lines and not self.lines[-1].strip():
+                        self.lines.pop()
+            return
+        line = f"{key}={value}"
+        if i is not None:
+            self.lines[i] = line
+        elif start is not None:
+            j = end
+            while j > start + 1 and not self.lines[j - 1].strip():
+                j -= 1
+            self.lines.insert(j, line)
+        else:
+            if self.lines and self.lines[-1].strip():
+                self.lines.append("")
+            self.lines += [group, line]
+
+    def text(self):
+        return "\n".join(self.lines) + "\n" if self.lines else ""
+
+
+def kset(st, part, path, changes):
+    """Set keys {(group, key): value} in a KDE config file and remember the earlier values for undo."""
+    rec = st.setdefault(part, {})
+    kf = KFile(path)
+    if "original" not in rec:
+        rec["original"] = kf.original
+        rec["keys"] = []
+    before = {tuple(k[:2]): k[2] for k in rec["keys"]}
+    for (g, k), v in changes.items():
+        if (g, k) not in before:
+            before[(g, k)] = kf.get(g, k)
+        kf.set(g, k, v)
+    rec["keys"] = [[g, k, v] for (g, k), v in before.items()]
+    rec["set"] = {f"{g}\t{k}": v for (g, k), v in changes.items()}
+    rec["written"] = kf.text()
+    write_file(path, rec["written"])
+
+
+def kundo(st, part, path):
+    rec = st.get(part)
+    if not rec:
+        return False
+    kf = KFile(path)
+    if kf.original == rec.get("written"):
+        if rec.get("original") is None:
+            remove(path)
+        else:
+            write_file(path, rec["original"])
+    else:
+        # Changed since (by you or by System Settings): put back only the keys still holding our value.
+        mine = rec.get("set", {})
+        for g, k, old in rec.get("keys", []):
+            if f"{g}\t{k}" in mine and kf.get(g, k) == mine[f"{g}\t{k}"]:
+                kf.set(g, k, old)
+        write_file(path, kf.text())
+    st.pop(part, None)
+    return True
+
+
+# Desktop splash after login (KSplash)
+
+QML_HEAD = """// Written by Forge OS (Forge Settings, Appearance, Bootup). Choose "Plasma's own" there to remove it.
+// The settings below are JSON values, never code.
+import QtQuick
+"""
+QML = {
+    "image": QML_HEAD + """
+Rectangle {
+    id: root
+    readonly property var forge: (@JSON@)
+    property int stage
+    color: root.forge.background
+    Image {
+        anchors.fill: parent
+        source: Qt.resolvedUrl(root.forge.file)
+        fillMode: Image.PreserveAspectCrop
+        smooth: true
+    }
+}
+""",
+    "animated-image": QML_HEAD + """
+Rectangle {
+    id: root
+    readonly property var forge: (@JSON@)
+    property int stage
+    color: root.forge.background
+    AnimatedImage {
+        anchors.fill: parent
+        source: Qt.resolvedUrl(root.forge.file)
+        fillMode: Image.PreserveAspectCrop
+        playing: true
+    }
+}
+""",
+    "video": QML_HEAD + """import QtMultimedia
+
+Rectangle {
+    id: root
+    readonly property var forge: (@JSON@)
+    property int stage
+    color: root.forge.background
+    VideoOutput {
+        id: screen
+        anchors.fill: parent
+        fillMode: VideoOutput.PreserveAspectCrop
+    }
+    MediaPlayer {
+        id: player
+        source: Qt.resolvedUrl(root.forge.file)
+        videoOutput: screen
+        loops: MediaPlayer.Infinite
+        Component.onCompleted: player.play()
+    }
+}
+""",
+}
+
+
+def desktop_splash(values, payload, st, out):
+    pkg = os.path.join(data_dir(), "plasma/look-and-feel", SPLASH_ID)
+    rc_path = os.path.join(config_dir(), "ksplashrc")
+    if values.get("desktop_splash") != "custom":
+        if st.get("ksplash"):
+            kundo(st, "ksplash", rc_path)
+            remove(pkg)
+            out.append("Desktop splash: back to Plasma's own.")
+        return True
+    item = media_item(payload, values.get("desktop_splash_media"))
+    if item is None:
+        raise Failed("Desktop splash: choose a picture or video first.")
+    for d in (os.path.join(data_dir(), "plasma"), os.path.join(data_dir(), "plasma/look-and-feel")):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        if os.path.islink(d):
+            raise Failed(f"Desktop splash: {d} is a link, so nothing was changed.")
+    tmp = tempfile.mkdtemp(prefix="." + SPLASH_ID + ".", dir=os.path.dirname(pkg))
+    try:
+        os.chmod(tmp, 0o755)
+        os.makedirs(os.path.join(tmp, "contents/splash/images"))
+        meta = {"KPlugin": {"Id": SPLASH_ID, "Name": "Forge OS splash",
+                            "Description": "Made by Forge Settings (Appearance, Bootup)",
+                            "Authors": [{"Name": "Forge OS"}], "License": "GPL-2.0-or-later", "Version": "1"},
+                "KPackageStructure": "Plasma/LookAndFeel", "X-Plasma-APIVersion": "2"}
+        with open(os.path.join(tmp, "metadata.json"), "w") as f:
+            json.dump(meta, f, indent=1)
+        name = "media." + item["ext"]
+        place(item, os.path.join(tmp, "contents/splash/images", name))
+        cfg = json.dumps({"kind": item["kind"], "file": "images/" + name, "background": "#000000"},
+                         ensure_ascii=True, sort_keys=True)
+        with open(os.path.join(tmp, "contents/splash/Splash.qml"), "w") as f:
+            f.write(QML[item["kind"]].replace("@JSON@", cfg))
+        remove(pkg)
+        os.rename(tmp, pkg)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    kset(st, "ksplash", rc_path, {("[KSplash]", "Engine"): "KSplashQML", ("[KSplash]", "Theme"): SPLASH_ID})
+    out.append("Desktop splash: applied. You see it at your next login.")
+    return True
+
+
+# Lock screen
+
+def lock_screen(values, payload, st, out):
+    rc_path = os.path.join(config_dir(), "kscreenlockerrc")
+    applied = os.path.join(fa.data_dir(), "applied")
+    mode = values.get("lock_screen")
+    if mode not in ("desktop", "custom"):
+        if st.get("lock"):
+            kundo(st, "lock", rc_path)
+            remove(applied + "/lock")
+            out.append("Lock screen: back to Plasma's own.")
+        return True
+    item, color = None, None
+    if mode == "custom":
+        item = media_item(payload, values.get("lock_media"))
+        if item is None:
+            raise Failed("Lock screen: choose a picture or video first.")
+    else:
+        schema = fa.load_schema()
+        bg = next((s for s in schema["sections"] if s["id"] == "background"), None)
+        bvals = (payload.get("all") or {}).get("background") or {}
+        for f in bg["fields"] if bg else []:
+            if not fa.visible(f, bvals):
+                continue
+            if f["type"] == "media" and item is None and bvals.get(f["key"]):
+                item = media_item(payload, bvals[f["key"]])
+            if f["type"] == "color" and color is None and isinstance(bvals.get(f["key"]), str) \
+                    and re.fullmatch(r"#[0-9a-f]{6}", bvals[f["key"]]):
+                color = bvals[f["key"]]
+        if item is None and color is None:
+            raise Failed("Lock screen: the desktop background has no picture, video or colour yet.")
+    if item is not None and item["kind"] == "video" and not video_plugin_installed():
+        raise Failed("Lock screen: a video needs the Smart Video Wallpaper plugin, which is not installed. "
+                     "The lock screen was left as it was.")
+    changes = {}
+    if item is not None:
+        private_dir(fa.data_dir())
+        private_dir(applied)
+        lock_dir = private_dir(applied + "/lock")
+        dest = os.path.join(lock_dir, f"lock-{item['id']}.{item['ext']}")
+        for n in os.listdir(lock_dir):
+            if os.path.join(lock_dir, n) != dest:
+                remove(os.path.join(lock_dir, n))
+        place(item, dest)
+        url = "file://" + dest
+        if item["kind"] == "video":
+            plugin = VIDEO_PLUGIN
+            video = {"filename": url, "enabled": True, "duration": 0, "customDuration": 0, "playbackRate": 0,
+                     "alternativePlaybackRate": 0, "loop": True, "dayNightCycleAssignment": 0}
+            g = f"[Greeter][Wallpaper][{plugin}][General]"
+            changes = {(g, "VideoUrls"): "[" + json.dumps(video, separators=(",", ":")) + "]",
+                       (g, "MuteMode"): "5", (g, "FillMode"): "2"}
+        else:
+            plugin = "org.kde.image"
+            changes = {("[Greeter][Wallpaper][org.kde.image][General]", "Image"): url}
+    else:
+        plugin = "org.kde.color"
+        rgb = ",".join(str(int(color[i:i + 2], 16)) for i in (1, 3, 5))
+        changes = {("[Greeter][Wallpaper][org.kde.color][General]", "Color"): rgb}
+    changes[("[Greeter]", "WallpaperPlugin")] = plugin
+    kset(st, "lock", rc_path, changes)
+    out.append("Lock screen: applied. You see it the next time the screen locks.")
+    return True
+
+
+# Boot splash and login screen: through the root helper
+
+def root_state():
+    try:
+        with open(ROOT + ROOT_STATE) as f:
+            st = json.load(f)
+        return st if isinstance(st, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def fingerprint(obj):
+    return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()
+
+
+def display_manager():
+    try:
+        return os.path.basename(os.readlink(ROOT + DM_LINK)).replace(".service", "")
+    except OSError:
+        return None
+
+
+def wants_off(mine, system):
+    """Turn a system part off when it is on and it is ours: we set it (also "pending", when the root part
+    outlived our time budget), or the system records our uid. A splash another user set stays."""
+    system = system or {}
+    if not system.get("enabled"):
+        return False
+    return mine not in (None, "off") or system.get("by_uid") == os.getuid()
+
+
+def system_parts(values, payload, st, out):
+    mine = st.setdefault("root", {})
+    sys_st = root_state()
+    work = private_dir(os.path.join(xdg("XDG_CACHE_HOME", ".cache"), "forge"))
+    ok = True
+    send = {}
+
+    # What the boot splash should be
+    splash, fp_s = None, None
+    if values.get("splash") == "on":
+        item = media_item(payload, values.get("splash_media"))
+        if item is None:
+            out.append("Boot splash: choose a picture or video first.")
+            ok = False
+        else:
+            splash = {"media": item["id"], "size": item["size"], "mtime": item["mtime"],
+                      "play": values.get("splash_play") if values.get("splash_play") in ("loop", "once") else "loop",
+                      "length": values.get("splash_length") if isinstance(values.get("splash_length"), int) else 2,
+                      "side": SIDES.get(values.get("splash_size"), 360),
+                      "background": values.get("splash_background") if isinstance(values.get("splash_background"), str)
+                      and re.fullmatch(r"#[0-9a-f]{6}", values.get("splash_background")) else "#000000",
+                      "logo": values.get("splash_logo") is not False, "converter": 1}
+            fp_s = fingerprint(splash)
+            sys_splash = sys_st.get("splash") or {}
+            if not (sys_splash.get("enabled") and sys_splash.get("fingerprint") == fp_s):
+                try:
+                    res = fbm.convert_splash(item["path"], item["kind"], item["format"], splash["play"],
+                                             splash["length"], splash["side"], work)
+                    send["splash"] = ({"action": "on", "fingerprint": fp_s, "play": splash["play"],
+                                       "background": splash["background"], "logo": splash["logo"]}, res["frames"])
+                    if len(res["frames"]) < res.get("wanted", 0):
+                        out.append(f"Boot splash: {len(res['frames'])} of {res['wanted']} frames kept to stay under "
+                                   "8 MB. The timing stays the same, the animation is less smooth.")
+                except fbm.ConvertError as e:
+                    out.append(f"Boot splash: not changed, {e}.")
+                    ok = False
+    elif wants_off(mine.get("splash"), sys_st.get("splash")):
+        send["splash"] = ({"action": "off"}, [])
+
+    # What the login screen should be
+    login_tmp = None
+    if values.get("login_screen") == "custom":
+        dm = display_manager()
+        item = media_item(payload, values.get("login_media"))
+        if dm != "plasmalogin":
+            out.append(f"Login screen: not supported with {dm or 'this login manager'}. It works only with "
+                       "Plasma Login Manager.")
+            ok = False
+        elif item is None:
+            out.append("Login screen: choose a picture or video first.")
+            ok = False
+        elif item["kind"] == "video" and not video_plugin_installed():
+            out.append("Login screen: a video needs the Smart Video Wallpaper plugin, which is not installed.")
+            ok = False
+        else:
+            fp_l = fingerprint({"media": item["id"], "size": item["size"], "mtime": item["mtime"], "converter": 1})
+            sys_login = sys_st.get("login") or {}
+            if not (sys_login.get("enabled") and sys_login.get("fingerprint") == fp_l):
+                try:
+                    ext, path = fbm.prepare_login(item["path"], item["kind"], item["format"], work)
+                    if path != item["path"]:
+                        login_tmp = path
+                    send["login"] = ({"action": "on", "fingerprint": fp_l,
+                                      "kind": "image" if ext == "png" else "video", "format": ext}, (ext, path))
+                except fbm.ConvertError as e:
+                    out.append(f"Login screen: not changed, {e}.")
+                    ok = False
+    elif wants_off(mine.get("login"), sys_st.get("login")):
+        send["login"] = ({"action": "off"}, None)
+
+    try:
+        if send:
+            ok &= hand_over(send, mine, out)
+        else:
+            if values.get("splash") == "on" and fp_s and ok:
+                out.append("Boot splash: unchanged.")
+    finally:
+        if login_tmp:
+            remove(login_tmp)
+    return ok
+
+
+def hand_over(send, mine, out):
+    splash, frames = send.get("splash", ({"action": "keep"}, []))
+    login, login_file = send.get("login", ({"action": "keep"}, None))
+    left = BUDGET_S - (time.monotonic() - STARTED)
+    if left < 8:
+        out.append("Bootup: converting took most of the time, so the system part was not started. Apply again.")
+        return False
+    out.append("Asking for an admin password to change the "
+               + " and ".join(x for x, k in (("boot splash", "splash"), ("login screen", "login")) if k in send) + ".")
+    try:
+        rc, text = fbm.send_bundle([PKEXEC, HELPER, "apply"], left, splash, login, frames, login_file)
+    except OSError as e:
+        out.append(f"Bootup: could not ask for the admin password ({e.strerror}).")
+        return False
+    text = "".join(c for c in text.decode("utf-8", "replace") if c == "\n" or c.isprintable()).strip()
+    if rc is None:
+        # The root part may still finish. Remember it as pending, so choosing the default later turns it off.
+        for part, hdr in (("splash", splash), ("login", login)):
+            if hdr["action"] != "keep":
+                mine[part] = "pending:" + (hdr.get("fingerprint") or "off")
+        out.append("Bootup: the system part is still running (rpm-ostree can take a few minutes) and finishes on "
+                   "its own, even after this window closes. Apply again in a few minutes to see the result.")
+        return False
+    if rc in (126, 127) and not text.startswith(("Boot splash", "Login screen", "Nothing")):
+        out.append("Bootup: not changed, the admin password was not given." if rc == 126 else
+                   "Bootup: not changed, no password prompt is available (pkexec could not ask).")
+        return False
+    if text:
+        out.append(text)
+    sys_st = root_state()
+    for part, (hdr, _) in (("splash", (splash, None)), ("login", (login, None))):
+        if hdr["action"] == "keep":
+            continue
+        want = hdr.get("fingerprint") if hdr["action"] == "on" else "off"
+        have = sys_st.get(part) or {}
+        if rc == 0 or (hdr["action"] == "on" and have.get("enabled") and have.get("fingerprint") == want) \
+                or (hdr["action"] == "off" and not have.get("enabled")):
+            mine[part] = want
+    return rc == 0
+
+
+def main():
+    if os.geteuid() == 0:
+        print("forge-appearance-boot: not as root. Bootup settings are applied as your user "
+              "(the system part asks for an admin password).")
+        return 1
+    if sys.argv[1:] not in (["apply"], ["apply", "--user-only"]):
+        print("Usage: forge-appearance-boot apply [--user-only]  (values on stdin; started by forge-appearance)")
+        return 2
+    # --user-only (a preset applied without its admin tick box): only your own parts, never pkexec.
+    user_only = sys.argv[1:] == ["apply", "--user-only"]
+    try:
+        payload = json.loads(sys.stdin.read(STDIN_MAX))
+        values = payload["values"]
+        if not isinstance(values, dict):
+            raise ValueError
+    except (ValueError, KeyError, TypeError):
+        print("Bootup: the settings could not be read.")
+        return 1
+    os.umask(0o077)
+    fbm.set_deadline(STARTED + CONVERT_SHARE_S)
+    st = load_state()
+    out, ok = [], True
+    if user_only:
+        out.append("Boot splash and login screen: not changed (they need the admin password).")
+    for part in (desktop_splash, lock_screen) + (() if user_only else (system_parts,)):
+        try:
+            ok &= part(values, payload, st, out)
+        except Failed as e:
+            out.append(str(e))
+            ok = False
+        except OSError as e:
+            out.append(f"Bootup: a file could not be written ({e.strerror}).")
+            ok = False
+    try:
+        save_state(st)
+    except (OSError, Failed) as e:
+        out.append(f"Bootup: could not remember what was changed ({e}).")
+        ok = False
+    print("\n".join(out) if out else "Bootup: nothing to change.")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

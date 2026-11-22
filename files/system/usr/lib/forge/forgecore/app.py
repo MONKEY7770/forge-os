@@ -2,8 +2,10 @@
 """Forge Core: the local API for Forge OS.
 
 Listens on 127.0.0.1 only (port from Forge Settings, default 47900).
-Every call except /api/health needs the token from /etc/forge/core.token,
-sent as "Authorization: Bearer <token>" or "X-Forge-Token: <token>".
+Every call except /api/health needs a token, sent as "Authorization: Bearer <token>"
+or "X-Forge-Token: <token>". The admin token (/etc/forge/core.token, root and Forge Core
+only) can do everything. The viewer token (/etc/forge/viewer.token, admin users) can only
+read, and can't read secrets, gateway keys and usage, the audit log or the policy.
 Interactive docs for every endpoint: http://127.0.0.1:47900/docs
 
 It runs as the unprivileged "forge" user. The only root action it can take
@@ -26,15 +28,19 @@ from forgecore.metrics import METRICS, Collector  # noqa: E402
 from forgecore import agents as A  # noqa: E402
 from forgecore import gateway as G  # noqa: E402
 from forgecore import policy as P  # noqa: E402
+from forgecore import doctor as D  # noqa: E402
+from forgecore import updates as U  # noqa: E402
+from forgecore import timeline as T  # noqa: E402
 import ipaddress  # noqa: E402
 import socket  # noqa: E402
 import time  # noqa: E402
 import urllib.parse  # noqa: E402
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query  # noqa: E402
-from fastapi.responses import StreamingResponse  # noqa: E402
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request  # noqa: E402
+from fastapi.responses import PlainTextResponse, StreamingResponse  # noqa: E402
 
 VERSION = "0.1.0"
 TOKEN_PATH = os.environ.get("FORGE_CORE_TOKEN", "/etc/forge/core.token")
+VIEWER_TOKEN_PATH = os.environ.get("FORGE_VIEWER_TOKEN", "/etc/forge/viewer.token")
 DB_PATH = os.environ.get("FORGE_CORE_DB", "/var/lib/forge/metrics.db")
 RUN_DIR = os.environ.get("FORGE_CORE_RUN", "/run/forge-core")
 HW_STATE = os.environ.get("FORGE_HW_STATE", "/var/lib/forge-hw")
@@ -52,12 +58,76 @@ def read_token(path=TOKEN_PATH):
         return ""
 
 
+_NAT64_WELL_KNOWN = ipaddress.ip_network("64:ff9b::/96")
+_NAT64_LOCAL = ipaddress.ip_network("64:ff9b:1::/48")
+_SITE_LOCAL = ipaddress.ip_network("fec0::/10")
+# IPv4-translated addresses (SIIT, RFC 2765): they also carry an IPv4 address inside.
+_SIIT = ipaddress.ip_network("::ffff:0:0:0/96")
+
+
+# Reads the viewer token may not do: secrets, keys and usage, the audit log and the policy.
+# Approvals show exactly what an agent wants to do (secrets included), so they are admin
+# only too. The viewer can still see how many are waiting: /api/approval-count.
+# The doctor report describes the PC's security setup, so it is admin only as well.
+VIEWER_BLOCKED = ("/api/gateway", "/api/audit", "/api/policy", "/api/approvals", "/api/doctor")
+
+
+def _viewer_blocked(path):
+    # Normalise the way a router might, so odd spellings can't slip past.
+    path = "/" + "/".join(p for p in path.split("/") if p and p != ".")
+    path = path.lower()
+    if "/.." in path:
+        return True
+    return any(path == b or path.startswith(b + "/") for b in VIEWER_BLOCKED)
+
+
+def _nat64_ipv4(ip):
+    """The IPv4 address inside a NAT64 address (RFC 6052), or None."""
+    b = ip.packed
+    if ip in _NAT64_WELL_KNOWN:
+        return ipaddress.IPv4Address(b[12:16])
+    if ip in _NAT64_LOCAL:
+        # For a /48 prefix the IPv4 bytes sit around the reserved byte 8.
+        return ipaddress.IPv4Address(b[6:8] + b[9:11])
+    return None
+
+
 def _ip_allowed(ip):
     """Only public internet addresses. IPv6 forms that hide an IPv4 address are refused too."""
-    if ip.version == 6 and (ip.ipv4_mapped or ip.sixtofour or ip.teredo
-                            or ip in ipaddress.ip_network("::/96")):
-        return False
+    if ip.version == 6:
+        if (ip.ipv4_mapped or ip.sixtofour or ip.teredo
+                or ip in ipaddress.ip_network("::/96") or ip in _SITE_LOCAL or ip in _SIIT):
+            return False
+        inner = _nat64_ipv4(ip)
+        if inner is not None and not inner.is_global:
+            return False
     return ip.is_global
+
+
+def _wall_clock():
+    return time.time()
+
+
+def _uptime_s():
+    try:
+        with open("/proc/uptime") as f:
+            return float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def _clock_trusted():
+    """Can the wall clock be trusted for deleting "old" data? Right after boot, before time sync,
+    it can be years off. Trusted when synchronized, after a day of uptime (an offline PC still
+    cleans up), or when it can't be checked at all (the earlier behaviour)."""
+    try:
+        r = subprocess.run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if (r.stdout or "").strip() == "yes":
+        return True
+    return _uptime_s() >= 86400
 
 
 def safe_fetch(url, max_bytes=100_000, deadline_s=20):
@@ -71,21 +141,71 @@ def safe_fetch(url, max_bytes=100_000, deadline_s=20):
     if parts.scheme not in ("http", "https") or not parts.hostname:
         return "Error: only http and https web addresses are allowed"
     port = parts.port or (443 if parts.scheme == "https" else 80)
-    try:
-        infos = socket.getaddrinfo(parts.hostname, port, type=socket.SOCK_STREAM)
-    except (OSError, UnicodeError):
+    end = time.monotonic() + deadline_s
+    # The name lookup has no timeout of its own, so it runs in a helper thread and the
+    # deadline covers it too. A stuck lookup is left behind; the agent goes on.
+    found = {}
+
+    def lookup():
+        try:
+            found["infos"] = socket.getaddrinfo(parts.hostname, port, type=socket.SOCK_STREAM)
+        except (OSError, UnicodeError) as e:
+            found["error"] = e
+
+    helper = threading.Thread(target=lookup, name="forge-fetch-dns", daemon=True)
+    helper.start()
+    helper.join(max(0.0, end - time.monotonic()))
+    if helper.is_alive():
+        return "Error: the website took too long to answer"
+    if "infos" not in found:
         return "Error: could not find that website"
-    ips = [ipaddress.ip_address(i[4][0]) for i in infos]
+    ips = [ipaddress.ip_address(i[4][0]) for i in found["infos"]]
     if not ips or not all(_ip_allowed(ip) for ip in ips):
         return "Error: local and private network addresses are not allowed"
     pinned = str(ips[0])
-    start = time.monotonic()
+
+    def time_left():
+        left = end - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("deadline")
+        return left
+
+    # Every send and receive first sets the socket timeout to the time that is left,
+    # so a server sending one byte at a time still can't go past the deadline.
+    class Capped:
+        def _cap(self):
+            self.settimeout(time_left())
+
+        def recv(self, *a, **k):
+            self._cap()
+            return super().recv(*a, **k)
+
+        def recv_into(self, *a, **k):
+            self._cap()
+            return super().recv_into(*a, **k)
+
+        def send(self, *a, **k):
+            self._cap()
+            return super().send(*a, **k)
+
+        def sendall(self, *a, **k):
+            self._cap()
+            return super().sendall(*a, **k)
+
+    class CappedSocket(Capped, socket.socket):
+        pass
+
+    class CappedSSLSocket(Capped, ssl.SSLSocket):
+        pass
 
     class Pinned(http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection):
         def connect(self):
-            sock = socket.create_connection((pinned, port), timeout=10)
+            raw = socket.create_connection((pinned, port), timeout=min(10, time_left()))
+            sock = CappedSocket(raw.family, raw.type, raw.proto, raw.detach())
             if parts.scheme == "https":
                 ctx = ssl.create_default_context()
+                ctx.sslsocket_class = CappedSSLSocket
+                sock.settimeout(time_left())   # the handshake is limited by this
                 sock = ctx.wrap_socket(sock, server_hostname=parts.hostname)
             self.sock = sock
 
@@ -98,14 +218,18 @@ def safe_fetch(url, max_bytes=100_000, deadline_s=20):
         r = conn.getresponse()   # redirects are not followed
         body = b""
         while len(body) < max_bytes:
-            if time.monotonic() - start > deadline_s:
+            try:
+                time_left()
+                chunk = r.read1(min(16384, max_bytes - len(body)))
+            except TimeoutError:
                 body += b"\n[stopped: took too long]"
                 break
-            chunk = r.read(min(16384, max_bytes - len(body)))
             if not chunk:
                 break
             body += chunk
         return f"HTTP {r.status}\n" + body.decode("utf-8", "replace")
+    except TimeoutError:
+        return "Error: the website took too long [stopped: took too long]"
     except (OSError, http.client.HTTPException, ssl.SSLError) as e:
         return f"Error: {type(e).__name__}"
     finally:
@@ -113,8 +237,10 @@ def safe_fetch(url, max_bytes=100_000, deadline_s=20):
 
 
 def create_app(token=None, collector=None, ollama=None, start_collector=True,
-               gateway=None, policy=None, agent_store=None, runner=None, data_dir=None):
+               gateway=None, policy=None, agent_store=None, runner=None, data_dir=None,
+               viewer_token=None, cleanup_delay_s=60, cleanup_check_s=600, doctor=None, doctor_cache_s=30):
     token = token if token is not None else read_token()
+    viewer_token = viewer_token if viewer_token is not None else read_token(VIEWER_TOKEN_PATH)
     collector = collector or Collector(DB_PATH, float(os.environ.get("FORGE_CORE_INTERVAL", "15")))
     ollama = ollama or M.OllamaClient(M.base_url_from_env())
     data = data_dir or DATA
@@ -171,8 +297,20 @@ def create_app(token=None, collector=None, ollama=None, start_collector=True,
     # Daily cleanup so audit logs, usage and run history never fill the disk.
     stop_cleanup = threading.Event()
 
+    # First run soon after start, so a PC that is off every night still gets cleaned.
     def cleanup_loop():
-        while not stop_cleanup.wait(86400):
+        # Runs soon after start, then once a day by the wall clock, checked every few minutes.
+        # (A sleep of a whole day would not count time the PC spends suspended.)
+        if stop_cleanup.wait(cleanup_delay_s):
+            return
+        last = None
+        while True:
+            now = _wall_clock()
+            if (last is not None and 0 <= now - last < 86400) or not _clock_trusted():
+                if stop_cleanup.wait(cleanup_check_s):
+                    return
+                continue
+            last = now
             for job in (lambda: policy.prune(90), lambda: getattr(gateway, "prune", lambda d: None)(90),
                         lambda: getattr(runner, "prune", lambda d: None)(30)):
                 try:
@@ -187,7 +325,7 @@ def create_app(token=None, collector=None, ollama=None, start_collector=True,
             collector.start()
             threading.Thread(target=cleanup_loop, daemon=True, name="forge-cleanup").start()
             if scheduler_on:
-                runner.start_scheduler()
+                runner.start_scheduler(prune_ok=_clock_trusted)
         yield
         stop_cleanup.set()
         if start_collector:
@@ -198,10 +336,18 @@ def create_app(token=None, collector=None, ollama=None, start_collector=True,
     app = FastAPI(title="Forge Core", version=VERSION, lifespan=lifespan,
                   description="Local API for Forge OS: settings, monitoring and AI models.")
 
-    def auth(authorization: str = Header(default=""), x_forge_token: str = Header(default="")):
+    # Two tokens. The admin token can do everything. The viewer token (readable by admin
+    # users without a password) can only read, and not secrets, audit log or policy.
+    def auth(request: Request):
+        x_forge_token = request.headers.get("x-forge-token", "")
+        authorization = request.headers.get("authorization", "")
         given = x_forge_token or (authorization[7:] if authorization.startswith("Bearer ") else "")
-        if not token or not secrets.compare_digest(given, token):
-            raise HTTPException(401, "Missing or wrong Forge token. It is in /etc/forge/core.token.")
+        if token and secrets.compare_digest(given, token):
+            return
+        if not viewer_token or not secrets.compare_digest(given, viewer_token):
+            raise HTTPException(401, "Missing or wrong Forge token. Run forge-api, or sudo forge-api for changes.")
+        if request.method != "GET" or _viewer_blocked(request.scope.get("path", "")):
+            raise HTTPException(403, "This needs admin rights: run sudo forge-api ...")
 
     def ollama_call(fn, *args):
         try:
@@ -315,6 +461,31 @@ def create_app(token=None, collector=None, ollama=None, start_collector=True,
             pass
         return out
 
+    # The doctor report runs a few system tools, so only one is built at a time
+    # and a recent one is reused.
+    doctor = doctor or D.build_report
+    doctor_lock = threading.Lock()
+    doctor_last = {"at": None, "report": None}
+
+    def doctor_report():
+        with doctor_lock:
+            at = doctor_last["at"]
+            if at is None or not (0 <= time.monotonic() - at < doctor_cache_s):
+                try:
+                    report = doctor()
+                except Exception:
+                    raise HTTPException(500, "The doctor report could not be built. Run forge-doctor for details.")
+                doctor_last.update(at=time.monotonic(), report=report)
+            return doctor_last["report"]
+
+    @app.get("/api/doctor", tags=["monitoring"], dependencies=[Depends(auth)])
+    def get_doctor(format: str = Query("json", pattern="^(json|text)$")):
+        report = doctor_report()
+        if format == "text":
+            return PlainTextResponse(D.to_text(report), headers={
+                "Content-Disposition": 'attachment; filename="forge-doctor.txt"'})
+        return report
+
     # AI models
 
     @app.get("/api/models", tags=["models"], dependencies=[Depends(auth)])
@@ -379,6 +550,8 @@ def create_app(token=None, collector=None, ollama=None, start_collector=True,
     app.include_router(G.make_admin_router(gateway, auth))
     app.include_router(P.make_router(policy, auth), prefix="/api")
     app.include_router(A.make_router(agent_store, runner, tools, auth))
+    app.include_router(U.make_router(auth))
+    app.include_router(T.make_router(auth, runner))
 
     @app.get("/api/notices", tags=["agents"], dependencies=[Depends(auth)])
     def notices(since: int = 0):

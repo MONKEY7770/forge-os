@@ -9,7 +9,8 @@ import threading
 import unittest
 from unittest import mock
 
-sys.path.insert(0, "/home/claude/forge-os-repo/files/system/usr/lib/forge")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "files/system/usr/lib/forge"))
 
 from forgecore.models import (  # noqa: E402
     OllamaClient, OllamaError, base_url_from_env, fit, normalize_name,

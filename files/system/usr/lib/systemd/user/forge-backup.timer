@@ -1,0 +1,9 @@
+[Unit]
+Description=Check every hour whether a Forge OS backup is due
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1h
+
+[Install]
+WantedBy=timers.target

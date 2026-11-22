@@ -28,4 +28,9 @@ powerprofilesctl set "$(cfg "modes.$mode.power")" 2>/dev/null \
 
 echo "$mode" > "$STATE_DIR/mode"
 echo "$(date -Is) mode=$mode" >> "$STATE_DIR/activity.log"
+# Share the change with the activity timeline (Forge Core can't read your home folder).
+PUBLISH=${FORGE_ACTIVITY_PUBLISH:-/usr/libexec/forge-activity-publish}
+if [ -x "$PUBLISH" ]; then
+  "$PUBLISH" >/dev/null 2>&1 || true
+fi
 echo "Switched to $mode mode."

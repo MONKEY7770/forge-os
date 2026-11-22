@@ -1,0 +1,9 @@
+[Unit]
+Description=Forge OS: update your MangoHud overlay file when Forge Settings change
+
+[Path]
+PathChanged=/etc/forge/settings.json
+Unit=forge-game-overlay.service
+
+[Install]
+WantedBy=default.target

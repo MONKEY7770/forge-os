@@ -1,0 +1,9 @@
+[Unit]
+Description=Share Forge OS settings soon after they change
+
+[Path]
+PathChanged=/etc/forge/settings.json
+Unit=forge-settings-sync.service
+
+[Install]
+WantedBy=default.target

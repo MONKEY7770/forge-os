@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""forge-doctor: check how well this PC and Forge OS fit together.
+
+  forge-doctor          show the report
+  forge-doctor --json   the same, as JSON
+  forge-doctor --save   save the report to a file in your home folder (to share when asking for help)
+  forge-doctor --fix    go through the fixes it found, one at a time: each asks y/N first
+  forge-doctor --fix --dry-run   only show what each fix would run
+
+The report is read-only: it never changes anything and needs no password. Only --fix
+changes something, and only after you say yes to that one fix. Steps that need root ask
+for your password (pkexec) and run a fixed command from /usr/libexec/forge-doctor-fix.
+"""
+import os
+import shlex
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.environ.get("FORGE_LIB", "/usr/lib/forge"))
+from forgecore import doctor  # noqa: E402
+
+# Tests only: read files under this folder instead of /. (Read-only, so harmless.)
+ROOT = os.environ.get("FORGE_DOCTOR_ROOT", "")
+
+
+def show(cmd):
+    return " ".join(shlex.quote(c) for c in cmd)
+
+
+def ask(question):
+    try:
+        answer = input(question)
+    except EOFError:
+        print()
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def run_fix(fix_id):
+    """Run one fix by its catalog id. The argv is built only from constants."""
+    if fix_id not in doctor.FIXES or not doctor.FIXES[fix_id]["automatic"]:
+        return 2
+    try:
+        return subprocess.run(["pkexec", doctor.HELPER, fix_id]).returncode
+    except OSError as e:
+        print(f"  Could not start pkexec ({e.strerror}).", file=sys.stderr)
+        return 1
+
+
+def fix(dry_run):
+    fixes = doctor.build_report(root=ROOT)["fixes"]
+    if not fixes:
+        print("Nothing to fix: forge-doctor found no problem it has a fix for.")
+        print("Run forge-doctor for the full report; it says how to fix the rest.")
+        return 0
+    print(f"forge-doctor found {len(fixes)} problem{'s' if len(fixes) > 1 else ''} with a fix."
+          + (" Dry run: nothing is run." if dry_run else " Each one asks before it runs."))
+    ran = []
+    for n, f in enumerate(fixes, 1):
+        print(f"\n[{n}/{len(fixes)}] {f['title']}")
+        print(f"  Problem: {f['problem']}")
+        print(f"  What it does: {f['explanation']}")
+        for cmd in f["commands"]:
+            print(f"  Command{' (as root)' if f['needs_root'] else ''}: {show(cmd)}")
+        print(f"  Needs your password: {'yes' if f['needs_root'] else 'no'}. "
+              f"Can be undone: {'yes' if f['reversible'] else 'no'}. Risk: {f['risk']}.")
+        if not f["automatic"]:
+            print("  Not run for you. If you want it, copy the command above into a terminal.")
+            continue
+        if dry_run:
+            print(f"  Would run: {show(f['run_with'])}")
+            continue
+        if not ask("  Run this fix? [y/N] "):
+            print("  Skipped.")
+            continue
+        rc = run_fix(f["id"])
+        print("  Done." if rc == 0 else f"  Failed (exit code {rc}).")
+        ran.append((f, rc))
+    if not ran:
+        return 0
+    print("\nChecked again:")
+    still = {f["id"] for f in doctor.build_report(root=ROOT)["fixes"]}
+    for f, rc in ran:
+        if f["id"] in still:
+            print(f"  {f['title']}: still found. Some fixes take a few minutes; run forge-doctor again later.")
+        else:
+            print(f"  {f['title']}: fixed.")
+    return 0 if all(rc == 0 for _, rc in ran) else 1
+
+
+def main(argv):
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if argv in (["--fix"], ["--fix", "--dry-run"]):
+        return fix(dry_run=len(argv) == 2)
+    report = doctor.build_report(root=ROOT)
+    if argv[:1] == ["--json"]:
+        import json
+        print(json.dumps(report, indent=2))
+        return 0
+    text = doctor.to_text(report)
+    if argv[:1] == ["--save"]:
+        stamp = time.strftime("forge-doctor-%Y%m%d-%H%M%S")
+        for n in range(1, 100):
+            path = os.path.join(os.path.expanduser("~"), stamp + (f"-{n}" if n > 1 else "") + ".txt")
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                break
+            except FileExistsError:
+                continue
+            except OSError as e:
+                print(f"Not saved: can't write {path} ({e.strerror}).", file=sys.stderr)
+                return 1
+        else:
+            print("Not saved: too many reports with the same time in your home folder.", file=sys.stderr)
+            return 1
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
+        except OSError as e:
+            os.unlink(path)
+            print(f"Not saved: writing {path} failed ({e.strerror}).", file=sys.stderr)
+            return 1
+        print(f"Saved: {path}")
+        print("It lists your hardware and settings status, but no passwords or keys. Check it before sharing.")
+        return 0
+    if argv:
+        print(__doc__.strip())
+        return 1
+    print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,14 @@
+[Unit]
+Description=Forge OS: switch performance mode when the charger is plugged in or out
+After=power-profiles-daemon.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=8min
+ExecStart=/usr/libexec/forge-power-switch
+StateDirectory=forge-power
+StateDirectoryMode=0700
+Environment=FORGE_POWER_STATE=/var/lib/forge-power
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

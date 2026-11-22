@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""forge-doctor-fix: run one of forge-doctor's fixes as root.
+
+  pkexec /usr/libexec/forge-doctor-fix FIXID
+
+forge-doctor --fix starts this through pkexec (it asks for your password) after you
+said yes to that one fix. It takes exactly one fix id and runs only the command written
+below for that id. Nothing else from the caller is used.
+
+The image switch (rpm-ostree rebase) is not here on purpose: forge-doctor only shows it.
+"""
+import os
+import re
+import subprocess
+import sys
+
+# Root runs only the system's own tools: a fixed PATH, never the caller's. (pkexec and sudo
+# already clear the environment; this also covers being started some other way.)
+SAFE_ENV = {"PATH": "/usr/sbin:/usr/bin", "LANG": "C.UTF-8"}
+# Who asked, so forge-apply records that user in the settings history instead of "root".
+# Set by pkexec (PKEXEC_UID) or sudo (SUDO_USER); only plain, valid values are passed on.
+if re.fullmatch(r"[0-9]{1,10}", os.environ.get("PKEXEC_UID", "")):
+    SAFE_ENV["PKEXEC_UID"] = os.environ["PKEXEC_UID"]
+if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,31}", os.environ.get("SUDO_USER", "")):
+    SAFE_ENV["SUDO_USER"] = os.environ["SUDO_USER"]
+# Test seam for the tests' fake tools, like forge-apply's: only when the test-only FORGE_ROOT
+# is set and this copy is not the installed one under /usr (so never in real use).
+if (os.environ.get("FORGE_TEST_HELPER_PATH") and os.environ.get("FORGE_ROOT")
+        and not os.path.realpath(__file__).startswith("/usr/")):
+    SAFE_ENV = dict(os.environ, PATH=os.environ["FORGE_TEST_HELPER_PATH"])
+
+# Must match FIXES in /usr/lib/forge/forgecore/doctor.py (a test checks that).
+FIXES = {
+    "restart-ollama": [["systemctl", "restart", "ollama.service"]],
+    "restart-forge-core": [["systemctl", "restart", "forge-core.service"]],
+    "usb-unlock-off": [["forge-config", "set", "security.usb_unlock", "off"]],
+    "run-hwcheck": [["systemctl", "start", "forge-hwcheck.service"]],
+    # forge-virt may download virt-manager, so it is started in the background.
+    "start-forge-virt": [["systemctl", "--no-block", "start", "forge-virt.service"]],
+}
+
+
+def main(argv):
+    if len(argv) != 1 or not isinstance(FIXES.get(argv[0]), list):
+        print("Usage: forge-doctor-fix FIXID (only the fixes forge-doctor knows).", file=sys.stderr)
+        return 2
+    for cmd in FIXES[argv[0]]:
+        print("Running: " + " ".join(cmd), flush=True)
+        try:
+            r = subprocess.run(cmd, timeout=600, env=SAFE_ENV)
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"{cmd[0]} could not run: {e}", file=sys.stderr)
+            return 1
+        if r.returncode != 0:
+            print(f"{cmd[0]} failed (exit code {r.returncode}).", file=sys.stderr)
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

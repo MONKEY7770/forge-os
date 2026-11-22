@@ -1,0 +1,7 @@
+[Unit]
+Description=Forge OS settings sync (shares this PC's settings, never applies any)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/forge-settings-sync
+Nice=19

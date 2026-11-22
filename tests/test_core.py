@@ -28,6 +28,10 @@ from fastapi.testclient import TestClient  # noqa: E402
 from forgecore import app as core  # noqa: E402
 from forgecore import models as M  # noqa: E402
 
+# Another test module may have imported Forge Core first, with its own settings: point this
+# module's fake forge-apply in directly, so the test order doesn't matter.
+core.APPLY_CMD = [FAKE_APPLY]
+
 
 class FakeCollector:
     def current(self):

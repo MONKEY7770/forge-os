@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""forge-appearance: your background, dock and bootup look. Per user, no password needed.
+
+  forge-appearance show [--json]          every section and its values
+  forge-appearance set SECTION KEY VALUE  change one value (for example: set dock size 48)
+  forge-appearance apply [SECTION]        put the values into effect (all sections, or one)
+  forge-appearance media add PATH         copy a picture or video into your media library
+  forge-appearance media list [--json]    what is in the library
+  forge-appearance media remove ID        remove one item
+  forge-appearance preset list [--json]   your presets (your whole look under a name)
+  forge-appearance preset save NAME       save the look you have now as a preset
+  forge-appearance preset apply ID [--system]  use a preset (--system: boot splash and login screen too)
+  forge-appearance preset rename ID NAME | delete ID | export ID FILE | import FILE | sync
+
+Values: ~/.config/forge/appearance.json. Media: ~/.local/share/forge/appearance/media/.
+"""
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.environ.get("FORGE_LIB", "/usr/lib/forge"))
+import forgeappearance as fa  # noqa: E402
+import forgepresets as fp  # noqa: E402
+
+USAGE = __doc__.split("\n\n")[1]
+
+
+def usage():
+    print("Usage:\n" + USAGE, file=sys.stderr)
+    return 2
+
+
+def fmt(field, value):
+    if field["type"] == "toggle":
+        return "on" if value else "off"
+    if field["type"] in ("number", "slider"):
+        return f"{value}{' ' + field['unit'] if field.get('unit') else ''}"
+    if field["type"] == "media":
+        return value or "(none)"
+    if field["type"] == "text":
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def show(args):
+    if args not in ([], ["--json"]):
+        return usage()
+    schema = fa.load_schema()
+    values = fa.load(schema)
+    if args == ["--json"]:
+        print(json.dumps({"sections": schema["sections"], "values": values,
+                          "backends": {s["id"]: fa.backend_installed(s["id"]) for s in schema["sections"]},
+                          "file": fa.config_path(), "media_dir": fa.media_dir()}, indent=2))
+        return 0
+    print(f"Your appearance settings: {fa.config_path()}")
+    for s in schema["sections"]:
+        state = "ready" if fa.backend_installed(s["id"]) else "not installed yet"
+        print(f"\n{s['label']} ({s['id']}), apply: {state}")
+        if not s["fields"]:
+            print("  No settings yet.")
+        vals = values[s["id"]]
+        for f in s["fields"]:
+            notes = []
+            if vals[f["key"]] != f["default"]:
+                notes.append("changed")
+            if not fa.visible(f, vals, s["fields"]):
+                notes.append("not used now")
+            if f.get("advanced"):
+                notes.append("advanced")
+            extra = f"  ({', '.join(notes)})" if notes else ""
+            print(f"  {f['key']} = {fmt(f, vals[f['key']])}{extra}    {f['label']}")
+    return 0
+
+
+def set_(args):
+    if len(args) != 3:
+        return usage()
+    try:
+        fa.set_value(*args)
+    except ValueError as e:
+        print(f"Not saved: {e}", file=sys.stderr)
+        return 1
+    except (OSError, fa.MediaError) as e:
+        print(f"Not saved: {e}", file=sys.stderr)
+        return 1
+    print(f"Saved. Run forge-appearance apply {args[0]} to use it now.")
+    return 0
+
+
+def apply(args):
+    if len(args) > 1:
+        return usage()
+    schema = fa.load_schema()
+    ids = [s["id"] for s in schema["sections"]]
+    if args and args[0] not in ids:
+        print(f"Unknown section {args[0][:40]!r}. Use one of: {', '.join(ids)}", file=sys.stderr)
+        return 2
+    labels = {s["id"]: s["label"] for s in schema["sections"]}
+    failed = False
+    for sid in args or ids:
+        state, text = fa.apply_section(sid, schema)
+        if state == "not-installed":
+            print(f"{labels[sid]}: not installed yet")
+            continue
+        print(f"{labels[sid]}: {'applied' if state == 'applied' else 'failed'}")
+        if text:
+            print("  " + text.replace("\n", "\n  "))
+        failed |= state == "failed"
+    return 1 if failed else 0
+
+
+def human(n):
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "bytes" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def media(args):
+    try:
+        fa.media_cleanup()   # what a killed upload left behind
+    except (OSError, fa.MediaError):
+        pass
+    if args[:1] == ["add"] and len(args) == 2:
+        try:
+            item = fa.media_add(args[1])
+        except (fa.MediaError, OSError) as e:
+            print(f"Not added: {e}", file=sys.stderr)
+            return 1
+        print(f"Added {item['name']} as {item['id']} ({item['kind']}, {item['format']}, {human(item['size'])}).")
+        return 0
+    if args[:1] == ["list"] and args[1:] in ([], ["--json"]):
+        items = fa.media_list()
+        problem = fa.index_problem()
+        if problem:
+            print(f"Warning: {problem}.", file=sys.stderr)
+        if args[1:] == ["--json"]:
+            print(json.dumps(items, indent=2))
+            return 0
+        if not items and not problem:
+            print("Your media library is empty. Add a file with: forge-appearance media add PATH")
+        for it in items:
+            when = time.strftime("%Y-%m-%d", time.localtime(it["added"]))
+            print(f"{it['id']}  {it['kind']:<14} {human(it['size']):>9}  {when}  {it['name']}")
+        return 0
+    if args[:1] == ["remove"] and len(args) == 2:
+        if fa.media_remove(args[1]):
+            print("Removed.")
+            return 0
+        print("Not removed: no such item. See forge-appearance media list.", file=sys.stderr)
+        return 1
+    return usage()
+
+
+def preset(args):
+    """Presets: forgepresets does the checks. Importing only stores a preset; nothing is run."""
+    cmd, rest = (args[0], args[1:]) if args else ("", [])
+    try:
+        if cmd == "list" and rest in ([], ["--json"]):
+            items = fp.list_presets(fa.load_schema())
+            if rest:
+                print(json.dumps(items, indent=2, ensure_ascii=False))
+            elif not items:
+                print("No presets yet. Save one with: forge-appearance preset save NAME")
+            for p in ([] if rest else items):
+                when = time.strftime("%Y-%m-%d", time.localtime(p["updated"]))
+                print(f"{p['id']}  {when}  {p['name']}")
+            return 0
+        if cmd == "save" and len(rest) == 1:
+            print(f"Saved as {fp.save_current(rest[0])['name']}.")
+            return 0
+        if cmd == "rename" and len(rest) == 2:
+            print(f"Renamed to {fp.rename(*rest)['name']}.")
+            return 0
+        if cmd == "delete" and len(rest) == 1:
+            if not fp.delete(rest[0]):
+                raise fp.PresetError("no such preset")
+            print("Deleted.")
+            return 0
+        if cmd == "apply" and rest[:1] and rest[1:] in ([], ["--system"]):
+            r = fp.apply(rest[0], include_system=rest[1:] == ["--system"])
+            for x in r["results"]:
+                print(f"{x['section']}: {x['state']}" + (f"\n  {x['output']}" if x["output"] else ""))
+            for n in r["notes"]:
+                print("Note: " + n)
+            return 0 if r["ok"] else 1
+        if cmd == "export" and len(rest) == 2:
+            fd = os.open(rest[1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    fp.export(rest[0], f)
+            except BaseException:
+                os.unlink(rest[1])
+                raise
+            print(f"Exported to {rest[1]}.")
+            return 0
+        if cmd == "import" and len(rest) == 1:
+            fd = os.open(rest[0], os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(fd, "rb") as f:
+                doc = fp.import_file(f)
+            print(f"Imported {doc['name']} ({doc['id']}). Nothing changed yet: apply it to use it.")
+            return 0
+        if cmd == "sync" and not rest:
+            r = fp.sync()
+            if not r["ok"]:
+                print(r["message"], file=sys.stderr)
+                return 1
+            print(f"Synced: {r['sent']} sent, {r['received']} brought in.")
+            for s in r["skipped"]:
+                print("Skipped " + s)
+            return 0
+    except fp.PresetError as e:
+        print(f"Not done: {e}.", file=sys.stderr)
+        return 1
+    except (OSError, fa.MediaError) as e:
+        print(f"Not done: {getattr(e, 'strerror', None) or e}.", file=sys.stderr)
+        return 1
+    return usage()
+
+
+def main():
+    if os.geteuid() == 0:
+        sys.exit("forge-appearance: don't run this as root. Appearance is per user: run it as your normal user.")
+    args = sys.argv[1:]
+    if not args:
+        return usage()
+    cmd = {"show": show, "set": set_, "apply": apply, "media": media, "preset": preset}.get(args[0])
+    return cmd(args[1:]) if cmd else usage()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

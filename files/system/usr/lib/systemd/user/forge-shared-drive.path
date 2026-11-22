@@ -1,0 +1,13 @@
+[Unit]
+Description=Forge OS: watch for the shared drive being plugged in
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Path]
+# A drive with a name appears here when it is plugged in. The tool checks the name itself
+# and does nothing for other drives.
+PathChanged=/dev/disk/by-label
+Unit=forge-shared-drive.service
+
+[Install]
+WantedBy=graphical-session.target

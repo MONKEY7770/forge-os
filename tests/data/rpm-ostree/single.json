@@ -1,0 +1,40 @@
+{
+  "deployments": [
+    {
+      "requested-modules": [],
+      "requested-modules-enabled": [],
+      "unlocked": "none",
+      "requested-local-packages": [],
+      "base-commit-meta": {
+        "ostree.manifest-digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "ostree.importer.version": "0.15.3",
+        "version": "45.20261117",
+        "ostree.container.image-config": "{}",
+        "ostree.bootable": true
+      },
+      "base-removals": [],
+      "pinned": false,
+      "osname": "default",
+      "regenerate-initramfs": false,
+      "base-local-replacements": [],
+      "container-image-reference-digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "modules": [],
+      "requested-local-fileoverride-packages": [],
+      "container-image-reference": "ostree-image-signed:docker://ghcr.io/example-owner/forge-os:latest",
+      "id": "default-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.0",
+      "requested-base-local-replacements": [],
+      "requested-packages": [],
+      "version": "45.20261117",
+      "serial": 0,
+      "timestamp": 1794897600,
+      "packages": [],
+      "requested-base-removals": [],
+      "checksum": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "booted": true,
+      "staged": false
+    }
+  ],
+  "transaction": null,
+  "cached-update": null,
+  "update-driver": null
+}

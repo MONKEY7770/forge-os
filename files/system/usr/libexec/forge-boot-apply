@@ -1,0 +1,919 @@
+#!/usr/bin/env python3
+"""forge-boot-apply: the root part of Forge Settings, Appearance, Bootup.
+
+Started only through pkexec (polkit action org.forgeos.boot-apply, admin password every time) by
+/usr/libexec/forge-appearance-boot, which runs as you and prepares everything first.
+
+  forge-boot-apply apply   read a prepared bundle on stdin and put it in place
+  forge-boot-apply off     turn the custom boot splash and login screen background off (undo)
+
+What it changes, and nothing else:
+  Boot splash:   /etc/forge-boot/plymouth/forge-boot/ (the theme), two lines in /etc/plymouth/plymouthd.conf
+                 (the original is kept in the state file and put back on undo), and
+                 "rpm-ostree initramfs-etc --track" of exactly those two paths, so the boot image has them.
+                 It never removes any other tracked path (like /etc/crypttab for USB key unlock), never
+                 rebuilds the boot image with dracut, and never restarts the PC.
+  Login screen:  /etc/plasmalogin.conf.d/90-forge-login.conf and the picture or video in /var/lib/forge-boot/login/.
+  Bookkeeping:   /var/lib/forge-boot/state.json (no secrets, readable by everyone).
+
+It trusts nothing it reads from the bundle: every name is fixed, every PNG is checked and rewritten,
+sizes and counts have hard caps, and folders are never followed through links.
+"""
+import base64
+import ctypes
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import time
+import zlib
+
+INSTALLED = "/usr/libexec/forge-boot-apply"
+
+
+def test_mode_allowed(path):
+    """The test switches below work only in a copy outside /usr (the repo during tests). The installed
+    helper ignores them, so "sudo -E" or a changed environment can't point it at another root."""
+    real = os.path.realpath(path)
+    return real != INSTALLED and not real.startswith("/usr/")
+
+
+_TESTABLE = test_mode_allowed(__file__)
+ROOT = os.environ.get("FORGE_BOOT_ROOT", "") if _TESTABLE else ""      # tests only: a fake root folder
+TEST = _TESTABLE and os.environ.get("FORGE_BOOT_TEST") == "1"           # tests only: commands come from PATH
+SAFE_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+
+THEME = "forge-boot"
+THEME_PARENT = "/etc/forge-boot/plymouth"             # ThemeDir= in plymouthd.conf
+THEME_DIR = THEME_PARENT + "/" + THEME
+ETC_BASE = "/etc/forge-boot"
+CONF = "/etc/plymouth/plymouthd.conf"
+SPINNER = "/usr/share/plymouth/themes/spinner"
+PASSWORD_IMAGES = ("entry", "bullet", "lock", "keyboard", "capslock")
+OPTIONAL_IMAGES = ("keymap-render",)    # the keyboard layout names next to keyboard.png (ply-keymap-icon.c)
+TWO_STEP = ("/usr/lib64/plymouth/two-step.so", "/usr/lib/plymouth/two-step.so")
+OSTREE_BOOTED = "/run/ostree-booted"
+STATE_DIR = "/var/lib/forge-boot"
+STATE_FILE = STATE_DIR + "/state.json"
+LOGIN_DIR = STATE_DIR + "/login"
+DROPIN_DIR = "/etc/plasmalogin.conf.d"
+DROPIN = DROPIN_DIR + "/90-forge-login.conf"
+PLM_CONF = "/etc/plasmalogin.conf"
+DM_LINK = "/etc/systemd/system/display-manager.service"
+VIDEO_PLUGIN = "luisbocanegra.smart.video.wallpaper.reborn"
+VIDEO_PLUGIN_DIRS = ("/usr/share/plasma/wallpapers/" + VIDEO_PLUGIN,)
+LOCK_FILE = "/run/forge-boot-apply.lock"
+CRYPTTAB = "/etc/crypttab"
+
+MAGIC = b"FORGEBOOT1\n"
+HEADER_MAX = 64 * 1024
+MAX_FRAMES = 90                     # plymouth decodes every frame into memory before the disk is unlocked
+MAX_SIDE = 480                      # pixels, width and height of a frame
+FRAME_MAX = 2 * 1024 * 1024         # one PNG frame
+FRAMES_TOTAL_MAX = 8 * 1024 * 1024  # all frames together: they ride along in every boot image (/boot space)
+LOGIN_IMAGE_MAX = 64 * 1024 * 1024
+LOGIN_VIDEO_MAX = 256 * 1024 * 1024
+LOGIN_MAX_SIDE = 8192
+CONF_MAX = 64 * 1024
+RPM_OSTREE_TIMEOUT_S = 900
+LOCK_WAIT_S = 120
+
+CONF_MARK = "# Forge OS boot splash (Forge Settings, Appearance, Bootup). Turn it off there to undo."
+CONF_DISABLED = "#forge-boot-disabled# "
+HEX64 = re.compile(r"[0-9a-f]{64}")
+COLOR = re.compile(r"#[0-9a-f]{6}")
+LOGIN_FILE_RE = re.compile(r"login-[0-9a-f]{16}\.(png|mp4|webm|mkv|mov)")
+VIDEO_FORMATS = ("mp4", "webm", "mkv", "mov")
+
+messages = []
+
+
+class Refused(Exception):
+    """Something is not as expected: nothing (more) is changed. The text is for the user."""
+
+
+def say(text):
+    messages.append(text)
+
+
+def flush_messages():
+    # The caller may already be gone (its time ran out): never let a closed pipe stop the work.
+    try:
+        sys.stdout.write("\n".join(messages) + ("\n" if messages else ""))
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        pass
+    messages.clear()
+
+
+def P(path):
+    return ROOT + path
+
+
+# Files and folders, never through links
+
+def lstat_or_none(path):
+    try:
+        return os.lstat(P(path))
+    except FileNotFoundError:
+        return None
+
+
+def check_real_dir(path):
+    st = lstat_or_none(path)
+    if st is None:
+        return False
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+        raise Refused(f"{path} is not a folder that only root can change (a link or something else), so nothing "
+                      "was changed")
+    return True
+
+
+def ensure_dirs(paths):
+    """Make each folder (in order, parents first) as root, mode 0755. Returns the ones it made."""
+    made = []
+    for p in paths:
+        if check_real_dir(p):
+            continue
+        os.mkdir(P(p), 0o755)
+        os.chmod(P(p), 0o755)
+        check_real_dir(p)
+        made.append(p)
+    return made
+
+
+def remove_empty_dirs(paths):
+    for p in sorted(paths, key=len, reverse=True):
+        try:
+            os.rmdir(P(p))
+        except OSError:
+            pass
+
+
+def read_regular(path, limit):
+    """Bytes of a regular file (not a link) of at most limit bytes, or None if it does not exist."""
+    try:
+        fd = os.open(P(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise Refused(f"{path} could not be opened safely ({e.strerror}): is it a link?")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Refused(f"{path} is not a regular file")
+        if st.st_size > limit:
+            raise Refused(f"{path} is unexpectedly large")
+        data = b""
+        while True:
+            part = os.read(fd, 65536)
+            if not part:
+                break
+            data += part
+            if len(data) > limit:
+                raise Refused(f"{path} is unexpectedly large")
+        return data
+    finally:
+        os.close(fd)
+
+
+def write_atomic(path, data, mode=0o644, uid=0, gid=0, like=None):
+    """Write data to path through a new file in the same folder, then rename it over path."""
+    d, name = os.path.split(P(path))
+    tmp = os.path.join(d, f".{name}.forge-{os.getpid()}-{time.monotonic_ns()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fchown(f.fileno(), uid, gid)
+            os.fchmod(f.fileno(), mode)
+            if like is not None:
+                try:   # keep the SELinux label of the file we replace (best effort)
+                    os.setxattr(f.fileno(), "security.selinux", os.getxattr(P(like), "security.selinux",
+                                                                            follow_symlinks=False))
+                except OSError:
+                    pass
+            os.fsync(f.fileno())
+        os.replace(tmp, P(path))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def write_new(dirpath, name, data):
+    fd = os.open(os.path.join(P(dirpath), name), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                 0o644)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+        os.fchmod(f.fileno(), 0o644)
+
+
+def remove_tree(path):
+    st = lstat_or_none(path)
+    if st is None:
+        return
+    if stat.S_ISDIR(st.st_mode):
+        shutil.rmtree(P(path))          # the fd based version: never follows links inside
+    else:
+        os.unlink(P(path))
+
+
+# The bundle from the user (stdin)
+
+def read_exact(stream, n):
+    buf = bytearray(n)
+    view, got = memoryview(buf), 0
+    while got < n:
+        k = stream.readinto(view[got:])
+        if not k:
+            raise Refused("the prepared files arrived incomplete")
+        got += k
+    return bytes(buf)
+
+
+def no_dupes(pairs):
+    out = {}
+    for k, v in pairs:
+        if k in out:
+            raise Refused("the prepared files have a repeated name in their description")
+        out[k] = v
+    return out
+
+
+def check_part(part, which):
+    if not isinstance(part, dict) or part.get("action") not in ("keep", "on", "off"):
+        raise Refused(f"{which}: unknown action")
+    action = part["action"]
+    if action == "keep":
+        allowed = {"action"}
+    elif action == "off":
+        allowed = {"action", "fingerprint"}
+    elif which == "splash":
+        allowed = {"action", "fingerprint", "play", "background", "logo"}
+    else:
+        allowed = {"action", "fingerprint", "kind", "format"}
+    if set(part) - allowed or (action == "on" and set(part) != allowed):
+        raise Refused(f"{which}: unexpected or missing settings")
+    if "fingerprint" in part and not (isinstance(part["fingerprint"], str) and HEX64.fullmatch(part["fingerprint"])):
+        raise Refused(f"{which}: bad fingerprint")
+    if action == "on" and which == "splash":
+        if part["play"] not in ("loop", "once") or not isinstance(part["logo"], bool):
+            raise Refused("splash: bad play mode or logo choice")
+        if not (isinstance(part["background"], str) and COLOR.fullmatch(part["background"])):
+            raise Refused("splash: bad background colour")
+    if action == "on" and which == "login":
+        if not ((part["kind"] == "image" and part["format"] == "png")
+                or (part["kind"] == "video" and part["format"] in VIDEO_FORMATS)):
+            raise Refused("login: only a PNG picture or an MP4, WebM, MKV or MOV video")
+    return part
+
+
+def read_bundle(stream):
+    if read_exact(stream, len(MAGIC)) != MAGIC:
+        raise Refused("this is not a bundle from Forge Settings")
+    line = b""
+    while not line.endswith(b"\n"):
+        c = stream.read(1)
+        if not c or len(line) > 8:
+            raise Refused("bad bundle header")
+        line += c
+    if not line[:-1].isdigit():
+        raise Refused("bad bundle header")
+    n = int(line[:-1])
+    if not 2 <= n <= HEADER_MAX:
+        raise Refused("bad bundle header")
+    try:
+        header = json.loads(read_exact(stream, n).decode("utf-8"), object_pairs_hook=no_dupes)
+    except (ValueError, UnicodeDecodeError):
+        raise Refused("bad bundle header")
+    if not isinstance(header, dict) or set(header) != {"version", "splash", "login", "files"} or header["version"] != 1:
+        raise Refused("this bundle is from another version of Forge OS")
+    splash, login = check_part(header["splash"], "splash"), check_part(header["login"], "login")
+    want = []
+    files = header["files"]
+    if not isinstance(files, list) or len(files) > MAX_FRAMES + 1:
+        raise Refused("too many files")
+    nframes = sum(1 for f in files if isinstance(f, dict) and str(f.get("name", "")).startswith("frame-"))
+    if splash["action"] == "on":
+        if not 1 <= nframes <= MAX_FRAMES:
+            raise Refused(f"the boot splash needs 1 to {MAX_FRAMES} frames")
+        want += [(f"frame-{i:04d}.png", FRAME_MAX) for i in range(1, nframes + 1)]
+    if login["action"] == "on":
+        want.append((f"login.{login['format']}", LOGIN_IMAGE_MAX if login["kind"] == "image" else LOGIN_VIDEO_MAX))
+    if len(files) != len(want):
+        raise Refused("unexpected files in the bundle")
+    total = 0
+    for f, (name, cap) in zip(files, want):
+        if (not isinstance(f, dict) or set(f) != {"name", "size"} or f["name"] != name
+                or type(f["size"]) is not int or not 1 <= f["size"] <= cap):
+            raise Refused("unexpected file names or sizes in the bundle")
+        if name.startswith("frame-"):
+            total += f["size"]
+    if total > FRAMES_TOTAL_MAX:
+        raise Refused(f"the boot splash frames are larger than {FRAMES_TOTAL_MAX // 1024 // 1024} MB together")
+    data = {name: read_exact(stream, f["size"]) for f, (name, _) in zip(files, want)}
+    if stream.read(1):
+        raise Refused("unexpected data after the bundle")
+    frames = [data[f"frame-{i:04d}.png"] for i in range(1, nframes + 1)] if splash["action"] == "on" else []
+    login_bytes = data.get(f"login.{login['format']}") if login["action"] == "on" else None
+    return splash, login, frames, login_bytes
+
+
+# PNG checks: every chunk's CRC, a known layout, and the exact pixel data size after decompression.
+
+def clean_png(data, max_side):
+    """Returns (width, height, a rewritten PNG with only IHDR, PLTE, tRNS, IDAT and IEND). Refused otherwise."""
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise Refused("a frame is not a PNG picture")
+    pos, chunks = 8, []
+    while pos < len(data):
+        if pos + 12 > len(data):
+            raise Refused("a PNG picture is cut off")
+        n = struct.unpack(">I", data[pos:pos + 4])[0]
+        kind = data[pos + 4:pos + 8]
+        if n > len(data) or pos + 12 + n > len(data):
+            raise Refused("a PNG picture is cut off")
+        body = data[pos + 8:pos + 8 + n]
+        if struct.unpack(">I", data[pos + 8 + n:pos + 12 + n])[0] != zlib.crc32(kind + body):
+            raise Refused("a PNG picture is damaged (checksum)")
+        if not re.fullmatch(rb"[A-Za-z]{4}", kind):
+            raise Refused("a PNG picture has a bad chunk")
+        chunks.append((kind, body))
+        pos += 12 + n
+        if kind == b"IEND":
+            break
+    if pos != len(data) or not chunks or chunks[0][0] != b"IHDR" or chunks[-1] != (b"IEND", b""):
+        raise Refused("a PNG picture has an unexpected layout")
+    ihdr = chunks[0][1]
+    if len(ihdr) != 13:
+        raise Refused("a PNG picture has a bad header")
+    w, h, depth, ctype, comp, filt, inter = struct.unpack(">IIBBBBB", ihdr)
+    if not (1 <= w <= max_side and 1 <= h <= max_side):
+        raise Refused(f"a picture is larger than {max_side} x {max_side} pixels")
+    if depth != 8 or ctype not in (2, 3, 6) or comp or filt or inter:
+        raise Refused("a PNG picture uses an unsupported kind (8 bit RGB, RGBA or palette only)")
+    keep, idat, plte, where = [], [], None, "before"
+    for kind, body in chunks[1:-1]:
+        if kind == b"IDAT":
+            if where == "after":
+                raise Refused("a PNG picture has split image data")
+            where = "in"
+            idat.append(body)
+            continue
+        if where != "before":
+            where = "after"
+            if kind[0:1].isupper():
+                raise Refused("a PNG picture has an unexpected layout")
+            continue                      # ancillary chunks after the data are dropped
+        if kind == b"PLTE":
+            if plte is not None or len(body) % 3 or not 3 <= len(body) <= 768 or ctype == 6:
+                raise Refused("a PNG picture has a bad palette")
+            plte = body
+            keep.append((kind, body))
+        elif kind == b"tRNS":
+            if (ctype == 3 and (plte is None or len(body) > len(plte) // 3)) or ctype == 6 or \
+                    (ctype == 2 and len(body) != 6):
+                raise Refused("a PNG picture has bad transparency")
+            keep.append((kind, body))
+        elif kind[0:1].isupper():
+            raise Refused("a PNG picture has an unknown required chunk")
+        # other ancillary chunks (text, colour profiles, ...) are dropped
+    if not idat or (ctype == 3 and plte is None):
+        raise Refused("a PNG picture has no image data")
+    bpp = {2: 3, 3: 1, 6: 4}[ctype]
+    stride = 1 + w * bpp
+    expected = stride * h
+    try:
+        return _inflate_check(w, h, ihdr, keep, idat, stride, expected)
+    except zlib.error:
+        raise Refused("a PNG picture is damaged (compressed data)")
+
+
+def _inflate_check(w, h, ihdr, keep, idat, stride, expected):
+    z = zlib.decompressobj()
+    got, next_row = 0, 0
+    for part in idat:
+        while part and not z.eof:
+            out = z.decompress(part, 1 << 20)
+            part = z.unconsumed_tail
+            while next_row < got + len(out):
+                if out[next_row - got] > 4:
+                    raise Refused("a PNG picture is damaged (filter)")
+                next_row += stride
+            got += len(out)
+            if got > expected:
+                raise Refused("a PNG picture holds more data than its size says")
+        if part:
+            raise Refused("a PNG picture has data after its end")
+    if got != expected or not z.eof or z.unused_data:
+        raise Refused("a PNG picture holds the wrong amount of data")
+    out = b"\x89PNG\r\n\x1a\n"
+    for kind, body in [(b"IHDR", ihdr)] + keep + [(b"IDAT", b"".join(idat)), (b"IEND", b"")]:
+        out += struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+    return w, h, out
+
+
+def check_video(data, fmt):
+    head = data[:4096]
+    ok = {
+        "mp4": head[4:8] == b"ftyp" and head[8:10] != b"qt",
+        "mov": head[4:8] in (b"ftyp", b"moov", b"mdat", b"wide"),
+        "webm": head[:4] == b"\x1a\x45\xdf\xa3" and b"webm" in head,
+        "mkv": head[:4] == b"\x1a\x45\xdf\xa3" and b"matroska" in head,
+    }.get(fmt, False)
+    if not ok:
+        raise Refused(f"the login video is not a {fmt.upper()} file")
+
+
+# rpm-ostree
+
+def run(argv, timeout):
+    env = {"PATH": os.environ.get("PATH", SAFE_PATH) if TEST else SAFE_PATH, "LANG": "C.UTF-8"}
+    if TEST:
+        env.update({k: v for k, v in os.environ.items() if k.startswith("FAKE_")})
+    try:
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        return None, f"{argv[0]} took longer than {timeout} seconds"
+    except OSError as e:
+        return None, f"{argv[0]} could not start ({e.strerror})"
+    text = (r.stdout + r.stderr).decode("utf-8", "replace")
+    text = "".join(c for c in text if c == "\n" or c.isprintable())
+    return r.returncode, text
+
+
+def rpm_ostree(*args):
+    rc, out = run(["rpm-ostree", *args], RPM_OSTREE_TIMEOUT_S)
+    return rc == 0, out
+
+
+def tracked():
+    """The /etc paths the next boot image takes along (rpm-ostree initramfs-etc). None if unknown."""
+    ok, out = rpm_ostree("initramfs-etc")
+    if not ok:
+        return None
+    lines = out.splitlines()
+    if any(line.strip() == "No tracked files." for line in lines):
+        return []
+    if "Tracked files:" not in [line.strip() for line in lines]:
+        return None
+    start = [line.strip() for line in lines].index("Tracked files:")
+    return [line.strip() for line in lines[start + 1:] if line.startswith("  ") and line.strip().startswith("/etc/")]
+
+
+def last_line(text):
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    return (lines[-1] if lines else "no details")[:300]
+
+
+def keep_crypttab(before):
+    """The USB key unlock needs /etc/crypttab in the boot image. Check it is still tracked; put it back if not."""
+    if CRYPTTAB not in before:
+        return True
+    after = tracked()
+    if after is not None and CRYPTTAB in after:
+        return True
+    ok, out = rpm_ostree("initramfs-etc", f"--track={CRYPTTAB}")
+    if ok:
+        say("Warning: /etc/crypttab (USB key unlock) was missing from the boot image list. Forge added it back.")
+        return True
+    say("IMPORTANT: /etc/crypttab (USB key unlock) is missing from the boot image list. Before you restart, run: "
+        "sudo rpm-ostree initramfs-etc --track=/etc/crypttab")
+    return False
+
+
+# State
+
+def load_state():
+    data = read_regular(STATE_FILE, 1024 * 1024)
+    try:
+        st = json.loads(data) if data else {}
+    except ValueError:
+        st = {}
+    return st if isinstance(st, dict) else {}
+
+
+def save_state(st):
+    st = {k: v for k, v in st.items() if v and k != "version"}
+    if not st:
+        remove_tree(STATE_FILE)
+        remove_tree(LOGIN_DIR)
+        remove_empty_dirs([STATE_DIR])
+        return
+    ensure_dirs([STATE_DIR])
+    st["version"] = 1
+    write_atomic(STATE_FILE, (json.dumps(st, indent=1, sort_keys=True) + "\n").encode())
+
+
+# The boot splash
+
+def conf_with_theme(text):
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    out, section, placed = [], None, False
+    for line in lines:
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            section = s
+            out.append(line)
+            if s == "[Daemon]" and not placed:
+                out += [CONF_MARK, f"Theme={THEME}", f"ThemeDir={THEME_PARENT}"]
+                placed = True
+            continue
+        if section == "[Daemon]" and re.match(r"\s*(Theme|ThemeDir)\s*=", line):
+            out.append(CONF_DISABLED + line)
+            continue
+        out.append(line)
+    if not placed:
+        out += ["[Daemon]", CONF_MARK, f"Theme={THEME}", f"ThemeDir={THEME_PARENT}"]
+    return "\n".join(out) + "\n"
+
+
+def conf_without_theme(text):
+    ours = {CONF_MARK, f"Theme={THEME}", f"ThemeDir={THEME_PARENT}"}
+    out = []
+    for line in text.split("\n"):
+        if line in ours:
+            continue
+        out.append(line[len(CONF_DISABLED):] if line.startswith(CONF_DISABLED) else line)
+    return "\n".join(out)
+
+
+def theme_text(play, background, logo):
+    c = background[1:]
+    fw = "true" if logo else "false"
+    modes = "".join(f"\n[{m}]\nUseEndAnimation=false\nUseFirmwareBackground={fw}\n"
+                    for m in ("boot-up", "shutdown", "reboot"))
+    for m, title in (("updates", "Installing Updates..."), ("system-upgrade", "Upgrading System..."),
+                     ("firmware-upgrade", "Upgrading Firmware..."), ("system-reset", "Resetting System...")):
+        modes += (f"\n[{m}]\nSuppressMessages=true\nProgressBarShowPercentComplete=true\nUseProgressBar=true\n"
+                  f"UseEndAnimation=false\nTitle={title}\nSubTitle=Do not turn off your computer\n")
+    return ("# Written by forge-boot-apply (Forge Settings, Appearance, Bootup). Turn it off there.\n"
+            "[Plymouth Theme]\nName=Forge OS custom boot splash\n"
+            "Description=Your own picture or video, made in Forge Settings\nModuleName=two-step\n\n"
+            f"[two-step]\nImageDir={THEME_DIR}\nHorizontalAlignment=.5\nVerticalAlignment={'.7' if logo else '.5'}\n"
+            "DialogHorizontalAlignment=.5\nDialogVerticalAlignment=.382\nTitleHorizontalAlignment=.5\n"
+            "TitleVerticalAlignment=.382\nWatermarkHorizontalAlignment=.5\nWatermarkVerticalAlignment=.96\n"
+            "Transition=none\nTransitionDuration=0.0\n"
+            f"BackgroundStartColor=0x{c}\nBackgroundEndColor=0x{c}\n"
+            "ProgressBarBackgroundColor=0x606060\nProgressBarForegroundColor=0xffffff\n"
+            "DialogClearsFirmwareBackground=true\nMessageBelowAnimation=true\n"
+            + ("ProgressFunction=linear\n" if play == "once" else "") + modes)
+
+
+def splash_preflight():
+    if lstat_or_none(OSTREE_BOOTED) is None:
+        raise Refused("this is not an rpm-ostree system (Forge OS), so the boot splash can't be changed here")
+    if not any(lstat_or_none(p) is not None and stat.S_ISREG(lstat_or_none(p).st_mode) for p in TWO_STEP):
+        raise Refused("Plymouth's two-step plugin is missing, so a custom boot splash can't work")
+    images = {}
+    for n in PASSWORD_IMAGES:
+        try:
+            data = read_regular(f"{SPINNER}/{n}.png", 1024 * 1024)
+        except Refused:
+            data = None
+        if not data or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise Refused(f"{SPINNER}/{n}.png is missing. The disk password box needs it, so the custom boot splash "
+                          "stays off")
+        images[n] = data
+    for n in OPTIONAL_IMAGES:
+        try:
+            data = read_regular(f"{SPINNER}/{n}.png", 4 * 1024 * 1024)
+        except Refused:
+            data = None
+        if data and data.startswith(b"\x89PNG\r\n\x1a\n"):
+            images[n] = data
+    st = lstat_or_none(CONF)
+    if st is not None and not stat.S_ISREG(st.st_mode):
+        raise Refused(f"{CONF} is not a regular file (a link?), so the boot splash was not changed")
+    return images
+
+
+def check_frames(frames):
+    checked = [clean_png(f, MAX_SIDE) for f in frames]
+    if len({(w, h) for w, h, _ in checked}) != 1:
+        raise Refused("the boot splash frames have different sizes")
+    return checked
+
+
+def exchange(a, b):
+    """Swap two folders in one step (renameat2 RENAME_EXCHANGE), so the tracked theme folder is never
+    missing. Falls back to three renames where the call is not available."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.renameat2(-100, os.fsencode(a), -100, os.fsencode(b), 2) == 0:
+            return
+    except (OSError, AttributeError):
+        pass
+    tmp = a + ".swap"
+    os.rename(a, tmp)
+    os.rename(b, a)
+    os.rename(tmp, b)
+
+
+def splash_on(part, checked, st):
+    images = splash_preflight()
+    before = tracked()
+    if before is None:
+        raise Refused("could not read the boot image file list (rpm-ostree initramfs-etc), so nothing was changed")
+    old = st.get("splash") or {}
+    first = not old.get("enabled")
+    conf_now = read_regular(CONF, CONF_MAX)
+    if conf_now is not None:
+        try:
+            conf_now.decode("utf-8")
+        except UnicodeDecodeError:
+            raise Refused(f"{CONF} is not plain text, so it was left alone")
+    conf_st = lstat_or_none(CONF)
+    made_plymouth = ensure_dirs(["/etc/plymouth"])
+    made = ensure_dirs([ETC_BASE, THEME_PARENT])
+    if first:
+        record = {"conf_original": base64.b64encode(conf_now).decode() if conf_now is not None else None,
+                  "conf_mode": stat.S_IMODE(conf_st.st_mode) if conf_st else 0o644,
+                  "conf_owner": [conf_st.st_uid, conf_st.st_gid] if conf_st else [0, 0],
+                  "created_dirs": made_plymouth + made}
+    else:
+        record = {k: old[k] for k in ("conf_original", "conf_mode", "conf_owner", "created_dirs")}
+        record["created_dirs"] = sorted(set(record["created_dirs"]) | set(made + made_plymouth))
+    # From here on files are written. Record a partial entry first, so whatever stops this part
+    # half way, "off" still finds and removes what exists.
+    st["splash"] = dict(record, enabled=True, partial=True, fingerprint=part["fingerprint"],
+                        tracked_by_forge=old.get("tracked_by_forge", []),
+                        conf_written_sha256=old.get("conf_written_sha256"), by_uid=caller_uid())
+    new = P(THEME_PARENT + "/." + THEME + ".new")
+    for d in (new, new + ".swap", P(THEME_PARENT + "/." + THEME + ".old")):
+        if os.path.lexists(d):
+            remove_tree(d[len(ROOT):])
+    os.mkdir(new, 0o755)
+    os.chmod(new, 0o755)
+    prefix = "throbber" if part["play"] == "loop" else "progress"
+    for i, (_, _, data) in enumerate(checked, 1):
+        write_new(new[len(ROOT):], f"{prefix}-{i:04d}.png", data)
+    for n, data in images.items():
+        write_new(new[len(ROOT):], f"{n}.png", data)
+    write_new(new[len(ROOT):], f"{THEME}.plymouth", theme_text(part["play"], part["background"], part["logo"]).encode())
+
+    had_theme = check_real_dir(THEME_DIR)
+    if had_theme:
+        exchange(new, P(THEME_DIR))        # "new" now holds the previous theme
+    else:
+        os.rename(new, P(THEME_DIR))
+    prev = new
+    conf_text = conf_with_theme((conf_now or b"").decode("utf-8"))
+    if conf_now != conf_text.encode():
+        write_atomic(CONF, conf_text.encode(), mode=record["conf_mode"], uid=record["conf_owner"][0],
+                     gid=record["conf_owner"][1], like=CONF if conf_now is not None else None)
+    to_track = [p for p in (CONF, THEME_DIR) if p not in before]
+    ok, out = rpm_ostree("initramfs-etc", "--force-sync", *[f"--track={p}" for p in to_track])
+    if not ok:
+        now = tracked()
+        still_ours = [p for p in to_track if now is None or p in now]
+        if still_ours:
+            # rpm-ostree may still be working on it: a tracked path must never go missing.
+            say(f"Boot splash: rpm-ostree reported a problem ({last_line(out)}), but the files may be in use, so "
+                "they were left in place. Try again in a minute.")
+            if had_theme:
+                remove_tree(prev[len(ROOT):])
+            st["splash"] = dict(record, enabled=True, fingerprint=part["fingerprint"], uncertain=True,
+                                tracked_by_forge=sorted(set(old.get("tracked_by_forge", [])) | set(to_track)),
+                                conf_written_sha256=hashlib.sha256(conf_text.encode()).hexdigest(),
+                                frames=len(checked), play=part["play"], by_uid=caller_uid())
+            return False
+        # Put everything back the way it was.
+        if had_theme:
+            exchange(prev, P(THEME_DIR))
+            remove_tree(prev[len(ROOT):])
+        else:
+            remove_tree(THEME_DIR)
+        if conf_now is None:
+            remove_tree(CONF)
+        elif read_regular(CONF, CONF_MAX) != conf_now:
+            write_atomic(CONF, conf_now, mode=record["conf_mode"], uid=record["conf_owner"][0],
+                         gid=record["conf_owner"][1], like=CONF)
+        if first:
+            remove_empty_dirs(made + made_plymouth)
+        st["splash"] = old or None
+        say(f"Boot splash: not changed. rpm-ostree said: {last_line(out)}")
+        return False
+    if had_theme:
+        remove_tree(prev[len(ROOT):])
+    st["splash"] = dict(record, enabled=True, fingerprint=part["fingerprint"],
+                        tracked_by_forge=sorted(set(old.get("tracked_by_forge", [])) | set(to_track)),
+                        conf_written_sha256=hashlib.sha256(conf_text.encode()).hexdigest(),
+                        frames=len(checked), play=part["play"], by_uid=caller_uid())
+    good = keep_crypttab(before)
+    say("Boot splash: ready. You see it after the next restart (also at shutdown and for the disk password).")
+    return good
+
+
+def splash_off(st):
+    old = st.get("splash") or {}
+    if not old.get("enabled"):
+        say("Boot splash: already Bazzite's own.")
+        return True
+    before = tracked()
+    if before is None:
+        raise Refused("could not read the boot image file list (rpm-ostree initramfs-etc), so nothing was changed")
+    conf_now = read_regular(CONF, CONF_MAX)
+    if conf_now is not None and hashlib.sha256(conf_now).hexdigest() == old.get("conf_written_sha256"):
+        orig = old.get("conf_original")
+        restore = base64.b64decode(orig) if orig is not None else None
+    elif conf_now is not None:
+        restore = conf_without_theme(conf_now.decode("utf-8", "surrogateescape")).encode("utf-8", "surrogateescape")
+        if restore != conf_now and not old.get("partial"):
+            say("Boot splash: plymouthd.conf was changed by hand since, so only Forge's lines were taken out.")
+    else:
+        restore = None
+    owner = old.get("conf_owner", [0, 0])
+    if restore is None:
+        remove_tree(CONF)
+    elif restore != conf_now:
+        write_atomic(CONF, restore, mode=old.get("conf_mode", 0o644), uid=owner[0], gid=owner[1],
+                     like=CONF if conf_now is not None else None)
+    ours = [p for p in old.get("tracked_by_forge", []) if p in before]
+    ok, out = rpm_ostree("initramfs-etc", "--force-sync", *[f"--untrack={p}" for p in ours])
+    if not ok:
+        if conf_now is None:
+            remove_tree(CONF)
+        else:
+            write_atomic(CONF, conf_now, mode=old.get("conf_mode", 0o644), uid=owner[0], gid=owner[1], like=CONF)
+        say(f"Boot splash: still on. rpm-ostree said: {last_line(out)}")
+        return False
+    after = tracked()
+    if after is not None and THEME_DIR in after:
+        say(f"Boot splash: {THEME_DIR} is still in the boot image list (someone else added it), so its files stay.")
+    else:
+        remove_tree(THEME_DIR)
+        for left in ("/." + THEME + ".new", "/." + THEME + ".new.swap", "/." + THEME + ".old"):
+            remove_tree(THEME_PARENT + left)       # left over if an earlier change stopped half way
+        remove_empty_dirs(old.get("created_dirs", []))
+    st["splash"] = None
+    good = keep_crypttab(before)
+    say("Boot splash: back to Bazzite's own after the next restart.")
+    return good
+
+
+# The login screen
+
+def display_manager():
+    try:
+        target = os.readlink(P(DM_LINK))
+    except OSError:
+        return None
+    return os.path.basename(target)
+
+
+def login_on(part, data, st):
+    dm = display_manager()
+    if dm != "plasmalogin.service":
+        name = (dm or "no display manager").replace(".service", "")
+        raise Refused(f"Login screen: not supported with {name[:40]}. It works only with Plasma Login Manager.")
+    ext = part["format"]
+    if part["kind"] == "image":
+        plugin = "org.kde.image"
+    else:
+        if not any(lstat_or_none(d + "/metadata.json") for d in VIDEO_PLUGIN_DIRS):
+            raise Refused("Login screen: a video needs the Smart Video Wallpaper plugin, which is not installed. "
+                          "Choose a picture instead.")
+        plugin = VIDEO_PLUGIN
+    old = st.get("login") or {}
+    made = ensure_dirs([STATE_DIR, LOGIN_DIR, DROPIN_DIR])
+    # Record before writing, so "off" removes whatever exists even if this stops half way.
+    st["login"] = {"enabled": True, "partial": True, "fingerprint": part["fingerprint"], "kind": part["kind"],
+                   "created_dirs": sorted(set(old.get("created_dirs", [])) | set(made)), "by_uid": caller_uid()}
+    name = f"login-{hashlib.sha256(data).hexdigest()[:16]}.{ext}"
+    write_atomic(f"{LOGIN_DIR}/{name}", data)
+    url = f"file://{LOGIN_DIR}/{name}"
+    if plugin == "org.kde.image":
+        body = f"Image={url}\n"
+    else:
+        video = {"filename": url, "enabled": True, "duration": 0, "customDuration": 0, "playbackRate": 0,
+                 "alternativePlaybackRate": 0, "loop": True, "dayNightCycleAssignment": 0}
+        body = f"VideoUrls=[{json.dumps(video, separators=(',', ':'))}]\nMuteMode=5\nPauseMode=3\nFillMode=2\n"
+    write_atomic(DROPIN, ("# Written by forge-boot-apply (Forge Settings, Appearance, Bootup). Turn the login screen "
+                          "background off there to remove it.\n"
+                          f"[Greeter]\nWallpaperPluginId={plugin}\n\n[Greeter][Wallpaper][{plugin}][General]\n"
+                          + body).encode())
+    for n in os.listdir(P(LOGIN_DIR)):
+        if n != name and LOGIN_FILE_RE.fullmatch(n):
+            os.unlink(P(f"{LOGIN_DIR}/{n}"))
+    st["login"] = {"enabled": True, "fingerprint": part["fingerprint"], "kind": part["kind"], "file": name,
+                   "created_dirs": sorted(set(old.get("created_dirs", [])) | set(made)), "by_uid": caller_uid()}
+    plm = read_regular(PLM_CONF, 1024 * 1024) or b""
+    if re.search(rb"(?m)^\s*(WallpaperPluginId\s*=|\[Greeter\]\[Wallpaper\])", plm):
+        say("Login screen: note, System Settings, Login Screen has its own wallpaper in /etc/plasmalogin.conf, "
+            "and that one wins. Reset it there to see this one.")
+    say("Login screen: background set. You see it the next time the login screen shows.")
+    return True
+
+
+def login_off(st):
+    old = st.get("login") or {}
+    if not old.get("enabled"):
+        say("Login screen: already the default.")
+        return True
+    remove_tree(DROPIN)
+    if check_real_dir(LOGIN_DIR):
+        for n in os.listdir(P(LOGIN_DIR)):
+            if LOGIN_FILE_RE.fullmatch(n) or n.startswith("."):
+                remove_tree(f"{LOGIN_DIR}/{n}")
+    remove_empty_dirs([d for d in old.get("created_dirs", []) if d != STATE_DIR])
+    st["login"] = None
+    say("Login screen: back to the default background.")
+    return True
+
+
+def caller_uid():
+    v = os.environ.get("PKEXEC_UID", "")
+    return int(v) if v.isdigit() else None
+
+
+class Lock:
+    def __enter__(self):
+        ensure = os.path.dirname(P(LOCK_FILE))
+        os.makedirs(ensure, exist_ok=True)
+        self.fd = os.open(P(LOCK_FILE), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        deadline = time.monotonic() + LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise Refused("another bootup change is still running. Try again in a minute.")
+                time.sleep(0.5)
+
+    def __exit__(self, *exc):
+        os.close(self.fd)
+        if ROOT:
+            try:
+                os.unlink(P(LOCK_FILE))
+            except OSError:
+                pass
+
+
+def main(argv):
+    if argv not in (["apply"], ["off"]):
+        print("Usage: forge-boot-apply apply < bundle | forge-boot-apply off", file=sys.stderr)
+        return 2
+    if os.geteuid() != 0:
+        print("forge-boot-apply: needs root (it is started by Forge Settings through pkexec).", file=sys.stderr)
+        return 1
+    for sig in (signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, signal.SIG_IGN)
+    os.umask(0o022)
+    good = True
+    try:
+        if argv == ["apply"]:
+            splash, login, frames, login_bytes = read_bundle(sys.stdin.buffer)
+        else:
+            splash, login, frames, login_bytes = {"action": "off"}, {"action": "off"}, [], None
+        # Check every file completely before anything is written.
+        checked = check_frames(frames) if splash["action"] == "on" else []
+        if login["action"] == "on":
+            if login["kind"] == "image":
+                login_bytes = clean_png(login_bytes, LOGIN_MAX_SIDE)[2]
+            else:
+                check_video(login_bytes, login["format"])
+        with Lock():
+            st = load_state()
+            try:
+                for name, label, run_part in (
+                        ("login", "Login screen",
+                         lambda: login_on(login, login_bytes, st) if login["action"] == "on"
+                         else login_off(st) if login["action"] == "off" else True),
+                        ("splash", "Boot splash",
+                         lambda: splash_on(splash, checked, st) if splash["action"] == "on"
+                         else splash_off(st) if splash["action"] == "off" else True)):
+                    try:
+                        good &= run_part()
+                    except Refused as e:
+                        say(str(e) if str(e).startswith(label) else f"{label}: not changed: {e}")
+                        good = False
+                    except Exception as e:   # never stop half way without recording what was done
+                        say(f"{label}: stopped by an unexpected problem ({type(e).__name__}). What was already "
+                            "changed is recorded, so turning it off still undoes it.")
+                        good = False
+            finally:
+                save_state(st)
+    except Refused as e:
+        say(f"Nothing was changed: {e}")
+        good = False
+    flush_messages()
+    return 0 if good else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

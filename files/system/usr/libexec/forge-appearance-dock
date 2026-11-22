@@ -1,0 +1,975 @@
+#!/usr/bin/env python3
+"""forge-appearance-dock: puts the Dock appearance settings into effect. Per user, never root.
+
+Run by "forge-appearance apply dock" and the "Save and apply" button, as the logged-in user, with
+argv ["apply"] and the values as JSON on stdin. Three styles:
+
+  default   your stock Plasma panel. Brings back the panel settings from the first backup.
+  floating  the same Plasma panel: floating, centered, fit to its icons, see-through. Only the panel
+            properties Plasma's own desktop scripting offers (evaluateScript); no widgets are added.
+  animated  Krema, a separate dock with zoom: ~/.config/kremarc and ~/.config/autostart/forge-krema.desktop.
+
+Before the first change away from Default it backs up the panel layout into
+$XDG_DATA_HOME/forge/appearance/dock-backup/first/ (0700): Plasma's dumpCurrentLayoutJS output, every
+panel's properties, plasmashellrc, plasma-org.kde.plasma.desktop-appletsrc (copied while plasmashell is
+stopped) and kremarc. That backup is never overwritten.
+
+Every Plasma script comes from a fixed template below; the only data in it is one JSON literal made
+by json.dumps from checked values. Nothing a person typed ever becomes code.
+"""
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+
+# The dock section's fields, the same as in /usr/share/forge/appearance.json (a test keeps them equal).
+# Every value is checked again here: a wrong one becomes the default, a number outside its range is clamped.
+ANIM = ("animated",)
+FIELDS = {
+    "style": {"default": "default", "options": ("default", "floating", "animated")},
+    "position": {"default": "bottom", "options": ("bottom", "top", "left", "right")},
+    "alignment": {"default": "center", "options": ("center", "left", "right")},
+    "panel_width": {"default": "fit", "options": ("fit", "fill")},
+    "icon_size": {"default": 48, "min": 24, "max": 96},
+    "visibility": {"default": "always", "options": ("always", "autohide", "dodge")},
+    "panel_look": {"default": "translucent", "options": ("translucent", "adaptive", "opaque")},
+    "stock_panel": {"default": "top_bar", "options": ("top_bar", "autohide", "keep")},
+    "zoom": {"default": 160, "min": 100, "max": 200},
+    "zoom_style": {"default": "parabolic", "options": ("parabolic", "in_place")},
+    "zoom_speed": {"default": "natural", "options": ("natural", "quick", "relaxed", "instant", "custom")},
+    "zoom_in_ms": {"default": 180, "min": 0, "max": 1000},
+    "zoom_out_ms": {"default": 240, "min": 0, "max": 1000},
+    "zoom_easing": {"default": "ease_in_out", "options": ("linear", "ease_in", "ease_out", "ease_in_out", "gentle")},
+    "spacing": {"default": 4, "min": 0, "max": 64},
+    "radius": {"default": 12, "min": 0, "max": 24},
+    "gap": {"default": 8, "min": 0, "max": 128},
+    "background": {"default": "theme", "options": ("theme", "acrylic", "tinted", "transparent")},
+    "opacity": {"default": 60, "min": 0, "max": 100},
+    "color_source": {"default": "theme", "options": ("theme", "accent", "custom")},
+    "tint": {"default": "#1e3a5f", "color": True},
+    "shadow": {"default": False},
+    "shadow_strength": {"default": 30, "min": 0, "max": 100},
+    "show_delay": {"default": 200, "min": 0, "max": 2000},
+    "hide_delay": {"default": 400, "min": 0, "max": 5000},
+    "dodge_active_only": {"default": False},
+    "reserve_space": {"default": True},
+    "badges": {"default": "number", "options": ("number", "dot", "off")},
+    "previews": {"default": True},
+    "preview_size": {"default": 200, "min": 120, "max": 320},
+    "attention": {"default": "wiggle", "options": ("none", "bounce", "wiggle", "pulse", "glow", "dot_color", "blink")},
+    "monitors": {"default": "primary", "options": ("primary", "all", "follow")},
+}
+
+PLASMA = "org.kde.plasmashell"
+PLASMA_UNIT = "plasma-plasmashell.service"
+KREMA = "com.bhyoo.krema"      # Krema's D-Bus name (KDBusService::Unique, organization domain bhyoo.com)
+AUTOSTART_NAME = "forge-krema.desktop"
+MARK = "X-Forge-Managed=dock"
+DBUS_TIMEOUT_S = 25
+# forge-appearance stops a backend after 120 s. Every command and wait here shares one budget that ends
+# well before that, so a slow desktop gives a plain message instead of a killed process.
+# Starting plasmashell again after the backup stopped it is always tried, outside that budget, with its
+# own timeout: BUDGET_S + RESTART_S stays well under 120 s.
+BUDGET_S = 95
+RESTART_S = 15
+DEADLINE = time.monotonic() + BUDGET_S
+RESTART_HINT = ("If your panel and desktop are gone, open a terminal (Ctrl+Alt+T) and run: "
+                "systemctl --user start plasma-plasmashell.service (or log out and back in), then apply again")
+FILE_MAX = 16 * 1024 * 1024    # a Plasma config file bigger than this is not copied
+KREMARC_MAX = 256 * 1024
+
+
+class DockError(Exception):
+    """Something stopped the change. The text is for the user."""
+
+
+def say(text):
+    print("Dock: " + text, flush=True)
+
+
+# Values
+
+def _num(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def clean_values(raw):
+    """Every dock value checked: unknown or wrong ones become the default, numbers are clamped."""
+    raw = raw if isinstance(raw, dict) else {}
+    out = {}
+    for key, spec in FIELDS.items():
+        v, d = raw.get(key), spec["default"]
+        if "options" in spec:
+            out[key] = v if isinstance(v, str) and v in spec["options"] else d
+        elif "min" in spec:
+            out[key] = int(round(min(max(v, spec["min"]), spec["max"]))) if _num(v) else d
+        elif spec.get("color"):
+            out[key] = v.lower() if isinstance(v, str) and re.fullmatch(r"#[0-9A-Fa-f]{6}", v) else d
+        else:
+            out[key] = v if isinstance(v, bool) else d
+    return out
+
+
+# Krema: ~/.config/kremarc
+
+# Every [General] entry of Krema's src/config/krema.kcfg (v0.13.0), in its order: (type, min, max).
+# Where the kcfg gives no range, the range here is Forge's own (marked "forge").
+KCFG = {
+    "IconSize": ("Int", 24, 96), "IconSpacing": ("Int", 0, 64),
+    "IconOpacityActive": ("Double", 0.1, 1.0), "IconOpacityInactive": ("Double", 0.1, 1.0),
+    "IconOpacityMinimized": ("Double", 0.1, 1.0), "MaxZoomFactor": ("Double", 1.0, 2.0),
+    "ZoomStyle": ("Int", 0, 1), "ZoomAnimationPreset": ("Int", 0, 4),
+    "ZoomInDuration": ("Int", 0, 1000), "ZoomOutDuration": ("Int", 0, 1000),
+    "ZoomInEasing": ("Int", 0, 4), "ZoomOutEasing": ("Int", 0, 4),
+    "IconNormalization": ("Bool", None, None), "IconScale": ("Double", 0.5, 1.0),
+    "CornerRadius": ("Int", 0, 24), "Floating": ("Bool", None, None), "FloatingMargin": ("Int", 1, 128),
+    "FloatingMarginReference": ("Int", 0, 1),
+    "VisibilityMode": ("Int", 0, 2),            # forge: 0 Always, 1 AutoHide, 2 Dodge
+    "ReserveScreenSpace": ("Bool", None, None), "DodgeActiveOnly": ("Bool", None, None),
+    "Edge": ("Int", 0, 3),                      # forge: 0 Top, 1 Bottom, 2 Left, 3 Right
+    "ShowDelay": ("Int", 0, 10000), "HideDelay": ("Int", 0, 10000),   # forge
+    "RevealTriggerLocation": ("Int", 0, 1),
+    "BackgroundOpacity": ("Double", 0.0, 1.0), "BackgroundStyle": ("Int", 0, 3),
+    "UseAccentColor": ("Bool", None, None), "UseSystemColor": ("Bool", None, None),
+    "TintColor": ("String", None, None), "ShadowEnabled": ("Bool", None, None),
+    "ShadowLightX": ("Int", -300, 300), "ShadowLightY": ("Int", -300, 300), "ShadowLightZ": ("Int", 100, 2000),
+    "ShadowLightRadius": ("Double", 0.5, 20.0), "ShadowColor": ("String", None, None),
+    "ShadowIntensity": ("Double", 0.0, 1.0), "ShadowElevation": ("Int", 1, 50),
+    "PreviewEnabled": ("Bool", None, None), "PreviewThumbnailSize": ("Int", 120, 320),
+    "PreviewHoverDelay": ("Int", 0, 10000), "PreviewHideDelay": ("Int", 0, 10000),   # forge
+    "SingleWindowClickAction": ("Int", 0, 1), "GroupedWindowClickAction": ("Int", 0, 2),
+    "AttentionAnimation": ("Int", 0, 6), "AttentionAnimationDuration": ("Int", 0, 60),
+    "BadgeDisplayMode": ("Int", 0, 2), "BadgePosition": ("Int", 0, 2),
+    "BadgeUseAccentColor": ("Bool", None, None), "BadgeCustomColor": ("String", None, None),
+    "MonitorMode": ("Int", 0, 3), "SelectedOutputs": ("StringList", None, None),
+    "FollowActiveTrigger": ("Int", 0, 2), "ScreenTransition": ("Int", 0, 2),
+    "VirtualDesktopMode": ("Int", 0, 2), "OtherDesktopOpacity": ("Double", 0.1, 0.9),
+    "PinnedLaunchers": ("StringList", None, None), "SeparateLaunchers": ("Bool", None, None),
+}
+EDGE = {"top": 0, "bottom": 1, "left": 2, "right": 3}
+EASING = {"linear": 0, "ease_in": 1, "ease_out": 2, "ease_in_out": 3, "gentle": 4}
+SPEED = {"natural": 0, "quick": 1, "relaxed": 2, "instant": 3, "custom": 4}
+BACKGROUND = {"theme": 0, "transparent": 1, "tinted": 2, "acrylic": 3}
+BADGES = {"number": 0, "dot": 1, "off": 2}
+ATTENTION = {"none": 0, "bounce": 1, "wiggle": 2, "pulse": 3, "glow": 4, "dot_color": 5, "blink": 6}
+MONITORS = {"primary": 0, "all": 1, "follow": 2}
+VISIBILITY_KREMA = {"always": 0, "autohide": 1, "dodge": 2}
+
+
+def krema_values(v):
+    """The Krema settings Forge manages, from the dock values."""
+    return {
+        "IconSize": v["icon_size"], "IconSpacing": v["spacing"], "MaxZoomFactor": v["zoom"] / 100,
+        "ZoomStyle": 1 if v["zoom_style"] == "in_place" else 0, "ZoomAnimationPreset": SPEED[v["zoom_speed"]],
+        "ZoomInDuration": v["zoom_in_ms"], "ZoomOutDuration": v["zoom_out_ms"],
+        "ZoomInEasing": EASING[v["zoom_easing"]], "ZoomOutEasing": EASING[v["zoom_easing"]],
+        "CornerRadius": v["radius"], "Floating": v["gap"] > 0, "FloatingMargin": v["gap"],
+        "VisibilityMode": VISIBILITY_KREMA[v["visibility"]], "ReserveScreenSpace": v["reserve_space"],
+        "DodgeActiveOnly": v["dodge_active_only"], "Edge": EDGE[v["position"]],
+        "ShowDelay": v["show_delay"], "HideDelay": v["hide_delay"],
+        "BackgroundOpacity": v["opacity"] / 100, "BackgroundStyle": BACKGROUND[v["background"]],
+        "UseAccentColor": v["color_source"] == "accent", "UseSystemColor": v["color_source"] != "custom",
+        "TintColor": v["tint"], "ShadowEnabled": v["shadow"], "ShadowIntensity": v["shadow_strength"] / 100,
+        "PreviewEnabled": v["previews"], "PreviewThumbnailSize": v["preview_size"],
+        "AttentionAnimation": ATTENTION[v["attention"]], "BadgeDisplayMode": BADGES[v["badges"]],
+        "MonitorMode": MONITORS[v["monitors"]],
+    }
+
+
+def _kformat(name, value):
+    """A checked, clamped value as KConfig text, or None if it can't be used."""
+    typ, lo, hi = KCFG[name]
+    if typ == "Bool":
+        return ("true" if value else "false") if isinstance(value, bool) else None
+    if typ in ("Int", "Double"):
+        if not _num(value):
+            return None
+        value = min(max(value, lo), hi)
+        return str(int(round(value))) if typ == "Int" else "%g" % round(value, 4)
+    if typ == "String":   # the three colors: #rrggbb, or #aarrggbb for the shadow
+        ok = r"#[0-9A-Fa-f]{8}|#[0-9A-Fa-f]{6}" if name == "ShadowColor" else r"#[0-9A-Fa-f]{6}"
+        return value if isinstance(value, str) and re.fullmatch(ok, value) else None
+    # StringList: kept as Krema wrote it (any language), but never with a line break or control character.
+    if not isinstance(value, str) or len(value) > 16384:
+        return None
+    return None if any(unicodedata.category(c) in ("Cc", "Cs", "Zl", "Zp") for c in value) else value
+
+
+# The keys Krema reads from a per-screen group [Screen-<output>] (src/config/screensettings.cpp).
+SCREEN_KEYS = ("IconSize", "Edge", "VisibilityMode", "BackgroundStyle", "BackgroundOpacity", "MaxZoomFactor",
+               "Floating", "CornerRadius", "PinnedLaunchers")
+
+
+def _parse_existing(text):
+    """The entries of an existing kremarc worth keeping: {"General": {name: raw}, "Screen-X": {...}}."""
+    groups, cur = {}, None
+    for line in text.split("\n"):       # KConfig breaks lines only at \n (not at U+2028 like splitlines)
+        line = line.strip(" \t\r")
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("["):
+            m = re.fullmatch(r"\[(General|Screen-[A-Za-z0-9_-][A-Za-z0-9._-]{0,63})\]", line)
+            cur = m.group(1) if m and ".." not in m.group(1) else None
+            if cur is not None:
+                groups.setdefault(cur, {})
+            continue
+        if cur is None or "=" not in line:
+            continue
+        name, raw = line.split("=", 1)
+        name = name.strip()
+        if name in KCFG and (cur == "General" or name in SCREEN_KEYS):
+            groups[cur][name] = raw
+    return groups
+
+
+def _from_text(name, raw):
+    typ = KCFG[name][0]
+    raw = raw.strip()
+    if typ == "Bool":
+        return {"true": True, "false": False}.get(raw.lower())
+    if typ in ("Int", "Double"):
+        try:
+            n = float(raw)
+        except ValueError:
+            return None
+        return n if math.isfinite(n) else None
+    return raw
+
+
+def kremarc_text(v, existing="", newer=""):
+    """The whole kremarc: Forge's values, plus other Krema settings already in the file (checked and
+    clamped, in Krema's own order): pinned apps and the per-screen choices made in Krema itself.
+    newer: a kremarc kept from the last time Animated was left; its entries win over existing.
+    Unknown keys, groups and anything odd are left out."""
+    old = _parse_existing(existing)
+    for group, entries in _parse_existing(newer).items():
+        old.setdefault(group, {}).update(entries)
+    mine = krema_values(v)
+    lines = ["# Written by Forge OS (Settings, Appearance, Dock). Changes here are replaced on the next apply.",
+             "[General]"]
+    for name in KCFG:
+        if name in mine:
+            text = _kformat(name, mine[name])
+        elif name in old.get("General", {}):
+            text = _kformat(name, _from_text(name, old["General"][name]))
+        else:
+            continue
+        if text is not None:
+            lines.append(f"{name}={text}")
+    size = len("\n".join(lines).encode("utf-8")) + 1
+    for group in sorted(g for g in old if g != "General"):
+        kept = []
+        for name in KCFG:
+            if name in old[group]:
+                text = _kformat(name, _from_text(name, old[group][name]))
+                if text is not None:
+                    kept.append(f"{name}={text}")
+        block = ["", f"[{group}]"] + kept
+        grow = len("\n".join(block).encode("utf-8")) + 1
+        if kept and size + grow <= KREMARC_MAX - 4096:     # extra screens beyond the cap are left out
+            lines += block
+            size += grow
+    return "\n".join(lines) + "\n"
+
+
+# Plasma panel scripts (desktop scripting, org.kde.PlasmaShell.evaluateScript)
+
+PANEL_PROPS = ("location", "height", "lengthMode", "maximumLength", "minimumLength", "offset", "alignment",
+               "hiding", "opacity", "floating", "floatingApplets")
+ENUMS = {"location": ("top", "bottom", "left", "right"), "lengthMode": ("fill", "fit", "custom"),
+         "alignment": ("left", "center", "right"), "hiding": ("none", "autohide", "dodgewindows", "windowsgobelow"),
+         "opacity": ("adaptive", "opaque", "translucent")}
+INT_RANGE = {"height": (1, 4096), "maximumLength": (0, 65536), "minimumLength": (0, 65536), "offset": (-65536, 65536)}
+
+# Reads every panel's properties (for the backup). No data in it at all.
+READ_SCRIPT = """// Forge OS dock: read every panel's properties for the backup.
+var all = panels();
+var out = [];
+for (var i = 0; i < all.length; i++) {
+  var p = all[i];
+  out.push({id: p.id, props: {location: p.location, height: p.height, lengthMode: p.lengthMode,
+    maximumLength: p.maximumLength, minimumLength: p.minimumLength, offset: p.offset, alignment: p.alignment,
+    hiding: p.hiding, opacity: p.opacity, floating: p.floating, floatingApplets: p.floatingApplets}});
+}
+print("FORGE-BEGIN" + JSON.stringify(out) + "FORGE-END");
+"""
+
+COUNT_SCRIPT = """// Forge OS dock: how many panels Plasma has loaded.
+print("FORGE-BEGIN" + JSON.stringify(panels().length) + "FORGE-END");
+"""
+
+# Default: puts the saved properties back on every saved panel. A style: only on the panels that hold an
+# app list (task manager), merged with the style's properties (one set, so nothing jumps back and forth).
+# Other panels are never touched, so later changes you make to them stay.
+# The order is the one Plasma's own loadSerializedLayout uses.
+PANEL_TEMPLATE = """// Forge OS dock: built from a fixed template; the only data is the JSON literal on the next line.
+var forge = @FORGE_DATA@;
+var ORDER = ["location", "height", "lengthMode", "maximumLength", "minimumLength", "offset", "alignment",
+             "hiding", "opacity", "floating", "floatingApplets"];
+var TASKS = ["org.kde.plasma.taskmanager", "org.kde.plasma.icontasks", "org.kde.plasma.expandingiconstaskmanager"];
+var all = panels();
+function hasTasks(p) {
+  var w = p.widgets();
+  for (var i = 0; i < w.length; i++) {
+    if (TASKS.indexOf(w[i].type) >= 0) return true;
+  }
+  return false;
+}
+function put(p, props) {
+  for (var i = 0; i < ORDER.length; i++) {
+    if (Object.prototype.hasOwnProperty.call(props, ORDER[i])) p[ORDER[i]] = props[ORDER[i]];
+  }
+}
+var targets = [];
+if (forge.style !== null) {
+  for (var i = 0; i < all.length; i++) {
+    if (hasTasks(all[i])) targets.push(all[i].id);
+  }
+  if (targets.length === 0 && all.length > 0) targets.push(all[0].id);
+}
+var restored = 0;
+for (var j = 0; j < all.length; j++) {
+  var p = all[j], props = {}, k;
+  // Default (style null) puts every saved panel back. A style touches only the panels it styles.
+  if (forge.style !== null && targets.indexOf(p.id) < 0) continue;
+  for (k = 0; k < forge.saved.length; k++) {
+    if (forge.saved[k].id === p.id) {
+      props = JSON.parse(JSON.stringify(forge.saved[k].props));
+      restored++;
+    }
+  }
+  if (forge.style !== null) {
+    for (k in forge.style) props[k] = forge.style[k];
+  }
+  put(p, props);
+}
+print("FORGE-BEGIN" + JSON.stringify({restored: restored, changed: targets.length}) + "FORGE-END");
+"""
+
+
+def clean_saved(raw):
+    """Saved panel properties from the backup, checked again: anything odd is left out."""
+    out = []
+    for p in raw if isinstance(raw, list) else []:
+        if not isinstance(p, dict) or type(p.get("id")) is not int or not 0 <= p["id"] < 2 ** 31:
+            continue
+        props = p.get("props") if isinstance(p.get("props"), dict) else {}
+        good = {}
+        for name in PANEL_PROPS:
+            v = props.get(name)
+            if name in ENUMS:
+                ok = isinstance(v, str) and v in ENUMS[name]
+            elif name in INT_RANGE:
+                ok = type(v) is int and INT_RANGE[name][0] <= v <= INT_RANGE[name][1]
+            else:
+                ok = isinstance(v, bool)
+            if ok:
+                good[name] = v
+        out.append({"id": p["id"], "props": good})
+    return out
+
+
+VISIBILITY_PLASMA = {"always": "none", "autohide": "autohide", "dodge": "dodgewindows"}
+
+
+def style_props(v):
+    """The panel properties the chosen style sets on the panel with the app list (None: Default)."""
+    if v["style"] == "floating":
+        return {"location": v["position"], "floating": True, "lengthMode": v["panel_width"],
+                "alignment": v["alignment"], "height": v["icon_size"] + 8,
+                "hiding": VISIBILITY_PLASMA[v["visibility"]], "opacity": v["panel_look"]}
+    if v["style"] == "animated":
+        if v["stock_panel"] == "top_bar":
+            return {"location": "bottom" if v["position"] == "top" else "top", "height": 30, "lengthMode": "fill",
+                    "floating": False, "hiding": "none"}
+        if v["stock_panel"] == "autohide":
+            return {"hiding": "autohide"}
+        return {}
+    return None
+
+
+def panel_script(saved, style):
+    data = json.dumps({"saved": saved, "style": style}, ensure_ascii=True, sort_keys=True)
+    return PANEL_TEMPLATE.replace("@FORGE_DATA@", data, 1)
+
+
+# D-Bus through dbus-send (a plain argv, never a shell)
+
+def run(argv, timeout=DBUS_TIMEOUT_S, always=False):
+    """Run argv (no shell). The time comes out of the shared budget unless always=True (the restart)."""
+    left = timeout if always else DEADLINE - time.monotonic()
+    if left < 1:
+        raise DockError(f"the desktop answered too slowly, so Forge stopped before running {argv[0]}. "
+                        "Apply again in a moment")
+    timeout = min(timeout, left)
+    try:
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout,
+                           errors="replace")
+    except FileNotFoundError:
+        raise DockError(f"{argv[0]} is not installed, so nothing was changed")
+    except subprocess.TimeoutExpired:
+        raise DockError(f"{argv[0]} did not answer within {int(timeout)} seconds")
+    return r
+
+
+def _short(text):
+    text = "".join(c for c in text if c.isprintable() or c == " ").strip()
+    return text[:300]
+
+
+def dbus(dest, path, method, *args):
+    r = run(["dbus-send", "--session", "--print-reply", "--reply-timeout=20000", "--dest=" + dest, path, method,
+             *args])
+    if r.returncode != 0:
+        err = r.stderr.strip().splitlines()
+        msg = err[-1] if err else "no answer"
+        msg = re.sub(r"^Error [\w.]+: ", "", msg)
+        raise DockError(_short(msg))
+    return r.stdout
+
+
+def _body(reply):
+    """The reply without dbus-send's "method return ..." line."""
+    return reply.split("\n", 1)[1] if reply.startswith("method return") and "\n" in reply else reply
+
+
+def parse_string(reply):
+    body = _body(reply)
+    m = re.match(r'\s*string "(.*)"\s*\Z', body, re.S)
+    if not m:
+        raise DockError("Plasma gave an answer Forge does not understand")
+    return m.group(1)
+
+
+def parse_bytes(reply):
+    body = _body(reply).strip()
+    m = re.fullmatch(r'array of bytes "(.*)"( \+ \\0)?', body, re.S)
+    if m:
+        return m.group(1).encode("utf-8")
+    m = re.fullmatch(r"array of bytes \[([0-9a-fA-F\s]*)\]", body)
+    if not m:
+        raise DockError("Plasma gave a layout Forge does not understand")
+    return bytes(int(x, 16) for x in m.group(1).split())
+
+
+def parse_bool(reply):
+    return re.search(r"^\s*boolean true\s*$", reply, re.M) is not None
+
+
+def extract(output):
+    m = re.search(r"FORGE-BEGIN(.*?)FORGE-END", output, re.S)
+    if not m:
+        raise DockError("Plasma did not run the panel script")
+    try:
+        return json.loads(m.group(1))
+    except ValueError:
+        raise DockError("Plasma gave an answer Forge does not understand")
+
+
+def has_owner(name):
+    return parse_bool(dbus("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus.NameHasOwner",
+                           "string:" + name))
+
+
+def plasma(script):
+    try:
+        reply = dbus(PLASMA, "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", "string:" + script)
+    except DockError as e:
+        raise DockError(f"Plasma refused the panel change ({str(e).rstrip('.')}). If your widgets are locked, "
+                        "unlock them and apply again")
+    return extract(parse_string(reply))
+
+
+def require_plasma():
+    try:
+        up = has_owner(PLASMA)
+    except DockError:
+        raise DockError("Plasma is not running here (this program could not reach your desktop's session bus), "
+                        "so nothing was changed. Apply again from inside a Plasma session")
+    if not up:
+        raise DockError("Plasma is not running (no plasmashell in this session), so nothing was changed. "
+                        "Apply again from inside a Plasma session.")
+
+
+# Files
+
+def _xdg(name, fallback):
+    base = os.environ.get(name, "")
+    return base if os.path.isabs(base) else os.path.join(os.path.expanduser("~"), fallback)
+
+
+def config_dir():
+    return _xdg("XDG_CONFIG_HOME", ".config")
+
+
+def backup_root():
+    return os.path.join(_xdg("XDG_DATA_HOME", os.path.join(".local", "share")), "forge", "appearance", "dock-backup")
+
+
+def private_dir(path):
+    """Make path (0700) and check it is a real folder of ours, not a link."""
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise DockError(f"{path} is not a private folder of yours (a link or someone else's), so nothing was changed")
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        os.chmod(path, 0o700)
+    return path
+
+
+def read_file(path, limit):
+    """Bytes of a regular file (never through a link), None if missing or not usable."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            return None
+        with os.fdopen(fd, "rb") as f:
+            fd = None
+            data = f.read(limit + 1)
+        return data if len(data) <= limit else None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def write_atomic(path, data, mode=0o600):
+    """Write through a temporary file in the same folder, then rename it over path."""
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    if os.path.isdir(path) and not os.path.islink(path):
+        raise DockError(f"{path} is a folder, so it was not replaced")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix="." + os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            os.fchmod(f.fileno(), mode)
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def write_new(path, data):
+    """A new 0600 file in the backup (never replaces or follows anything)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data.encode("utf-8") if isinstance(data, str) else data)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def followed(path):
+    """The file to read or write for path: path itself, or for a link (a dotfile manager, for example)
+    the regular file of yours it points to, so the link stays. DockError for a link to anything else."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return path
+    if not stat.S_ISLNK(st.st_mode):
+        return path
+    target = os.path.realpath(path)
+    try:
+        tst = os.lstat(target)
+    except FileNotFoundError:
+        raise DockError(f"{path} is a link to {target}, which does not exist, so Forge left it alone. "
+                        "Fix or remove the link and apply again")
+    if not stat.S_ISREG(tst.st_mode) or tst.st_uid != os.getuid():
+        raise DockError(f"{path} is a link to something that is not a regular file of yours, so Forge left it "
+                        "alone. Fix or remove the link and apply again")
+    backups = os.path.realpath(backup_root())
+    if os.path.commonpath([backups, target]) == backups:
+        raise DockError(f"{path} is a link into Forge's dock backup folder, which is never changed, so Forge left "
+                        "it alone. Fix or remove the link and apply again")
+    return target
+
+
+def remove_file(path):
+    try:
+        if stat.S_ISREG(os.lstat(path).st_mode):
+            os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+# Backup and state
+
+PLASMA_FILES = ("plasmashellrc", "plasma-org.kde.plasma.desktop-appletsrc")
+
+README = """Forge OS dock backup: your Plasma panel and Krema settings from before Forge first changed the dock.
+Choosing the Default dock style in Forge Settings puts the panel settings back (panels.json).
+
+The other files are for a full manual restore, if ever needed. That also brings back the desktop
+widgets and wallpaper from that day, so use it only if the panel is broken:
+  systemctl --user stop plasma-plasmashell.service
+  cp plasmashellrc plasma-org.kde.plasma.desktop-appletsrc ~/.config/
+  systemctl --user start plasma-plasmashell.service
+layout.js is Plasma's own layout dump (dumpCurrentLayoutJS). Running it adds panels next to the
+existing ones, so remove the old panels first.
+"""
+
+
+def first_backup():
+    return os.path.join(backup_root(), "first")
+
+
+def damaged(first):
+    return (f"the dock backup in {first} is damaged, so nothing was changed. Rename or remove that folder "
+            f"(for example: mv {first} {first}.broken) and apply again; Forge then backs up your panel as it is now")
+
+
+def load_backup():
+    """(saved panel properties, meta) from the first backup, or (None, None) if there is none."""
+    first = first_backup()
+    try:
+        st = os.lstat(first)
+    except FileNotFoundError:
+        return None, None
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise DockError(f"{first} is not a private folder of yours, so nothing was changed")
+    try:
+        saved = json.loads((read_file(os.path.join(first, "panels.json"), FILE_MAX) or b"null").decode("utf-8"))
+        meta = json.loads((read_file(os.path.join(first, "meta.json"), FILE_MAX) or b"null").decode("utf-8"))
+    except ValueError:
+        saved, meta = None, None
+    if not isinstance(saved, list) or not isinstance(meta, dict):
+        raise DockError(damaged(first))
+    return clean_saved(saved), meta
+
+
+def wait_for(check, seconds):
+    end = min(time.monotonic() + seconds, DEADLINE - 2)
+    while True:
+        if check():
+            return True
+        if time.monotonic() > end:
+            return False
+        time.sleep(0.5)
+
+
+def shell_active():
+    r = run(["systemctl", "--user", "is-active", PLASMA_UNIT])
+    return r.returncode == 0 and r.stdout.strip() == "active"
+
+
+def windows_go_below(rc):
+    """Panel ids whose plasmashellrc says "windows go below" (panelVisibility=3). Plasma's scripting
+    reads that mode back as "none", so the backup takes it from the file instead."""
+    ids, cur = set(), None
+    for line in rc.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            m = re.fullmatch(r"\[PlasmaViews\]\[Panel (\d{1,9})\]", line)
+            cur = int(m.group(1)) if m else None
+        elif cur is not None and line.replace(" ", "") == "panelVisibility=3":
+            ids.add(cur)
+    return ids
+
+
+def take_backup():
+    """The first backup, taken once: never replaced afterwards."""
+    root = private_dir(backup_root())
+    if os.path.lexists(first_backup()):
+        load_backup()
+        return
+    layout = parse_bytes(dbus(PLASMA, "/PlasmaShell", "org.kde.PlasmaShell.dumpCurrentLayoutJS"))
+    panels = clean_saved(plasma(READ_SCRIPT))
+    tmp = tempfile.mkdtemp(dir=root, prefix=".first-")
+    try:
+        write_new(os.path.join(tmp, "layout.js"), layout)
+        kremarc = read_file(followed(kremarc_path()), KREMARC_MAX)
+        if kremarc is not None:
+            write_new(os.path.join(tmp, "kremarc"), kremarc)
+        # A running plasmashell writes its files back, so they are copied while it is stopped.
+        stopped = shell_active()
+        copied, not_copied, started, stop_tried = [], [], True, False
+        try:
+            if stopped:
+                stop_tried = True    # from here on plasmashell may be down, even if stop times out
+                r = run(["systemctl", "--user", "stop", PLASMA_UNIT], timeout=60)
+                if r.returncode != 0:
+                    raise DockError("plasmashell could not be stopped for the backup: " + _short(r.stderr))
+            for name in PLASMA_FILES:
+                try:
+                    data = read_file(followed(os.path.join(config_dir(), name)), FILE_MAX)
+                except DockError as e:
+                    data = None
+                    not_copied.append(f"{name}: {e}")
+                if data is not None:
+                    write_new(os.path.join(tmp, name), data)
+                    copied.append(name)
+                if data is not None and name == "plasmashellrc":
+                    below = windows_go_below(data)
+                    for p in panels:
+                        if p["id"] in below and p["props"].get("hiding") in ("none", None):
+                            p["props"]["hiding"] = "windowsgobelow"
+        except DockError as e:
+            if stop_tried:
+                raise DockError(f"{str(e).rstrip('.')}. {RESTART_HINT}")
+            raise
+        finally:
+            if stop_tried:
+                try:
+                    started = run(["systemctl", "--user", "start", PLASMA_UNIT], timeout=RESTART_S,
+                                  always=True).returncode == 0
+                except DockError:
+                    started = False
+        write_new(os.path.join(tmp, "panels.json"), json.dumps(panels, indent=1) + "\n")
+        write_new(os.path.join(tmp, "README.txt"), README)
+        write_new(os.path.join(tmp, "meta.json"), json.dumps(
+            {"taken": int(time.time()), "kremarc": kremarc is not None, "files": copied, "not_copied": not_copied,
+             "copied_while_stopped": stopped, "panels": len(panels)}, indent=1) + "\n")
+        os.rename(tmp, first_backup())
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    if stopped:
+        want = len(panels)
+        try:
+            back = started and wait_for(lambda: has_owner(PLASMA), 30) and wait_for(lambda: _count() >= want, 15)
+        except DockError:
+            back = False
+        if not back:
+            raise DockError("the backup is done, but your panel and desktop (plasmashell) did not come back. "
+                            + RESTART_HINT)
+
+
+def _count():
+    try:
+        n = plasma(COUNT_SCRIPT)
+    except DockError:
+        return -1
+    return n if type(n) is int else -1
+
+
+def state_path():
+    return os.path.join(backup_root(), "state.json")
+
+
+def read_state():
+    data = read_file(state_path(), 4096)
+    try:
+        s = json.loads(data.decode("utf-8")) if data else {}
+    except ValueError:
+        s = {}
+    return s.get("applied") if isinstance(s, dict) and s.get("applied") in FIELDS["style"]["options"] else None
+
+
+def write_state(style):
+    private_dir(backup_root())
+    write_atomic(state_path(), json.dumps({"applied": style}) + "\n")
+
+
+# Krema process and autostart
+
+def autostart_path():
+    return os.path.join(config_dir(), "autostart", AUTOSTART_NAME)
+
+
+def ours(path):
+    data = read_file(path, 65536)
+    return data is not None and MARK.encode() in data.splitlines()
+
+
+def krema_running():
+    return has_owner(KREMA)
+
+
+def quit_krema():
+    if not krema_running():
+        return
+    dbus(KREMA, "/MainApplication", "org.qtproject.Qt.QCoreApplication.quit")
+    if not wait_for(lambda: not krema_running(), 15):
+        raise DockError("Krema did not quit in time, so its settings were not changed")
+
+
+def stop_forge_krema():
+    """Leaving Animated: remove Forge's autostart file and quit Krema if Forge started it."""
+    mine = ours(autostart_path())
+    if mine:
+        remove_file(autostart_path())
+    if mine or read_state() == "animated":
+        quit_krema()
+
+
+def start_krema(exe):
+    r = run(["systemd-run", "--user", "--collect", "--quiet", "--unit=forge-krema", "--", exe], timeout=30)
+    if r.returncode != 0:
+        raise DockError("Krema could not be started: " + _short(r.stderr))
+
+
+def find_krema():
+    exe = shutil.which("krema")
+    if exe is None:
+        return None
+    exe = os.path.realpath(exe)
+    if not re.fullmatch(r"/[A-Za-z0-9._/+-]+", exe):
+        raise DockError("Krema is installed in a folder whose name Forge does not accept, so nothing was changed")
+    return exe
+
+
+def autostart_text(exe):
+    return ("[Desktop Entry]\nType=Application\nName=Krema (Forge OS dock)\n"
+            "Comment=Started because the Forge OS Dock style is Animated. Choose another style in Forge Settings "
+            "to stop it.\n"
+            f"Exec={exe}\nIcon=com.bhyoo.krema\nTerminal=false\nOnlyShowIn=KDE;\nX-GNOME-Autostart-enabled=true\n"
+            f"{MARK}\n")
+
+
+def kremarc_path():
+    return os.path.join(config_dir(), "kremarc")
+
+
+def kept_path():
+    """Krema's settings from the last time Animated was left: pinned apps and per-screen choices made in
+    Krema come back from here the next time Animated is chosen."""
+    return os.path.join(backup_root(), "kremarc-kept")
+
+
+def restore_kremarc(meta):
+    path = kremarc_path()
+    target = followed(path)
+    now = read_file(target, KREMARC_MAX)
+    if meta.get("kremarc") is True:
+        data = read_file(os.path.join(first_backup(), "kremarc"), KREMARC_MAX)
+        if data is not None:
+            write_atomic(target, data)
+    elif meta.get("kremarc") is False and target == path:
+        remove_file(path)      # a link made later (a dotfile manager) is left as it is
+    # Next to it: what kremarc holds right after this restore (by content, not file time, so a clock that
+    # is off or a tool that only touches the file changes nothing).
+    if now is not None:
+        write_atomic(kept_path(), now)
+        write_atomic(kept_path() + ".restored", content_id(read_file(target, KREMARC_MAX)) + "\n")
+
+
+def content_id(data):
+    return "absent" if data is None else "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def kept_if_unchanged(target):
+    """kremarc-kept, but only while kremarc still holds exactly what Default restored. Once its content
+    changed (Krema saved new pins, or you edited it), kremarc wins and the kept file is dropped."""
+    kept = read_file(kept_path(), KREMARC_MAX)
+    mark = read_file(kept_path() + ".restored", 256)
+    if kept is not None and mark is not None and mark.decode("ascii", "replace").strip() == \
+            content_id(read_file(target, KREMARC_MAX)):
+        return kept.decode("utf-8", "replace")
+    remove_file(kept_path())
+    remove_file(kept_path() + ".restored")
+    return ""
+
+
+# Styles
+
+def apply_default():
+    saved, meta = load_backup()
+    if saved is None:
+        stop_forge_krema()
+        return "Forge has not changed your Plasma panel, so there is nothing to restore."
+    if read_state() == "default":
+        return "your Plasma panel is already as it was before Forge changed it."
+    require_plasma()
+    stop_forge_krema()
+    restore_kremarc(meta)
+    plasma(panel_script(saved, None))
+    write_state("default")
+    return "your Plasma panel is back to how it was before Forge changed it."
+
+
+def apply_floating(v):
+    require_plasma()
+    take_backup()
+    saved, _ = load_backup()
+    stop_forge_krema()
+    res = plasma(panel_script(saved, style_props(v)))
+    write_state("floating")
+    n = res.get("changed", 0) if isinstance(res, dict) else 0
+    return f"Floating clean applied to {n} Plasma panel{'s' if n != 1 else ''}."
+
+
+STOCK_TEXT = {"top_bar": "your Plasma panel is now a slim bar on the other edge",
+              "autohide": "your Plasma panel now hides until you touch its edge",
+              "keep": "your Plasma panel is left as it is"}
+
+
+def apply_animated(v):
+    exe = find_krema()
+    if exe is None:
+        raise DockError("Krema is not installed in this Forge OS image, so the Animated style can't run. "
+                        "Nothing was changed. Choose Floating clean, or see README (Dock styles) to add Krema.")
+    require_plasma()
+    auto = autostart_path()
+    if os.path.lexists(auto) and not ours(auto):
+        raise DockError(f"{auto} exists and was not made by Forge, so it was left alone and nothing was changed")
+    target = followed(kremarc_path())
+    take_backup()
+    saved, _ = load_backup()
+    quit_krema()
+    plasma(panel_script(saved, style_props(v)))
+    old = read_file(target, KREMARC_MAX)
+    write_atomic(target, kremarc_text(v, old.decode("utf-8", "replace") if old else "", kept_if_unchanged(target)))
+    start_krema(exe)
+    # Last, so a failed apply never makes Krema start at the next login.
+    os.makedirs(os.path.dirname(auto), mode=0o700, exist_ok=True)
+    write_atomic(auto, autostart_text(exe))
+    write_state("animated")
+    remove_file(kept_path())
+    remove_file(kept_path() + ".restored")
+    return f"Krema started with your settings; {STOCK_TEXT[v['stock_panel']]}."
+
+
+def main():
+    if os.geteuid() == 0:
+        print("forge-appearance-dock: don't run this as root. The dock is per user.", file=sys.stderr)
+        return 2
+    if sys.argv[1:] != ["apply"]:
+        print("Usage: forge-appearance-dock apply  (the values come as JSON on stdin)", file=sys.stderr)
+        return 2
+    try:
+        payload = json.loads(sys.stdin.read(1024 * 1024))
+    except (ValueError, UnicodeDecodeError):
+        payload = None
+    if not isinstance(payload, dict):
+        say("could not read the settings (expected JSON on stdin), so nothing was changed.")
+        return 1
+    v = clean_values(payload.get("values"))
+    try:
+        if v["style"] == "floating":
+            text = apply_floating(v)
+        elif v["style"] == "animated":
+            text = apply_animated(v)
+        else:
+            text = apply_default()
+    except DockError as e:
+        say(str(e).rstrip(".") + ".")
+        return 1
+    except OSError as e:
+        say(f"a file could not be written ({e.strerror or e}).")
+        return 1
+    say(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

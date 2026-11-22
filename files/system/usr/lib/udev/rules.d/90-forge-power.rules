@@ -1,0 +1,3 @@
+# Forge OS: when a laptop charger is plugged in or out, let forge-power-switch pick the
+# performance mode (only if "Laptop: switch mode on charger" is on in Forge Settings).
+SUBSYSTEM=="power_supply", ATTR{type}=="Mains", ACTION=="change", RUN+="/usr/bin/systemctl --no-block start forge-power-switch.service"

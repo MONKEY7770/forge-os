@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+"""forge-hub: connect Forge OS to your Creative MCP hub clone, without changing the hub.
+
+  forge-hub setup PATH_TO_HUB_CLONE [--force]   build the hub, write its Linux config, add it to Claude Desktop
+  forge-hub status [--json]                     show what is set up and, if the hub runs, its apps
+  forge-hub dashboard                           open the hub's dashboard (approvals happen there on Linux)
+  forge-hub remove                              undo the Claude Desktop entry and the Flatpak permissions Forge added
+
+The hub itself (its files, config format and code) is never changed. --force replaces an existing
+hub config (the old one is backed up first), like the hub's own `npm run setup -- --force`.
+"""
+import copy
+import datetime
+import html
+import http.client
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import time
+import zipfile
+
+HOME = os.path.expanduser("~")
+
+
+def xdg(var, default):
+    v = os.environ.get(var, "")
+    return v if os.path.isabs(v) else os.path.join(HOME, default)
+
+
+DATA_PARENT = xdg("XDG_DATA_HOME", ".local/share")          # used as LOCALAPPDATA for the hub
+DATA = os.path.join(DATA_PARENT, "creative-mcp-hub")
+HUB_CONFIG = os.path.join(DATA, "hub.config.json")
+BRIDGES = os.path.join(DATA, "bridges")
+INSTALL = os.path.join(DATA, "install")
+CLAUDE_CONFIG = os.path.join(xdg("XDG_CONFIG_HOME", ".config"), "Claude", "claude_desktop_config.json")
+STATE = os.path.join(xdg("XDG_STATE_HOME", ".local/state"), "forge", "hub.json")
+VINEGAR_PREFIX = os.path.join(HOME, ".var/app/org.vinegarhq.Vinegar/data/vinegar/prefixes/studio")
+ENTRY = "creative-mcp-hub"
+BUILT = ["packages/hub/dist/main.js", "packages/hub/dist/config/load.js"] + [
+    "servers/%s/dist/index.js" % s for s in ("blender", "studio", "aseprite", "blockbench")]
+MAX_JSON = 4 * 1024 * 1024
+CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+URL_RE = re.compile(r"^http://127\.0\.0\.1:([0-9]{1,5})/\?t=([A-Za-z0-9_-]{32,256})$")
+
+
+class Stop(Exception):
+    pass
+
+
+def say(msg=""):
+    print(msg, flush=True)
+
+
+def clean(v, n=200):
+    """Text from the hub or from files, made safe to print."""
+    return CONTROL.sub("?", str(v))[:n]
+
+
+def stamp():
+    return datetime.datetime.now().strftime("%Y%m%dT%H%M%S%f")
+
+
+# ---------- files ----------
+
+def write_atomic(path, data, mode=0o600):
+    d = os.path.dirname(path)
+    tmp = os.path.join(d, ".%s.forge-tmp-%d" % (os.path.basename(path), os.getpid()))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            os.fchmod(f.fileno(), mode)
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_own_file(path, what, limit=MAX_JSON):
+    """Read a regular file owned by this user. Returns None if it does not exist."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(st.st_mode):
+        raise Stop("%s (%s) is a symlink. Refusing to use it." % (what, path))
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+        raise Stop("%s (%s) is not a normal file owned by you. Refusing to use it." % (what, path))
+    if st.st_size > limit:
+        raise Stop("%s (%s) is too big." % (what, path))
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as f:
+        return f.read(limit + 1).decode("utf-8")
+
+
+def own_dir(path, mode=0o700):
+    os.makedirs(path, mode=mode, exist_ok=True)
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        raise Stop("%s is not a normal folder owned by you." % path)
+    os.chmod(path, mode)
+
+
+def load_state():
+    try:
+        raw = read_own_file(STATE, "Forge hub state")
+        return json.loads(raw) if raw else None
+    except (Stop, ValueError):
+        return None
+
+
+def save_state(state):
+    own_dir(os.path.dirname(STATE))
+    write_atomic(STATE, (json.dumps(state, indent=2) + "\n").encode())
+
+
+# ---------- Claude Desktop config ----------
+
+def load_claude():
+    """(config dict, raw text or None). Refuses a symlinked or invalid file."""
+    raw = read_own_file(CLAUDE_CONFIG, "Claude Desktop's config")
+    if raw is None:
+        return {}, None
+    try:
+        cfg = json.loads(raw) if raw.strip() else {}
+    except ValueError as e:
+        raise Stop("Claude Desktop's config (%s) is not valid JSON (%s). Nothing was changed. "
+                   "Fix it in Claude Desktop: Settings > Developer > Edit Config." % (CLAUDE_CONFIG, e))
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("mcpServers", {}), dict):
+        raise Stop("Claude Desktop's config (%s) has an unexpected shape. Nothing was changed." % CLAUDE_CONFIG)
+    return cfg, raw
+
+
+def save_claude(cfg, raw):
+    if raw is not None:
+        bak = "%s.forge-bak-%s" % (CLAUDE_CONFIG, stamp())
+        fd = os.open(bak, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(raw)
+        say("  ok    old Claude Desktop config backed up to %s" % bak)
+    else:
+        own_dir(os.path.dirname(CLAUDE_CONFIG))
+    write_atomic(CLAUDE_CONFIG, (json.dumps(cfg, indent=2) + "\n").encode())
+
+
+# ---------- setup ----------
+
+def check_clone(path):
+    if CONTROL.search(path):
+        raise Stop("The folder name has control characters.")
+    clone = os.path.abspath(path)
+    try:
+        pkg = json.loads(read_own_file(os.path.join(clone, "package.json"), "package.json") or "{}")
+    except (Stop, ValueError):
+        pkg = {}
+    if not isinstance(pkg, dict) or pkg.get("name") != "creative-mcp-hub-workspace" or \
+            not os.path.isfile(os.path.join(clone, "hub.config.example.json")):
+        raise Stop("%s does not look like a creative-mcp-hub clone." % clone)
+    return clone
+
+
+def check_node():
+    node, npm = shutil.which("node"), shutil.which("npm")
+    if not node or not npm:
+        raise Stop("Node.js 22 or newer (with npm) is needed and was not found.")
+    out = subprocess.run([node, "--version"], capture_output=True, text=True, timeout=30).stdout.strip()
+    m = re.match(r"^v(\d+)\.", out)
+    if not m or int(m.group(1)) < 22:
+        raise Stop("Node.js 22 or newer is needed (found %s)." % clean(out or "unknown", 40))
+    return node, npm, out
+
+
+def build(clone, npm):
+    say("\n1. Building the hub (its own npm ci and npm run build)")
+    for argv in ([npm, "ci", "--ignore-scripts", "--no-audit", "--no-fund"], [npm, "run", "build"]):
+        if subprocess.run(argv, cwd=clone).returncode != 0:
+            raise Stop("`%s` failed in %s. See the output above." % (" ".join(argv[1:]), clone))
+    missing = [e for e in BUILT if not os.path.isfile(os.path.join(clone, e))]
+    if missing:
+        raise Stop("The build did not produce %s." % missing[0])
+    say("  ok    hub and all four app servers are built")
+
+
+def windows_only(app):
+    parts = [app.get("command", "")] + list(app.get("args", [])) + [app.get("cwd") or ""]
+    return any("%" in p or "\\" in p or re.search(r"\.(exe|cmd|bat)$", p, re.I) for p in parts)
+
+
+def make_config(clone, node):
+    """The hub's example config with only the paths filled in for Linux (what the hub's
+    Windows-only setup.mjs does with {{NODE}} and {{REPO}}), plus the approval mode."""
+    ex = json.loads(read_own_file(os.path.join(clone, "hub.config.example.json"), "hub.config.example.json"))
+    if not isinstance(ex, dict) or not isinstance(ex.get("apps"), dict):
+        raise Stop("hub.config.example.json has an unexpected shape.")
+    cfg = copy.deepcopy(ex)
+
+    def fill(s):
+        if isinstance(s, str) and s.startswith("{{REPO}}"):
+            rest = s[len("{{REPO}}"):].replace("\\", "/").lstrip("/")
+            return os.path.join(clone, rest) if rest else clone
+        return s
+
+    cfg["dataDir"] = DATA
+    # The example uses "native-dialog", a Windows-only pop-up. On Linux nothing could ever be
+    # approved with it, so approvals go to the dashboard (the hub's own default mode).
+    cfg.setdefault("approval", {})["mode"] = "dashboard-then-dialog"
+    dropped = []
+    for app_id, app in list(cfg["apps"].items()):
+        if not isinstance(app, dict) or app.get("kind") != "stdio":
+            continue
+        if app.get("command") == "{{NODE}}":
+            app["command"] = node
+        app["args"] = [fill(a) for a in app.get("args", [])]
+        if app.get("cwd"):
+            app["cwd"] = fill(app["cwd"])
+        if windows_only(app):
+            del cfg["apps"][app_id]
+            dropped.append(app_id)
+    if isinstance(cfg.get("proposals"), dict):
+        # Off: merging a proposal would change the hub's clone, and Forge never changes the hub.
+        cfg["proposals"]["repoDir"] = None
+    if "{{" in json.dumps(cfg):
+        raise Stop("hub.config.example.json has a placeholder this tool does not know. Nothing was written.")
+    return cfg, dropped
+
+
+VALIDATE = ("const {parseConfig} = await import(process.argv[1]); let s = '';"
+            "for await (const c of process.stdin) s += c;"
+            "try { parseConfig(s, 'hub.config.json'); } catch (e) { console.error(e.message); process.exit(1); }")
+
+
+def write_config(clone, node, force):
+    say("\n2. Hub config")
+    own_dir(DATA)
+    cfg, dropped = make_config(clone, node)
+    text = json.dumps(cfg, indent=2) + "\n"
+    load_js = "file://" + os.path.join(clone, "packages/hub/dist/config/load.js").replace("%", "%25").replace(" ", "%20")
+    r = subprocess.run([node, "--input-type=module", "-e", VALIDATE, load_js], input=text,
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise Stop("The hub says the generated config is invalid:\n%s" % clean(r.stderr, 2000))
+    for app_id in dropped:
+        say("  note  left out %s: it runs Windows-only commands (cmd.exe / %%LOCALAPPDATA%%)." % app_id)
+    say("  note  approvals: set to the dashboard (the example's Windows pop-ups cannot show on Linux)")
+    existing = read_own_file(HUB_CONFIG, "the hub config")
+    if existing is not None and not force:
+        say("  note  %s already exists, kept as is. Use `forge-hub setup PATH --force` to replace it." % HUB_CONFIG)
+        return
+    if existing is not None:
+        bak = "%s.bak-%s" % (HUB_CONFIG, stamp())
+        write_atomic(bak, existing.encode())
+        say("  note  old config backed up to %s" % bak)
+    write_atomic(HUB_CONFIG, text.encode())
+    say("  ok    wrote %s (apps: %s)" % (HUB_CONFIG, ", ".join(cfg["apps"])))
+
+
+def zip_to(dest, items):
+    """items: (source file, name in zip). Written next to dest, then moved into place."""
+    tmp = dest + ".forge-tmp"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+        for src, name in sorted(items, key=lambda i: i[1]):
+            z.write(src, name)
+    os.replace(tmp, dest)
+
+
+def walk_files(base, skip=None):
+    out = []
+    for d, dirs, files in os.walk(base):
+        dirs.sort()
+        for f in sorted(files):
+            p = os.path.join(d, f)
+            rel = os.path.relpath(p, base)
+            if os.path.islink(p) or (skip and skip.search("/" + rel)):
+                continue
+            out.append((p, rel))
+    return out
+
+
+def plugin_files(clone):
+    say("\n3. Plugin files")
+    own_dir(INSTALL)
+    ase = os.path.join(clone, "servers/aseprite/plugin")
+    items = [(os.path.join(ase, f), f) for f in ("package.json", "main.lua")]
+    items += [(p, "hub/" + rel) for p, rel in walk_files(os.path.join(ase, "hub"))]
+    zip_to(os.path.join(INSTALL, "creative-hub-bridge.aseprite-extension"), items)
+
+    blender = os.path.join(clone, "servers/blender/plugin")
+    manifest = read_own_file(os.path.join(blender, "blender_manifest.toml"), "blender_manifest.toml") or ""
+    m = re.search(r'^version\s*=\s*"([0-9A-Za-z.+-]{1,32})"', manifest, re.M)
+    skip = re.compile(r"/(tests?|__pycache__)(/|$)|README\.md$|\.pyc$", re.I)
+    blender_zip = os.path.join(INSTALL, "creative_hub-%s.zip" % (m.group(1) if m else "0.1.0"))
+    zip_to(blender_zip, walk_files(blender, skip))
+
+    for src, name in (("servers/blockbench/plugin/build/creative_hub.js", "creative_hub.js"),
+                      ("servers/studio/plugin/build/CreativeHub.lua", "CreativeHub.lua")):
+        data = read_own_file(os.path.join(clone, src), name, limit=64 * 1024 * 1024)
+        write_atomic(os.path.join(INSTALL, name), data.encode(), 0o644)
+    say("  ok    plugin files are in %s" % INSTALL)
+    return blender_zip
+
+
+def add_claude_entry(clone, node, state):
+    say("\n4. Claude Desktop")
+    cfg, raw = load_claude()
+    servers = cfg.setdefault("mcpServers", {})
+    if not state.get("claude_previous_recorded"):
+        state["claude_previous_entry"] = servers.get(ENTRY)
+        state["claude_previous_recorded"] = True
+    servers[ENTRY] = {
+        "command": node,
+        "args": [os.path.join(clone, "packages/hub/dist/main.js")],
+        # The hub keeps its data in %LOCALAPPDATA%\creative-mcp-hub on Windows. Pointing
+        # LOCALAPPDATA here moves it (and the app servers, which inherit it) to this folder.
+        "env": {"LOCALAPPDATA": DATA_PARENT, "HUB_CONFIG": HUB_CONFIG},
+    }
+    save_claude(cfg, raw)
+    say("  ok    added \"%s\" to %s" % (ENTRY, CLAUDE_CONFIG))
+    say("  note  fully quit Claude Desktop and reopen it. It starts the hub.")
+
+
+def flatpak_installed(app_id):
+    fp = shutil.which("flatpak")
+    if not fp:
+        return False
+    return subprocess.run([fp, "info", app_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          timeout=60).returncode == 0
+
+
+def studio_plugins_dir():
+    users = os.path.join(VINEGAR_PREFIX, "drive_c/users")
+    try:
+        names = sorted(os.listdir(users))
+    except OSError:
+        return None
+    for n in names:
+        if n == "Public" or not re.match(r"^[A-Za-z0-9._-]{1,64}$", n):
+            continue
+        roblox = os.path.join(users, n, "AppData/Local/Roblox")
+        if os.path.isdir(roblox) and not os.path.islink(roblox):
+            return os.path.join(roblox, "Plugins")
+    return None
+
+
+def find_aseprite():
+    # Same places the hub's Aseprite server looks on Linux.
+    for c in (shutil.which("aseprite"), "/usr/bin/aseprite", "/usr/local/bin/aseprite",
+              os.path.join(HOME, ".steam/steam/steamapps/common/Aseprite/aseprite")):
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+def apps(blender_zip, state):
+    say("\n5. Apps (install the plugin in each one)")
+    overrides = []
+    flat_ok = ":" not in BRIDGES and "," not in BRIDGES and not CONTROL.search(BRIDGES)
+
+    say("\n  Blender (Flatpak org.blender.Blender)")
+    if flatpak_installed("org.blender.Blender"):
+        say("    File:    %s" % blender_zip)
+        say("    Install: Edit > Preferences > Get Extensions > arrow at top right > Install from Disk,")
+        say("             pick the file, then tick Creative Hub Bridge under Add-ons.")
+        say("    Token:   Blender needs HUB_BRIDGE_DIR to find the pairing token (permission below).")
+        overrides.append(("org.blender.Blender", "--env=HUB_BRIDGE_DIR=" + BRIDGES, "--unset-env=HUB_BRIDGE_DIR"))
+    else:
+        say("    not installed")
+
+    say("\n  Blockbench (Flatpak net.blockbench.Blockbench)")
+    if flatpak_installed("net.blockbench.Blockbench"):
+        say("    File:    %s" % os.path.join(INSTALL, "creative_hub.js"))
+        say("    Install: File > Plugins > Load Plugin from File. If the file picker cannot open that folder,")
+        say("             copy the file to Downloads first and load it from there.")
+        say("    Token:   File > Preferences > Settings > General > Creative Hub token folder:")
+        say("             %s" % BRIDGES)
+        say("             Blockbench can only read it with the read-only permission below.")
+        overrides.append(("net.blockbench.Blockbench", "--filesystem=%s:ro" % BRIDGES, "--nofilesystem=" + BRIDGES))
+    else:
+        say("    not installed")
+
+    say("\n  Roblox Studio (Vinegar)")
+    say("    File:    %s" % os.path.join(INSTALL, "CreativeHub.lua"))
+    plugins = studio_plugins_dir()
+    if plugins:
+        say("    Install: mkdir -p '%s'" % plugins)
+        say("             cp '%s' '%s/'" % (os.path.join(INSTALL, "CreativeHub.lua"), plugins))
+    else:
+        say("    Install: Studio's Wine prefix was not found. Open Roblox Studio once through Vinegar, then")
+        say("             run forge-hub setup again to see the plugin folder.")
+    say("    Token:   in Studio, Plugins tab > Hub Bridge. Open %s in a text editor," % os.path.join(BRIDGES, "studio.token"))
+    say("             copy everything into the token box and press Save. Allow HTTP to 127.0.0.1 when asked.")
+
+    say("\n  Aseprite")
+    exe = find_aseprite()
+    if exe:
+        say("    Found:   %s" % exe)
+        say("    File:    %s" % os.path.join(INSTALL, "creative-hub-bridge.aseprite-extension"))
+        say("    Install: Edit > Preferences > Extensions > Add Extension.")
+        say("    Token:   start Aseprite with HUB_BRIDGE_DIR='%s' so it finds the token." % BRIDGES)
+    else:
+        say("    not installed (it is paid and not preinstalled). The hub still runs; Aseprite tools show as")
+        say("    not connected. After installing it, run forge-hub setup again for the steps.")
+
+    if not overrides:
+        return
+    if not flat_ok:
+        say("\n  The data folder path has characters Flatpak permissions cannot use, so no permissions were set.")
+        return
+    say("\n6. Flatpak permissions (per user, only the hub's token folder)")
+    for app_id, grant, _undo in overrides:
+        say("    flatpak override --user '%s' %s" % (grant, app_id))
+    try:
+        answer = input("  Apply these Flatpak permission changes now? [y/N] ")
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() not in ("y", "yes"):
+        say("  note  not applied. You can run the commands above yourself later.")
+        return
+    fp = shutil.which("flatpak")
+    done = state.setdefault("overrides", [])
+    for app_id, grant, undo in overrides:
+        if subprocess.run([fp, "override", "--user", grant, app_id], timeout=60).returncode != 0:
+            say("  error could not apply the permission for %s" % app_id)
+            continue
+        rec = {"app": app_id, "grant": grant, "undo": undo}
+        if rec not in done:
+            done.append(rec)
+        say("  ok    %s" % app_id)
+    save_state(state)
+    say("  note  restart Blender and Blockbench so they pick up the change.")
+
+
+def cmd_setup(path, force):
+    clone = check_clone(path)
+    node, npm, version = check_node()
+    say("Node.js %s at %s" % (clean(version, 40), node))
+    build(clone, npm)
+    write_config(clone, node, force)
+    blender_zip = plugin_files(clone)
+    state = load_state() or {}
+    add_claude_entry(clone, node, state)
+    state.update({"version": 1, "clone": clone, "node": node, "data_dir": DATA, "claude_config": CLAUDE_CONFIG})
+    save_state(state)
+    apps(blender_zip, state)
+    say("\nDone. Approvals happen in the hub's dashboard on Linux: run `forge-hub dashboard` and keep it open"
+        "\nwhile Claude works. Without an open dashboard, anything that needs your approval is refused.")
+
+
+# ---------- status ----------
+
+def dashboard_link():
+    """(port, token) from the hub's dashboard.url, or None if the hub never wrote one."""
+    raw = read_own_file(os.path.join(DATA, "dashboard.url"), "dashboard.url", limit=4096)
+    if raw is None:
+        return None
+    m = URL_RE.match(raw.strip())
+    if not m or not 1 <= int(m.group(1)) <= 65535:
+        raise Stop("dashboard.url does not hold a link to this PC (127.0.0.1). Refusing to use it.")
+    return int(m.group(1)), m.group(2)
+
+
+def hub_state(port, token):
+    """GET /api/state from the dashboard (read only). None if the hub is not running."""
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+    try:
+        c.request("GET", "/api/state", headers={"X-Hub-Token": token})
+        r = c.getresponse()
+        if r.status != 200:
+            return None
+        data = json.loads(r.read(MAX_JSON).decode("utf-8"))
+    except (OSError, ValueError, http.client.HTTPException):
+        return None
+    finally:
+        c.close()
+    return data if isinstance(data, dict) else None
+
+
+def git_commit(clone):
+    git = shutil.which("git")
+    if not git or not clone:
+        return None
+    try:
+        out = subprocess.run([git, "-C", clone, "rev-parse", "HEAD"], capture_output=True, text=True,
+                             timeout=30).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out if re.match(r"^[0-9a-f]{40,64}$", out) else None
+
+
+def collect_status():
+    state = load_state()
+    clone = state.get("clone") if state else None
+    s = {"set_up": bool(state), "clone": clone, "hub_built": False, "commit": None,
+         "hub_config": HUB_CONFIG, "hub_config_present": False, "claude_config": CLAUDE_CONFIG,
+         "claude_entry_present": False, "claude_config_problem": None,
+         "flatpak_overrides": [o.get("app") for o in (state or {}).get("overrides", [])],
+         "hub_running": None, "pending_approvals": None, "apps": None}
+    if clone and os.path.isdir(clone):
+        s["hub_built"] = all(os.path.isfile(os.path.join(clone, e)) for e in BUILT)
+        s["commit"] = git_commit(clone)
+    try:
+        s["hub_config_present"] = read_own_file(HUB_CONFIG, "the hub config") is not None
+    except Stop:
+        pass
+    try:
+        cfg, _raw = load_claude()
+        s["claude_entry_present"] = ENTRY in cfg.get("mcpServers", {})
+    except Stop as e:
+        s["claude_config_problem"] = str(e)
+    try:
+        link = dashboard_link()
+    except Stop:
+        link = None
+    if link:
+        st = hub_state(*link)
+        s["hub_running"] = st is not None
+        if st:
+            s["pending_approvals"] = len(st.get("pending") or [])
+            s["apps"] = [{"id": clean(a.get("id"), 64), "label": clean(a.get("label"), 80),
+                          "status": clean(a.get("status"), 32),
+                          "lastError": clean(a["lastError"]) if a.get("lastError") else None}
+                         for a in (st.get("apps") or []) if isinstance(a, dict)]
+    return s
+
+
+def cmd_status(as_json):
+    s = collect_status()
+    if as_json:
+        print(json.dumps(s, indent=2))
+        return
+    yn = lambda v: "yes" if v else "no"
+    say("Set up:               %s" % yn(s["set_up"]))
+    say("Hub clone:            %s" % (s["clone"] or "-"))
+    say("Hub built:            %s" % yn(s["hub_built"]))
+    say("Version (git commit): %s" % (s["commit"] or "unknown"))
+    say("Hub config:           %s (%s)" % (s["hub_config"], "present" if s["hub_config_present"] else "missing"))
+    say("Claude Desktop entry: %s" % yn(s["claude_entry_present"]))
+    if s["claude_config_problem"]:
+        say("  problem: %s" % s["claude_config_problem"])
+    say("Flatpak permissions:  %s" % (", ".join(s["flatpak_overrides"]) or "none"))
+    running = {None: "unknown (it has not started yet)", True: "yes", False: "no"}[s["hub_running"]]
+    say("Hub running:          %s" % running)
+    if s["apps"] is not None:
+        say("Waiting approvals:    %d" % s["pending_approvals"])
+        say("App servers (the hub's side; whether each app's plugin is connected shows in Claude with hub_status):")
+        for a in s["apps"]:
+            say("  %-14s %-12s %s" % (a["id"], a["status"], a["lastError"] or ""))
+
+
+# ---------- dashboard ----------
+
+def cmd_dashboard():
+    link = dashboard_link()
+    if not link:
+        raise Stop("The hub has not started yet. Open Claude Desktop (it starts the hub), then try again.")
+    port, _token = link
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=2).close()
+    except OSError:
+        raise Stop("The hub is not running. Open Claude Desktop (it starts the hub), then try again.")
+    opener = shutil.which("xdg-open")
+    if not opener:
+        raise Stop("xdg-open was not found.")
+    # The link holds the dashboard's private token. It never goes on a command line (any local
+    # user can read /proc/PID/cmdline): the browser gets a private page that redirects to it.
+    url = "http://127.0.0.1:%d/?t=%s" % link
+    page = write_redirect_page(url)
+    try:
+        subprocess.run([opener, page], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=60)
+    finally:
+        delete_later(page, REDIRECT_TTL)
+    say("Opened the hub dashboard in your browser. Keep it open: approvals show there.")
+
+
+REDIRECT_TTL = 60  # seconds: long enough for a browser that still has to start
+
+
+def redirect_dir():
+    """A 0700 folder of ours in $XDG_RUNTIME_DIR (or ~/.cache) for the one-time redirect page."""
+    d = os.path.join(xdg("XDG_RUNTIME_DIR", ".cache"), "forge-hub")
+    os.makedirs(os.path.dirname(d), mode=0o700, exist_ok=True)
+    try:
+        os.mkdir(d, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(d)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise Stop("%s is not a private folder of yours. Refusing to use it." % d)
+    os.chmod(d, 0o700)
+    now = time.time()
+    for name in os.listdir(d):  # leftovers from a run that was killed before its cleanup
+        p = os.path.join(d, name)
+        try:
+            if name.endswith(".html") and now - os.lstat(p).st_mtime > 2 * REDIRECT_TTL:
+                os.unlink(p)
+        except OSError:
+            pass
+    return d
+
+
+def write_redirect_page(url):
+    """Write a 0600 page that sends the browser to url, and return its path."""
+    path = os.path.join(redirect_dir(), "dashboard-%s.html" % secrets.token_hex(8))
+    u = html.escape(url, quote=True)
+    body = ('<!DOCTYPE html><html><head><meta charset="utf-8">'
+            '<meta name="referrer" content="no-referrer">'
+            '<meta http-equiv="refresh" content="0;url=%s"><title>Hub dashboard</title></head>'
+            '<body><script>location.replace(%s);</script>'
+            '<p><a href="%s">Open the hub dashboard</a></p></body></html>\n'
+            % (u, json.dumps(url), u))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as f:
+        os.fchmod(f.fileno(), 0o600)
+        f.write(body)
+    return path
+
+
+def delete_later(path, delay):
+    """Remove path after delay seconds, in a detached helper so this command returns at once."""
+    code = "import os,sys,time\ntime.sleep(float(sys.argv[2]))\ntry: os.unlink(sys.argv[1])\nexcept OSError: pass\n"
+    subprocess.Popen([sys.executable, "-I", "-c", code, path, str(delay)], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+# ---------- remove ----------
+
+def cmd_remove():
+    state = load_state()
+    if not state:
+        say("Nothing to remove: forge-hub setup has not been run (or was already removed).")
+        return
+    cfg, raw = load_claude()  # refuses a symlinked or invalid file before anything changes
+    servers = cfg.get("mcpServers", {})
+    if ENTRY in servers:
+        prev = state.get("claude_previous_entry")
+        if prev is not None:
+            servers[ENTRY] = prev
+        else:
+            del servers[ENTRY]
+        save_claude(cfg, raw)
+        say("  ok    removed \"%s\" from Claude Desktop's config%s" % (ENTRY, " (restored the earlier entry)" if prev else ""))
+    fp = shutil.which("flatpak")
+    left = []
+    for o in state.get("overrides", []):
+        app_id, undo = o.get("app", ""), o.get("undo", "")
+        if not re.match(r"^[A-Za-z0-9_.-]+$", app_id) or not undo.startswith(("--unset-env=", "--nofilesystem=")):
+            continue
+        if fp and subprocess.run([fp, "override", "--user", undo, app_id], timeout=60).returncode == 0:
+            say("  ok    undid the Flatpak permission for %s" % app_id)
+        else:
+            say("  error could not undo the Flatpak permission for %s. Run: flatpak override --user '%s' %s"
+                % (app_id, undo, app_id))
+            left.append(o)
+    if left:
+        state["overrides"] = left
+        save_state(state)
+        raise Stop("Some Flatpak permissions are still set (see above).")
+    os.unlink(STATE)
+    say("  note  the hub clone and the hub's data folder (%s) were not touched." % DATA)
+    say("  note  fully quit Claude Desktop and reopen it.")
+
+
+def main(argv):
+    try:
+        if len(argv) >= 2 and argv[0] == "setup" and set(argv[2:]) <= {"--force"}:
+            cmd_setup(argv[1], "--force" in argv[2:])
+        elif argv[:1] == ["status"] and set(argv[1:]) <= {"--json"}:
+            cmd_status("--json" in argv[1:])
+        elif argv == ["dashboard"]:
+            cmd_dashboard()
+        elif argv == ["remove"]:
+            cmd_remove()
+        else:
+            print(__doc__.strip(), file=sys.stderr)
+            return 2
+    except Stop as e:
+        print("\nStopped: %s" % e, file=sys.stderr)
+        return 1
+    except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as e:
+        print("\nStopped: %s" % clean(e, 400), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "files/system/usr/lib/forge"))
@@ -24,6 +25,7 @@ class FakeProviders:
     def __init__(self):
         self.requests = []
         self.fail = None  # "connect" or an HTTP status code
+        self.show = {}    # model -> Ollama /api/show reply (a dict) or an HTTP status code
 
     def __call__(self, request: httpx.Request):
         self.requests.append(request)
@@ -32,6 +34,15 @@ class FakeProviders:
         if isinstance(self.fail, int):
             return httpx.Response(self.fail, json={"error": {"message": "boom"}})
         path = request.url.path
+        if path == "/api/show":
+            model = json.loads(request.content or b"{}").get("model")
+            reply = self.show.get(model, {"details": {"format": "gguf", "family": "qwen3"},
+                                          "modelfile": "FROM /var/lib/ollama/blobs/sha256-abc\n"})
+            if isinstance(reply, int):
+                return httpx.Response(reply, json={"error": f"model '{model}' not found"})
+            if isinstance(reply, bytes):
+                return httpx.Response(200, content=reply)
+            return httpx.Response(200, json=reply)
         if request.method == "GET" and path.endswith("/models"):
             return httpx.Response(200, json={"object": "list", "data": [{"id": "qwen3:8b", "object": "model"}]})
         body = json.loads(request.content or b"{}")
@@ -366,6 +377,84 @@ class SecurityFixTests(Base):
         self.assertEqual(self.gw.prune(keep_days=90), 1)
         self.assertEqual([r["model"] for r in self.gw.usage(since_s=365 * 86400)], ["new"])
         self.assertEqual(self.gw.prune(), 0)
+
+
+class R13CloudAliasTests(Base):
+    ALIAS = {"remote_model": "gpt-oss:120b-cloud", "remote_host": "https://ollama.com:443",
+             "details": {"format": "", "family": ""}}
+
+    def chats_sent(self):
+        return [r for r in self.fake.requests if r.url.path.endswith(("/chat/completions", "/embeddings"))]
+
+    def test_r13_local_alias_of_cloud_model_is_not_local(self):
+        self.fake.show["mine"] = self.ALIAS                                   # ollama cp x:120b-cloud mine
+        self.fake.show["fmt"] = {"details": {"format": "remote"}}
+        self.fake.show["from"] = {"details": {"format": "gguf"}, "modelfile": "# x\nFROM glm-4.6:cloud\n"}
+        self.fake.show["parent"] = {"details": {"format": "gguf", "parent_model": "kimi-k2:1t-cloud"}}
+        self.fake.show["host"] = {"details": {"format": "gguf"}, "remote_host": "https://x.example"}
+        for name in ["mine", "fmt", "from", "parent", "host"]:
+            self.assertFalse(self.gw.is_local(name), name)
+        self.assertTrue(self.gw.is_local("qwen3:8b"))
+        req = [r for r in self.fake.requests if r.url.path == "/api/show"][-1]
+        self.assertEqual(str(req.url), "http://127.0.0.1:11434/api/show")
+        self.assertEqual(json.loads(req.content), {"model": "qwen3:8b"})
+
+    def test_r13_show_failure_fails_closed(self):
+        self.fake.show["ghost"] = 404
+        self.fake.show["junk"] = b"not json"
+        self.assertFalse(self.gw.is_local("ghost"))
+        self.assertFalse(self.gw.is_local("junk"))
+        self.fake.fail = "connect"
+        self.assertFalse(self.gw.is_local("qwen3:8b"))
+        self.fake.fail = 500
+        self.assertFalse(self.gw.is_local("qwen3:8b"))
+
+    def test_r13_show_result_cached_300s(self):
+        shows = lambda: len([r for r in self.fake.requests if r.url.path == "/api/show"])
+        now = time.monotonic()
+        with mock.patch("forgecore.gateway.time.monotonic", return_value=now):
+            self.assertTrue(self.gw.is_local("qwen3:8b"))
+            self.assertTrue(self.gw.is_local("qwen3:8b"))
+        self.assertEqual(shows(), 1)
+        self.fake.show["qwen3:8b"] = self.ALIAS   # replaced by a cloud alias meanwhile
+        with mock.patch("forgecore.gateway.time.monotonic", return_value=now + 299):
+            self.assertTrue(self.gw.is_local("qwen3:8b"))
+        with mock.patch("forgecore.gateway.time.monotonic", return_value=now + 301):
+            self.assertFalse(self.gw.is_local("qwen3:8b"))
+        self.assertEqual(shows(), 2)
+
+    def test_r13_v1_gate_blocks_alias_for_local_keys(self):
+        self.fake.show["mine"] = self.ALIAS
+        app = FastAPI()
+        app.include_router(G.make_v1_router(self.gw))
+        c = TestClient(app)
+        local = {"Authorization": "Bearer " + self.gw.create_key("a")["key"]}
+        cloud = {"Authorization": "Bearer " + self.gw.create_key("b", allow_cloud=True)["key"]}
+        body = {"model": "mine", "messages": []}
+        r = c.post("/v1/chat/completions", json=body, headers=local)
+        self.assertEqual(r.status_code, 403)
+        self.assertIn("cloud", r.json()["error"]["message"])
+        self.assertEqual(c.post("/v1/chat/completions", json=dict(body, stream=True), headers=local).status_code, 403)
+        self.assertEqual(c.post("/v1/embeddings", json=body, headers=local).status_code, 403)
+        self.assertEqual(self.chats_sent(), [])
+        self.assertEqual(c.post("/v1/chat/completions", json=body, headers=cloud).status_code, 200)
+        self.assertEqual(c.post("/v1/chat/completions", json={"model": "qwen3:8b", "messages": []},
+                                headers=local).status_code, 200)
+
+    def test_r13_v1_gate_clear_error_when_check_fails(self):
+        self.fake.show["ghost"] = 404
+        app = FastAPI()
+        app.include_router(G.make_v1_router(self.gw))
+        c = TestClient(app)
+        local = {"Authorization": "Bearer " + self.gw.create_key("a")["key"]}
+        r = c.post("/v1/chat/completions", json={"model": "ghost", "messages": []}, headers=local)
+        self.assertEqual(r.status_code, 404)
+        self.assertIn("ghost", r.json()["error"]["message"])
+        self.fake.fail = "connect"
+        r = c.post("/v1/chat/completions", json={"model": "qwen3:8b", "messages": []}, headers=local)
+        self.assertEqual(r.status_code, 502)
+        self.assertIn("Could not reach ollama", r.json()["error"]["message"])
+        self.assertEqual(self.chats_sent(), [])
 
 
 class UsageTests(Base):

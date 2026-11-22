@@ -1,0 +1,10 @@
+[Unit]
+Description=Forge OS: write your MangoHud overlay file from Forge Settings (Gaming)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/forge-game overlay apply
+Nice=10
+
+[Install]
+WantedBy=default.target

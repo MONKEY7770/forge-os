@@ -7,23 +7,32 @@ modules:
       - source: system
         destination: /
 
-  # 2. System packages (part of the image, updated with it).
+  # 2a. Check the extra repos' signing keys against pinned fingerprints before anything is
+  #     installed from them. Their repo files are in files/system/etc/yum.repos.d (step 1):
+  #     Claude Desktop (Anthropic's official Linux app, repackaged as .rpm by the
+  #     claude-desktop-debian project, since Anthropic only ships a .deb) and Tailscale.
+  - type: script
+    scripts:
+      - pin-repo-keys.sh
+
+  # 2b. System packages (part of the image, updated with it).
   - type: dnf
-    repos:
-      files:
-        # Claude Desktop: official Anthropic app, repackaged as .rpm by the
-        # claude-desktop-debian project (Anthropic only ships a .deb).
-        - https://pkg.claude-desktop-debian.dev/rpm/claude-desktop-unofficial.repo
-        - https://pkgs.tailscale.com/stable/fedora/tailscale.repo
     install:
       packages:
         - claude-desktop-unofficial
         - tailscale
         - smartmontools   # disk health warnings
         - lm_sensors      # CPU and board temperatures
+        - restic          # encrypted home folder backups to a USB or second drive (forge-backup)
         - python3-fastapi # Forge Core API
         - python3-uvicorn
         - python3-httpx   # AI gateway
+        # Node.js for the Creative MCP hub (forge-hub). It needs Node 22 or newer; Fedora 45 has
+        # nodejs24 (24.18). The -bin packages add the plain `node` and `npm` commands it uses.
+        - nodejs24
+        - nodejs24-bin
+        - nodejs24-npm
+        - nodejs24-npm-bin
         # Essentials. Bazzite normally has these already; listing them makes sure.
         - NetworkManager-wifi       # Wi-Fi
         - NetworkManager-bluetooth  # internet through a phone over Bluetooth
@@ -36,17 +45,31 @@ modules:
         - fwupd                     # firmware updates for BIOS, SSDs, docks
         - fprintd                   # fingerprint readers on laptops
         - iio-sensor-proxy          # screen rotation and light sensors on laptops
+        - dbus-tools                # dbus-send, used by the Dock appearance backend to talk to Plasma and Krema
         # Virtual machine guest tools. Each one only starts inside its own kind of VM.
         - qemu-guest-agent        # QEMU / KVM / Proxmox / GNOME Boxes
         - spice-vdagent           # shared clipboard and screen resize in QEMU
         - open-vm-tools-desktop   # VMware
         - hyperv-daemons          # Hyper-V
         - virtualbox-guest-additions  # VirtualBox
+        # Video backgrounds (Forge Settings, Appearance, Background): the video wallpaper plugin plays
+        # through Qt Multimedia. Bazzite's Plasma most likely has it already; listing it makes sure.
+        - qt6-qtmultimedia
+        # Thai text in Forge Settings, the Forge Dashboard and the desktop. Not sure Bazzite ships a Thai font;
+        # listing it makes sure (a no-op when it is already there).
+        - google-noto-sans-thai-vf-fonts
 
   # 3. Ollama (local models; uses the GPU when it can, CPU otherwise), plus making the Forge tools executable.
+  #    install-krema.sh: the optional Krema dock (Animated dock style). It only installs when its version and
+  #    key pins are filled in, and it never fails the build (it prints why Krema was left out).
   - type: script
     scripts:
       - install-ollama.sh
+      - install-krema.sh
+      # Video backgrounds: Smart Video Wallpaper Reborn, pinned by version and sha256.
+      - install-video-wallpaper.sh
+      # Wallpaper Engine backgrounds: optional, skipped until a version and key are pinned in the script.
+      - install-wallpaper-engine.sh
       - finalize.sh
 
   # 4. Services that start on boot.
@@ -59,9 +82,15 @@ modules:
         - forge-apply-firstboot.service
         - forge-core.service
         - forge-hwcheck.service
+        - forge-mode-switch.socket   # gaming mode's root step (forge-game), no password
     user:
       enabled:
         - forge-health.timer
+        - forge-backup.timer
+        - forge-backup-restore-test.timer   # monthly restore test of the backup
+        - forge-game.service           # gaming mode while a game runs (forge-game)
+        - forge-game-overlay.path      # MangoHud overlay file follows Forge Settings
+        - forge-game-overlay.service
 
   # 5. Desktop apps (Flatpaks, installed on first boot, updated separately).
   - type: default-flatpaks
@@ -89,6 +118,7 @@ modules:
           - net.blockbench.Blockbench
           - org.kde.krita                    # textures, UI art, thumbnails
           - org.audacityteam.Audacity        # sound effects
+          - com.orama_interactive.Pixelorama # free pixel art (Aseprite is paid, get it on Steam)
           # Minecraft Bedrock (for the realm); needs the game bought on Google Play
           - io.mrarm.mcpelauncher
           # Remote access
@@ -96,5 +126,6 @@ modules:
           - com.rustdesk.RustDesk
           # System tools
           - io.missioncenter.MissionCenter   # see CPU, GPU, VRAM per app
+          - com.dec05eba.gpu_screen_recorder # low-overhead clips with NVENC; note: this Flatpak has full access to your files and devices
 
   - type: signing

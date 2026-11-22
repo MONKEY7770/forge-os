@@ -1,0 +1,16 @@
+[Unit]
+Description=Forge OS: open the drive shared with Windows
+Documentation=man:udisksctl(1)
+# Needs the desktop for notifications and for udisks to see an active login.
+After=graphical-session.target
+PartOf=graphical-session.target
+# Plugging a drive in can start this a few times in a row: never give up on it.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/forge-shared-drive
+Nice=10
+
+[Install]
+WantedBy=graphical-session.target

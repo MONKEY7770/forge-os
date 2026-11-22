@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "sections": [
+    {"id": "background", "label": "Background", "help": "The picture, video or color behind your windows.",
+     "fields": [
+      {"key": "type", "type": "select", "label": "Background type", "help": "What fills the desktop.",
+       "default": "color", "options": [{"value": "color", "label": "Solid color"},
+                                       {"value": "image", "label": "Picture"},
+                                       {"value": "video", "label": "Video"}]},
+      {"key": "color", "type": "color", "label": "Color", "help": "Used when the type is a solid color.",
+       "default": "#2b3a4a", "show_if": {"key": "type", "equals": "color"}},
+      {"key": "image", "type": "media", "accept": "image", "label": "Picture", "help": "A picture from your media library.",
+       "default": "", "show_if": {"key": "type", "equals": "image"}},
+      {"key": "video", "type": "media", "accept": "video", "label": "Video", "help": "A video from your media library.",
+       "default": "", "show_if": {"key": "type", "equals": "video"}},
+      {"key": "video_sound", "type": "toggle", "label": "Play sound", "help": "Off keeps the desktop quiet.",
+       "default": false, "show_if": {"key": "type", "equals": "video"}},
+      {"key": "dim", "type": "slider", "label": "Dim", "help": "Darkens the background so icons stay readable.",
+       "default": 0, "min": 0, "max": 80, "step": 5, "unit": "%", "show_if": {"key": "type", "in": ["image", "video"]}},
+      {"key": "fps_cap", "type": "number", "label": "Video frame limit", "help": "Lower uses less power.",
+       "default": 30, "min": 5, "max": 144, "step": 1, "unit": "fps", "advanced": true,
+       "show_if": {"key": "type", "equals": "video"}},
+      {"key": "caption", "type": "text", "label": "Caption", "help": "Optional text in a corner.",
+       "default": "", "max_length": 40, "advanced": true}
+     ]},
+    {"id": "dock", "label": "Dock", "help": "The bar with your favorite apps.",
+     "fields": [
+      {"key": "position", "type": "select", "label": "Position", "help": "Edge of the screen.",
+       "default": "bottom", "options": [{"value": "bottom", "label": "Bottom"}, {"value": "left", "label": "Left"},
+                                        {"value": "right", "label": "Right"}]},
+      {"key": "size", "type": "slider", "label": "Icon size", "help": "", "default": 48, "min": 24, "max": 96,
+       "step": 4, "unit": "px"},
+      {"key": "autohide", "type": "toggle", "label": "Hide when a window touches it", "help": "", "default": false}
+     ]},
+    {"id": "boot", "label": "Bootup", "help": "What you see while the PC starts.", "fields": []}
+  ]
+}

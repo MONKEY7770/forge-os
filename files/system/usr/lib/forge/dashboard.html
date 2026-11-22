@@ -1,0 +1,1060 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title data-i18n="dash.title">Forge Dashboard</title>
+<style nonce="__NONCE__">
+:root {
+  --bg: #f6f6f4; --panel: #ffffff; --text: #1c1c1e; --muted: #6b6b70; --line: #e4e4e0;
+  --accent: #d9622b; --accent-soft: #fbe9e0; --ok: #2f8f5b; --bad: #c0392b; --warn: #a96b0c;
+  --warn-soft: #f8edd8; --bad-soft: #f8e1de; --ok-soft: #e1f1e8; --rail: #efefec;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #141416; --panel: #1d1d20; --text: #ececee; --muted: #9a9aa2; --line: #2c2c31;
+          --accent: #ff7a3d; --accent-soft: #3a2418; --ok: #4cbf82; --bad: #ff6b5b; --warn: #e3a53c;
+          --warn-soft: #362a14; --bad-soft: #3b1d1a; --ok-soft: #16301f; --rail: #18181b; }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--text);
+       font: 14px/1.45 system-ui, "Noto Sans", "Noto Sans Thai", sans-serif; }
+button { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.shell { display: grid; grid-template-columns: 228px 1fr; min-height: 100%; }
+.shell > * { min-width: 0; }
+.row > .btn, .row > .pill { justify-self: end; }
+.rail { background: var(--rail); border-right: 1px solid var(--line); padding: 22px 14px 18px;
+        display: flex; flex-direction: column; gap: 18px; position: sticky; top: 0; height: 100vh; }
+.brand h1 { font-size: 18px; margin: 0; letter-spacing: .2px; white-space: nowrap; }
+.brand h1 span { color: var(--accent); }
+.brand .host { color: var(--muted); font-size: 12.5px; margin-top: 2px; overflow-wrap: anywhere; }
+.rail nav { display: flex; flex-direction: column; gap: 1px; }
+.rail nav a { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 8px;
+              color: var(--muted); text-decoration: none; }
+.rail nav a:hover { color: var(--text); background: var(--panel); }
+.rail nav a[aria-current="page"] { background: var(--panel); color: var(--text); font-weight: 600;
+                                   box-shadow: inset 3px 0 0 var(--accent); }
+.rail nav a .n { flex: 1; }
+.flag { width: 8px; height: 8px; border-radius: 50%; background: transparent; flex: none; }
+.flag.accent { background: var(--accent); } .flag.warn { background: var(--warn); } .flag.bad { background: var(--bad); }
+.rail .foot { margin-top: auto; display: flex; flex-direction: column; gap: 8px; }
+.live { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; padding: 0 10px; }
+.live i { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); }
+.live.paused i { background: var(--muted); }
+.live.down i { background: var(--bad); }
+@media (prefers-reduced-motion: no-preference) {
+  .live:not(.paused):not(.down) i { animation: beat 2s ease-in-out infinite; }
+  @keyframes beat { 50% { opacity: .35; } }
+}
+
+main { padding: 30px 36px 80px; max-width: 1180px; width: 100%; }
+.page { display: none; }
+.page.on { display: block; }
+.ph { margin: 0 0 20px; }
+.ph h2 { font-size: 22px; margin: 0; font-weight: 650; letter-spacing: -.1px; }
+.ph p { margin: 4px 0 0; color: var(--muted); max-width: 70ch; }
+
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; margin-bottom: 18px; }
+.panel > h3 { font-size: 14px; margin: 0; padding: 14px 18px 10px; font-weight: 650; }
+.panel > .sub { color: var(--muted); font-size: 13px; padding: 0 18px 10px; margin-top: -6px; }
+.row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: center;
+       padding: 11px 18px; border-top: 1px solid var(--line); }
+.row .t { font-weight: 600; overflow-wrap: anywhere; }
+.row .d { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.row .v { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+.row .acts { display: flex; gap: 8px; justify-content: flex-end; align-items: center; flex-wrap: wrap; }
+.empty { color: var(--muted); padding: 14px 18px 16px; border-top: 1px solid var(--line); }
+.error { color: var(--bad); padding: 10px 18px; border-top: 1px solid var(--line); font-size: 13px; }
+.cols { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+
+.btn { padding: 7px 13px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg);
+       cursor: pointer; white-space: nowrap; }
+.btn:hover { border-color: var(--muted); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+.btn.quiet { background: transparent; border-color: transparent; color: var(--muted); padding-left: 10px; text-align: left; }
+.btn.quiet:hover { color: var(--text); background: var(--panel); }
+.btn.danger { color: var(--bad); }
+.btn:disabled { opacity: .45; cursor: default; }
+
+.pill { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 999px; background: var(--bg);
+        color: var(--muted); border: 1px solid var(--line); white-space: nowrap; }
+.pill.ok { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
+.pill.warn { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+.pill.bad { background: var(--bad-soft); color: var(--bad); border-color: transparent; }
+.pill.accent { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+code, .mono { font: 12.5px/1.4 ui-monospace, "DejaVu Sans Mono", monospace; }
+.cmd { display: flex; gap: 8px; align-items: center; margin: 6px 0; }
+.cmd code { flex: 1; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px;
+            overflow-wrap: anywhere; }
+.result { margin: 0 18px 14px; padding: 9px 12px; border-radius: 8px; background: var(--bg); white-space: pre-wrap;
+          font-size: 13px; border-left: 3px solid var(--muted); }
+.result.ok { border-left-color: var(--ok); } .result.bad { border-left-color: var(--bad); }
+.result:empty { display: none; }
+
+/* Home: the headline and the live strip */
+.hello { margin: 4px 0 22px; }
+.hello .host { color: var(--muted); font-size: 13px; }
+.hello h2 { font-size: 30px; line-height: 1.15; margin: 4px 0 6px; font-weight: 650; letter-spacing: -.4px; }
+.hello .facts { display: flex; flex-wrap: wrap; gap: 6px 18px; color: var(--muted); }
+.hello .facts b { color: var(--text); font-weight: 600; }
+.strip { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); background: var(--panel);
+         border: 1px solid var(--line); border-radius: 14px; overflow: hidden; margin-bottom: 18px; }
+.gauge { position: relative; padding: 14px 16px 0; border-left: 1px solid var(--line); min-height: 148px;
+         display: flex; flex-direction: column; }
+.gauge:first-child { border-left: 0; }
+.gauge .k { color: var(--muted); font-size: 13px; }
+.gauge .big { font-size: 34px; font-weight: 640; letter-spacing: -.8px; line-height: 1.1; margin-top: 4px;
+              font-variant-numeric: tabular-nums; }
+.gauge .big small { font-size: 15px; font-weight: 400; color: var(--muted); letter-spacing: 0; margin-left: 2px; }
+.gauge .s { color: var(--muted); font-size: 12.5px; min-height: 18px; font-variant-numeric: tabular-nums; }
+.gauge svg { display: block; width: calc(100% + 32px); margin: auto -16px 0; height: 60px; }
+.spark-area { fill: var(--accent); opacity: .13; }
+.spark-line { fill: none; stroke: var(--accent); stroke-width: 1.6; vector-effect: non-scaling-stroke; }
+.gauge.warm .spark-area { fill: var(--warn); } .gauge.warm .spark-line { stroke: var(--warn); }
+.gauge.hot .spark-area { fill: var(--bad); } .gauge.hot .spark-line { stroke: var(--bad); }
+.gauge.hot .big { color: var(--bad); }
+.gauge.na .big { color: var(--muted); }
+
+/* Activity */
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 14px; }
+.chip { border: 1px solid var(--line); background: var(--panel); color: var(--muted); border-radius: 999px;
+        padding: 3px 11px; font-size: 12.5px; cursor: pointer; }
+.chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+.day { font-size: 13px; font-weight: 650; color: var(--muted); padding: 12px 18px 6px; border-top: 1px solid var(--line); }
+.day:first-of-type { border-top: 0; }
+.ev { display: grid; grid-template-columns: 80px 14px minmax(0, 1fr); gap: 10px; padding: 7px 18px; align-items: baseline; }
+.ev .when { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.ev .mark { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); align-self: center; }
+.ev .mark.mode { background: var(--accent); } .ev .mark.health { background: var(--bad); }
+.ev .mark.update { background: #3b7dd8; } .ev .mark.backup { background: var(--ok); }
+.ev .mark.agent { background: #8a5cd0; } .ev .mark.hardware, .ev .mark.settings { background: var(--warn); }
+.ev .d { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+
+/* Updates: release history */
+.rel { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 12px; padding: 12px 18px;
+       border-top: 1px solid var(--line); align-items: start; }
+.rel .node { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--muted); margin-top: 4px; background: var(--panel); }
+.rel.booted .node { border-color: var(--accent); background: var(--accent); }
+.rel.staged .node { border-color: var(--accent); }
+.rel .t { font-weight: 600; font-variant-numeric: tabular-nums; }
+.rel .d { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+ol.steps { margin: 0; padding: 4px 18px 14px 38px; }
+ol.steps li { margin: 6px 0; }
+
+/* Storage */
+.use { height: 6px; border-radius: 6px; background: var(--bg); border: 1px solid var(--line); overflow: hidden; margin-top: 6px; max-width: 360px; }
+.use i { display: block; height: 100%; background: var(--accent); width: 0; }
+.use.full i { background: var(--bad); }
+.row.part { padding-left: 38px; border-top-style: dashed; }
+.facts-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 0; border-top: 1px solid var(--line); }
+.fact { padding: 12px 18px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); margin-right: -1px; margin-bottom: -1px; }
+.fact .k { color: var(--muted); font-size: 12.5px; }
+.fact .v { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.lead-num { padding: 4px 18px 14px; }
+.lead-num .v { font-size: 26px; font-weight: 650; letter-spacing: -.3px; }
+.lead-num .d { color: var(--muted); }
+
+/* Diagnostics */
+.sec-items { margin: 2px 0 0; padding-left: 18px; color: var(--muted); font-size: 13px; }
+
+/* Virtual machines: a long name is cut, the full name is in its tooltip */
+.row.vm > * { min-width: 0; }
+.row.vm .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; overflow-wrap: normal; }
+
+dialog { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); color: var(--text);
+         padding: 0; width: min(520px, calc(100vw - 32px)); }
+dialog::backdrop { background: rgba(0, 0, 0, .35); }
+dialog .in { padding: 20px 22px 18px; }
+dialog h3 { margin: 0 0 8px; font-size: 17px; }
+dialog p { margin: 6px 0; }
+dialog .list { display: none; margin: 8px 0; padding: 8px 10px; max-height: 40vh; overflow: auto; white-space: pre-wrap;
+               overflow-wrap: anywhere; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; }
+dialog .list.on { display: block; }
+dialog .typed { display: none; margin-top: 10px; }
+dialog .typed.on { display: block; }
+dialog input { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg);
+               color: var(--text); font: inherit; margin-top: 4px; }
+dialog .bar { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.muted { color: var(--muted); }
+.small { font-size: 13px; }
+
+:lang(th) body { line-height: 1.6; }
+/* Logs */
+.filters { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: end; padding: 14px 18px; }
+.filters label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); font-size: 12.5px; }
+.filters select, .filters input { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line);
+                                  border-radius: 8px; padding: 6px 9px; min-width: 150px; }
+.filters input { min-width: 220px; }
+.logl { display: grid; grid-template-columns: 132px 76px minmax(0, 170px) minmax(0, 1fr); gap: 10px; padding: 6px 18px;
+        border-top: 1px solid var(--line); align-items: baseline; font-size: 13px; }
+.logl .when { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12.5px; }
+.logl .u { color: var(--muted); overflow-wrap: anywhere; }
+.logl .m { white-space: pre-wrap; overflow-wrap: anywhere; }
+.loginfo { color: var(--muted); font-size: 13px; padding: 8px 18px; border-top: 1px solid var(--line); }
+
+@media (max-width: 1080px) { .strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .gauge:nth-child(4) { border-left: 0; } .gauge:nth-child(n+4) { border-top: 1px solid var(--line); }
+  .cols { grid-template-columns: 1fr; } }
+@media (max-width: 760px) {
+  .shell { grid-template-columns: 1fr; }
+  .rail { position: static; height: auto; flex-direction: column; gap: 10px; padding: 14px; }
+  .rail nav { flex-direction: row; overflow-x: auto; }
+  .rail nav a { white-space: nowrap; }
+  .rail .foot { flex-direction: row; margin: 0; }
+  main { padding: 20px 16px 60px; }
+  .strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .gauge:nth-child(n) { border-left: 1px solid var(--line); border-top: 1px solid var(--line); }
+  .gauge:nth-child(odd) { border-left: 0; } .gauge:nth-child(-n+2) { border-top: 0; }
+  .row { grid-template-columns: 1fr; } .row .acts, .row .v { justify-content: flex-start; text-align: left; }
+  .logl { grid-template-columns: 1fr; gap: 2px; }
+  .row > .btn, .row > .pill { justify-self: start; }
+}
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside class="rail">
+    <div class="brand"><h1>Forge <span data-i18n="dash.brand">Dashboard</span></h1><div class="host" id="host" data-i18n="dash.this_pc">This PC</div></div>
+    <nav id="nav" aria-label="Sections" data-i18n-aria-label="dash.nav.aria">
+      <a href="#home" data-page="home"><span class="n" data-i18n="dash.nav.home">Home</span><i class="flag" id="f-home"></i></a>
+      <a href="#agents" data-page="agents"><span class="n" data-i18n="dash.nav.agents">Agents and approvals</span><i class="flag" id="f-agents"></i></a>
+      <a href="#activity" data-page="activity"><span class="n" data-i18n="dash.nav.activity">Activity</span><i class="flag"></i></a>
+      <a href="#updates" data-page="updates"><span class="n" data-i18n="dash.nav.updates">Updates and recovery</span><i class="flag" id="f-updates"></i></a>
+      <a href="#backups" data-page="backups"><span class="n" data-i18n="dash.nav.backups">Backups</span><i class="flag" id="f-backups"></i></a>
+      <a href="#storage" data-page="storage"><span class="n" data-i18n="dash.nav.storage">Storage</span><i class="flag"></i></a>
+      <a href="#sync" data-page="sync"><span class="n" data-i18n="dash.nav.sync">Sync</span><i class="flag"></i></a>
+      <a href="#vms" data-page="vms"><span class="n" data-i18n="dash.nav.vms">Virtual machines</span><i class="flag"></i></a>
+      <a href="#hub" data-page="hub"><span class="n" data-i18n="dash.nav.hub">Creative hub</span><i class="flag"></i></a>
+      <a href="#diagnostics" data-page="diagnostics"><span class="n" data-i18n="dash.nav.diagnostics">Diagnostics</span><i class="flag" id="f-diagnostics"></i></a>
+      <a href="#logs" data-page="logs"><span class="n" data-i18n="dash.nav.logs">Logs</span><i class="flag"></i></a>
+    </nav>
+    <div class="foot">
+      <div class="live" id="live"><i></i><span data-i18n="dash.live">Live</span></div>
+      <button class="btn quiet" id="open-settings" data-i18n="dash.open_settings">Open Forge Settings</button>
+    </div>
+  </aside>
+
+  <main>
+    <section class="page" id="p-home" aria-labelledby="hello">
+      <div class="hello">
+        <div class="host" id="home-when"></div>
+        <h2 id="hello" data-i18n="dash.home.checking">Checking this PC...</h2>
+        <div class="facts" id="home-facts"></div>
+      </div>
+      <div class="strip" id="strip"></div>
+      <div class="cols">
+        <div class="panel"><h3 data-i18n="dash.home.needs">Needs a look</h3><div id="home-needs"></div></div>
+        <div class="panel"><h3 data-i18n="dash.home.recent">Recently</h3><div id="home-recent"></div></div>
+      </div>
+    </section>
+
+    <section class="page" id="p-agents">
+      <div class="ph"><h2 data-i18n="dash.nav.agents">Agents and approvals</h2>
+        <p data-i18n="dash.agents.help">Your AI agents, their latest runs, and the requests waiting for your OK.</p></div>
+      <div class="panel"><h3 data-i18n="dash.agents.waiting">Waiting approvals</h3>
+        <div class="sub" data-i18n="dash.agents.waiting.help">Seeing what an agent asks for, and answering it, needs your password.</div>
+        <div id="approvals"></div><div class="result" id="approvals-out"></div></div>
+      <div class="cols">
+        <div class="panel"><h3 data-i18n="dash.agents.runs">Recent runs</h3><div id="runs"></div></div>
+        <div class="panel"><h3 data-i18n="dash.agents.agents">Agents</h3><div id="agents"></div></div>
+      </div>
+    </section>
+
+    <section class="page" id="p-activity">
+      <div class="ph"><h2 data-i18n="dash.nav.activity">Activity</h2>
+        <p data-i18n="dash.activity.help">What happened on this PC, newest first. Setting values and secrets are never shown here.</p></div>
+      <div class="chips" id="kinds" role="group" aria-label="Show only" data-i18n-aria-label="dash.activity.only"></div>
+      <div class="panel" id="timeline"></div>
+    </section>
+
+    <section class="page" id="p-updates">
+      <div class="ph"><h2 data-i18n="dash.nav.updates">Updates and recovery</h2>
+        <p data-i18n="dash.updates.help">The system versions this PC keeps. Your files and settings are not part of them.</p></div>
+      <div class="panel"><h3 id="upd-msg" data-i18n="dash.updates.history">Release history</h3><div id="releases"></div></div>
+      <div class="panel"><h3 data-i18n="dash.updates.breaks">If an update breaks something</h3>
+        <ol class="steps">
+          <li data-i18n="dash.updates.step1">Restart the PC and pick the previous Forge OS entry in the boot menu. Nothing is changed for good.</li>
+          <li><span data-i18n="dash.updates.step2">To keep using that older version, run this and restart:</span>
+            <div class="cmd"><code>rpm-ostree rollback</code><button class="btn" data-copy="rpm-ostree rollback" data-i18n="dash.copy">Copy</button></div></li>
+          <li><span data-i18n="dash.updates.step3">To cancel an update that is ready but not started yet:</span>
+            <div class="cmd"><code>rpm-ostree cleanup -p</code><button class="btn" data-copy="rpm-ostree cleanup -p" data-i18n="dash.copy">Copy</button></div></li>
+        </ol>
+        <div id="rollback-box"></div>
+        <div class="result" id="rollback-out"></div>
+      </div>
+    </section>
+
+    <section class="page" id="p-backups">
+      <div class="ph"><h2 data-i18n="dash.nav.backups">Backups</h2>
+        <p data-i18n="dash.backups.help">Encrypted copies of your home folder on your backup drive. No account and no cloud.</p></div>
+      <div class="panel" id="backup"></div>
+    </section>
+
+    <section class="page" id="p-storage">
+      <div class="ph"><h2 data-i18n="dash.nav.storage">Storage</h2><p data-i18n="dash.storage.help">Your disks and the drive you share with Windows.</p></div>
+      <div class="panel"><h3 data-i18n="dash.storage.shared">Shared drive with Windows</h3><div id="shared"></div><div class="result" id="shared-out"></div></div>
+      <div class="panel"><h3 data-i18n="dash.storage.disks">Disks</h3><div id="disks"></div></div>
+    </section>
+
+    <section class="page" id="p-sync">
+      <div class="ph"><h2 data-i18n="dash.nav.sync">Sync</h2><p data-i18n="dash.sync.help">Use the same Forge settings on your other PCs, through a folder they can all reach.</p></div>
+      <div class="panel" id="sync"></div>
+    </section>
+
+    <section class="page" id="p-vms">
+      <div class="ph"><h2 data-i18n="dash.nav.vms">Virtual machines</h2><p data-i18n="dash.vms.help">Machines in Virtual Machine Manager. This page only shows them.</p></div>
+      <div class="panel" id="vms"></div>
+    </section>
+
+    <section class="page" id="p-hub">
+      <div class="ph"><h2 data-i18n="dash.nav.hub">Creative hub</h2><p data-i18n="dash.hub.help">One Claude Desktop connection to Blender, Roblox Studio, Aseprite and Blockbench.</p></div>
+      <div class="panel" id="hub"></div>
+    </section>
+
+    <section class="page" id="p-diagnostics">
+      <div class="ph"><h2 data-i18n="dash.nav.diagnostics">Diagnostics</h2><p data-i18n="dash.diag.help">How well this PC fits Forge OS. Checking changes nothing.</p></div>
+      <div class="panel"><h3 data-i18n="dash.diag.fixes">Fixes</h3>
+        <div class="sub" data-i18n="dash.diag.fixes.help">Each fix runs on its own, after you confirm it, and asks for your password.</div>
+        <div id="fixes"></div><div class="result" id="fix-out"></div></div>
+      <div class="panel"><h3 id="doc-head" data-i18n="dash.diag.report">Report</h3><div id="report"></div>
+        <div class="row"><div class="d" data-i18n="dash.diag.download.help">Save the full report as a text file, to keep or to share when asking for help. It holds no passwords or keys.</div>
+          <div class="acts"><button class="btn" id="download" data-i18n="dash.diag.download">Download report</button></div></div></div>
+    </section>
+
+    <section class="page" id="p-logs">
+      <div class="ph"><h2 data-i18n="dash.logs.title">Logs</h2>
+        <p data-i18n="dash.logs.intro">Recent errors and warnings from this PC's journals and from Forge's own services. Read only. Passwords, keys and tokens are hidden before a line reaches this page.</p></div>
+      <div class="panel">
+        <div class="filters">
+          <label><span data-i18n="dash.logs.service">Service</span><select id="log-service">
+            <option value="all" data-i18n="dash.logs.svc.all">Everything</option>
+            <option value="forge" data-i18n="dash.logs.svc.forge">All Forge services</option></select></label>
+          <label><span data-i18n="dash.logs.level">Level</span><select id="log-level">
+            <option value="error" data-i18n="dash.logs.lvl.error">Errors</option>
+            <option value="warning" selected data-i18n="dash.logs.lvl.warning">Errors and warnings</option>
+            <option value="info" data-i18n="dash.logs.lvl.info">Everything (info)</option></select></label>
+          <label><span data-i18n="dash.logs.since">Time</span><select id="log-since">
+            <option value="1h" data-i18n="dash.logs.since.1h">Last hour</option>
+            <option value="24h" selected data-i18n="dash.logs.since.24h">Last 24 hours</option>
+            <option value="7d" data-i18n="dash.logs.since.7d">Last 7 days</option></select></label>
+          <label><span data-i18n="dash.logs.search">Search</span><input id="log-search" type="search" maxlength="100" autocomplete="off"
+            placeholder="Words in the line" data-i18n-placeholder="dash.logs.search_ph"></label>
+          <button class="btn" id="log-refresh" data-i18n="dash.logs.refresh">Refresh</button>
+        </div>
+        <div id="log-access"></div>
+        <div id="log-lines"></div>
+      </div>
+      <div class="panel"><h3 data-i18n="dash.logs.access_title">Who can read which logs</h3>
+        <div class="sub" data-i18n="dash.logs.access_body">Fedora keeps two kinds of journals. Your own user journal (your apps, and your Forge services such as backups and gaming mode) is always readable by you. The system journal (Forge Core, hardware checks, Ollama and the rest of the system) is readable by administrators in the wheel group, and by members of the adm or systemd-journal groups. To let another account read it: sudo usermod -aG systemd-journal NAME, then log out and in.</div></div>
+    </section>
+  </main>
+</div>
+
+<dialog id="confirm" aria-labelledby="c-title">
+  <div class="in">
+    <h3 id="c-title"></h3>
+    <p id="c-body"></p>
+    <pre class="list mono" id="c-list"></pre>
+    <p class="muted small" id="c-cmd-label" data-i18n="dash.confirm.runs">This runs:</p>
+    <div class="cmd"><code id="c-cmd"></code></div>
+    <div class="typed" id="c-typed"><label for="c-input" id="c-typed-label"></label><input id="c-input" autocomplete="off"></div>
+    <div class="bar"><button class="btn" id="c-cancel" data-i18n="ui.cancel">Cancel</button><button class="btn primary" id="c-ok"></button></div>
+  </div>
+</dialog>
+
+<!--__I18N__-->
+<script nonce="__NONCE__">
+"use strict";
+const TOKEN = "__TOKEN__";
+const H = {"X-Forge-Token": TOKEN, "Content-Type": "application/json"};
+const $ = s => document.querySelector(s);
+
+// Every element is built here. Text from data only ever goes in with textContent.
+function h(tag, cls, text, kids) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = String(text);
+  (kids || []).forEach(k => { if (k) e.append(k); });
+  return e;
+}
+function btn(label, cls, onclick) { const b = h("button", "btn" + (cls ? " " + cls : ""), label); b.onclick = onclick; return b; }
+function row(title, detail, right) {
+  const left = h("div", "", null, [h("div", "t", title), detail ? h("div", "d", detail) : null]);
+  return h("div", "row", null, [left, right || h("span")]);
+}
+function vrow(title, detail, value) { return row(title, detail, h("div", "v", value)); }
+function empty(text) { return h("div", "empty", text); }
+function errorLine(text) { return h("div", "error", text); }
+function pill(text, kind) { return h("span", "pill" + (kind ? " " + kind : ""), text); }
+function fill(box, nodes) { box.replaceChildren(...nodes.filter(Boolean)); }
+const num = v => typeof v === "number" && isFinite(v);
+
+applyStatic();
+const LOCALE = I18N.lang === "th" ? "th-TH" : [];
+function ago(ts) {
+  if (!num(ts)) return t("dash.never");
+  const s = Date.now() / 1000 - ts;
+  if (s < 60) return t("dash.just_now");
+  if (s < 3600) return t("dash.min_ago", {n: Math.round(s / 60)});
+  if (s < 86400) return t("dash.h_ago", {n: Math.round(s / 3600)});
+  return tn("dash.days_ago", Math.round(s / 86400));
+}
+const when = ts => num(ts) ? new Date(ts * 1000).toLocaleString(LOCALE, {dateStyle: "medium", timeStyle: "short"}) : t("dash.unknown");
+const clock = ts => new Date(ts * 1000).toLocaleTimeString(LOCALE, {hour: "2-digit", minute: "2-digit"});
+function size(b) {
+  if (!num(b)) return t("dash.unknown");
+  const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0;
+  while (b >= 1000 && i < u.length - 1) { b /= 1000; i++; }
+  return (b >= 100 || i === 0 ? Math.round(b) : b.toFixed(1)) + " " + u[i];
+}
+
+async function get(path) {
+  const r = await fetch(path, {headers: H});
+  if (!r.ok) throw new Error(t("dash.refused", {status: r.status}));
+  return r.json();
+}
+async function post(path, body) {
+  try {
+    const r = await fetch(path, {method: "POST", headers: H, body: JSON.stringify(body)});
+    if (!r.ok) return {ok: false, output: t("dash.refused_short", {status: r.status})};
+    return await r.json();
+  } catch (e) {
+    return {ok: false, output: t("dash.closed")};
+  }
+}
+function result(box, d) { box.className = "result " + (d.ok ? "ok" : "bad"); box.textContent = d.output ? tr(d.output) : (d.ok ? t("dash.done") : t("dash.not_done")); }
+
+// The one confirm step every action goes through.
+let pending = null;
+function ask(opts, payload, done) {
+  $("#c-title").textContent = opts.title;
+  $("#c-body").textContent = opts.body;
+  $("#c-list").textContent = opts.list || "";
+  $("#c-list").classList.toggle("on", !!opts.list);
+  $("#c-cmd").textContent = opts.command;
+  $("#c-ok").textContent = opts.verb;
+  $("#c-ok").classList.toggle("danger", !!opts.danger);
+  const typed = $("#c-typed"), input = $("#c-input");
+  typed.classList.toggle("on", !!opts.typed);
+  input.value = "";
+  $("#c-typed-label").textContent = opts.typed ? t("dash.confirm.type", {word: opts.typed}) : "";
+  $("#c-ok").disabled = !!opts.typed;
+  pending = {opts, payload, done};
+  $("#confirm").showModal();
+  (opts.typed ? input : $("#c-cancel")).focus();
+}
+$("#c-input").oninput = () => { if (pending) $("#c-ok").disabled = $("#c-input").value !== pending.opts.typed; };
+$("#c-cancel").onclick = () => { pending = null; $("#confirm").close(); };
+$("#confirm").onclose = () => { pending = null; };
+$("#c-ok").onclick = async () => {
+  if (!pending) return;
+  const {opts, payload, done} = pending;
+  if (opts.typed && $("#c-input").value !== opts.typed) return;
+  const extra = opts.typed ? {typed: $("#c-input").value} : {};
+  pending = null;
+  $("#confirm").close();
+  done({ok: true, output: t("dash.working"), working: true});
+  done(await post("/api/dash/action", Object.assign({}, payload, extra, {confirmed: true})));
+};
+
+document.querySelectorAll("[data-copy]").forEach(b => b.onclick = async () => {
+  try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = t("welcome.copied"); }
+  catch (e) { b.textContent = t("welcome.select_copy"); }
+});
+
+function flag(id, kind) { const f = document.getElementById("f-" + id); if (f) f.className = "flag" + (kind ? " " + kind : ""); }
+
+// ---------- Home ----------
+
+const GAUGES = [
+  {id: "cpu", label: "dash.g.cpu", metric: "cpu_pct", min: 0, max: () => 100},
+  {id: "gpu", label: "dash.g.gpu", metric: "gpu_util_pct", min: 0, max: () => 100},
+  {id: "vram", label: "dash.g.vram", metric: "vram_used_mb", min: 0, max: m => m.vram_total_mb || 1},
+  {id: "ram", label: "dash.g.ram", metric: "mem_used_gb", min: 0, max: m => m.mem_total_gb || 1},
+  {id: "temp", label: "dash.g.temp", metric: "gpu_temp_c", alt: "cpu_temp_c", min: 30, max: () => 95},
+];
+const series = {};
+let lastTs = null, latest = {};
+const SVGNS = "http://www.w3.org/2000/svg";
+
+function buildStrip() {
+  const strip = $("#strip");
+  fill(strip, GAUGES.map(g => {
+    const svg = document.createElementNS(SVGNS, "svg");
+    svg.setAttribute("viewBox", "0 0 100 40");
+    svg.setAttribute("preserveAspectRatio", "none");
+    svg.setAttribute("aria-hidden", "true");
+    const area = document.createElementNS(SVGNS, "path"); area.setAttribute("class", "spark-area");
+    const line = document.createElementNS(SVGNS, "path"); line.setAttribute("class", "spark-line");
+    svg.append(area, line);
+    const big = h("div", "big", "--");
+    const box = h("div", "gauge na", null, [h("div", "k", t(g.label)), big, h("div", "s", ""), svg]);
+    box.id = "g-" + g.id;
+    return box;
+  }));
+}
+function drawSpark(g) {
+  const box = document.getElementById("g-" + g.id);
+  const vals = (series[g.metric] || []).filter(p => num(p.v));
+  const area = box.querySelector(".spark-area"), line = box.querySelector(".spark-line");
+  if (vals.length < 2) { area.setAttribute("d", ""); line.setAttribute("d", ""); return; }
+  const lo = g.min, hi = Math.max(g.max(latest), lo + 1);
+  const t0 = vals[0].ts, t1 = vals[vals.length - 1].ts, span = Math.max(t1 - t0, 1);
+  const pts = vals.map(p => [((p.ts - t0) / span) * 100, 38 - Math.min(Math.max((p.v - lo) / (hi - lo), 0), 1) * 34]);
+  const d = pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(2) + " " + p[1].toFixed(2)).join(" ");
+  line.setAttribute("d", d);
+  area.setAttribute("d", d + " L100 40 L0 40 Z");
+}
+function setGauge(g, m) {
+  const box = document.getElementById("g-" + g.id);
+  const big = box.querySelector(".big"), sub = box.querySelector(".s");
+  const v = m[g.metric];
+  let cls = "gauge";
+  big.replaceChildren();
+  if (!num(v)) {
+    cls += " na"; big.textContent = t("dash.na");
+    sub.textContent = g.id === "temp" && num(m.cpu_temp_c) ? "" : t("dash.not_reported");
+    if (g.id === "temp" && num(m.cpu_temp_c)) { cls = "gauge"; big.textContent = Math.round(m.cpu_temp_c) + "°"; sub.textContent = "CPU"; }
+    box.className = cls; drawSpark(g); return;
+  }
+  const unit = t => h("small", "", t);
+  if (g.id === "cpu" || g.id === "gpu") { big.append(String(Math.round(v)), unit("%")); sub.textContent = g.id === "cpu" && num(m.load1) ? t("dash.load", {n: m.load1.toFixed(1)}) : (num(m.gpu_power_w) ? Math.round(m.gpu_power_w) + " W" : ""); }
+  if (g.id === "vram") { big.append((v / 1024).toFixed(1), unit("GB")); sub.textContent = num(m.vram_total_mb) ? t("dash.of_gb", {n: (m.vram_total_mb / 1024).toFixed(1)}) : ""; }
+  if (g.id === "ram") { big.append(v.toFixed(1), unit("GB")); sub.textContent = num(m.mem_total_gb) ? t("dash.of_gb", {n: Math.round(m.mem_total_gb)}) : ""; }
+  if (g.id === "temp") {
+    big.append(String(Math.round(v)), unit("°C"));
+    sub.textContent = "GPU" + (num(m.cpu_temp_c) ? ", CPU " + Math.round(m.cpu_temp_c) + "°" : "");
+    if (v >= 83) cls += " hot"; else if (v >= 72) cls += " warm";
+  }
+  box.className = cls;
+  drawSpark(g);
+}
+function pushSample(m) {
+  if (!m || m.ts === lastTs) return;
+  lastTs = m.ts;
+  GAUGES.forEach(g => {
+    const s = series[g.metric] || (series[g.metric] = []);
+    s.push({ts: m.ts, v: m[g.metric]});
+    while (s.length && s[0].ts < m.ts - 900) s.shift();
+  });
+}
+function liveState(kind, text) { const l = $("#live"); l.className = "live" + (kind ? " " + kind : ""); l.lastChild.textContent = text; }
+
+async function pollMetrics() {
+  try {
+    const d = await get("/api/dash/metrics");
+    if (!d.metrics) { liveState("down", t("dash.no_live")); return; }
+    latest = d.metrics; pushSample(d.metrics);
+    GAUGES.forEach(g => setGauge(g, d.metrics));
+    liveState("", t("dash.live"));
+  } catch (e) { liveState("down", t("dash.closed_short")); }
+}
+async function loadHistory() {
+  try {
+    const d = await get("/api/dash/history");
+    GAUGES.forEach(g => {
+      const hist = (d.history[g.metric] || []).map(p => ({ts: p.ts, v: p.avg}));
+      series[g.metric] = hist.concat(series[g.metric] || []).sort((a, b) => a.ts - b.ts);
+    });
+  } catch (e) { /* the live samples still fill the lines */ }
+}
+
+let doctorCache = null;
+async function loadHome() {
+  let d, doc;
+  try { [d, doc] = await Promise.all([get("/api/dash/home"), get("/api/dash/doctor").catch(() => null)]); }
+  catch (e) { $("#hello").textContent = e.message; return; }
+  doctorCache = doc;
+  $("#host").textContent = d.host || t("dash.this_pc");
+  $("#home-when").textContent = d.host || "";
+  if (d.metrics) { latest = d.metrics; pushSample(d.metrics); GAUGES.forEach(g => setGauge(g, d.metrics)); }
+  const needs = [];
+  const go = page => () => { location.hash = "#" + page; };
+  if (d.error) needs.push(row(t("dash.home.no_live"), tr(d.error), null));
+  if (num(d.approvals) && d.approvals > 0)
+    needs.push(row(tn("dash.home.requests", d.approvals), t("dash.home.paused"), btn(t("dash.review"), "primary", go("agents"))));
+  const rep = doc && doc.report;
+  const warn = rep && rep.summary ? rep.summary.warn : 0;
+  if (warn > 0) needs.push(row(tn("dash.home.report_things", warn),
+                               (rep.fixes || []).length ? t("dash.home.some_fixes") : t("dash.home.report_says"),
+                               btn(t("dash.open_diag"), "", go("diagnostics"))));
+  const u = d.updates;
+  if (u && u.booted_is_rollback) needs.push(row(t("dash.home.older"), t("dash.home.older.help"), btn(t("dash.details"), "", go("updates"))));
+  else if (u && u.update_ready) needs.push(row(t("dash.home.update_ready"), t("dash.home.restart_to_use"), btn(t("dash.details"), "", go("updates"))));
+  if (u && u.last_attempt && u.last_attempt.result === "failed") needs.push(row(t("dash.home.update_failed"), tr(u.last_attempt.detail || ""), btn(t("dash.details"), "", go("updates"))));
+  const b = d.backup;
+  if (b && !b.set_up) needs.push(row(t("dash.home.no_backups"), t("dash.home.no_backups.help", {drive: b.drive_label || "FORGEBACKUP"}), btn(t("dash.how"), "", go("backups"))));
+  else if (b && b.overdue) needs.push(row(t("dash.home.backup_old"), t("dash.home.backup_old.help", {ago: ago(b.last_success), drive: b.drive_label || t("dash.your_drive")}), btn(t("dash.back_up"), "", go("backups"))));
+  if (d.game && d.game.pending) needs.push(row(t("dash.home.game_pending"), t("dash.home.game_pending_detail", {mode: d.game.back_to}), null));
+  const rtn = b && b.set_up ? restoreTestNeed(b, go) : null;
+  if (rtn) needs.push(rtn);
+  fill($("#home-needs"), needs.length ? needs : [empty(t("dash.home.nothing"))]);
+  const n = needs.length;
+  $("#hello").textContent = n === 0 ? t("dash.home.fine") : tn("dash.home.need_look", n);
+  const facts = [
+    [t("dash.fact.mode"), d.mode === "default" ? t("dash.mode.default") : tl("set.opt." + d.mode, d.mode.charAt(0).toUpperCase() + d.mode.slice(1))],
+    [t("dash.fact.system"), u && u.booted && u.booted.version ? u.booted.version : t("dash.unknown")],
+    [t("dash.fact.backup"), b ? ago(b.last_success) : t("dash.unknown")],
+    [t("dash.fact.approvals"), num(d.approvals) ? String(d.approvals) : t("dash.unknown")],
+    [t("dash.fact.problems"), rep && rep.summary ? String(warn) : t("dash.unknown")],
+  ];
+  fill($("#home-facts"), facts.map(([k, v]) => h("span", "", k + ": ", [h("b", "", v)])));
+  fill($("#home-recent"), (d.timeline || []).length ? d.timeline.slice(0, 6).map(e => event(e, true)) : [empty(t("dash.nothing_recorded"))]);
+  flag("agents", d.approvals > 0 ? "accent" : "");
+  flag("updates", u && u.booted_is_rollback ? "warn" : u && u.update_ready ? "accent" : "");
+  flag("backups", b && (b.overdue || !b.set_up) ? "bad" : rtn ? "warn" : "");
+  flag("diagnostics", warn > 0 ? "warn" : "");
+}
+
+// ---------- Agents and approvals ----------
+
+function runKind(s) { return s === "done" ? "ok" : s === "failed" ? "bad" : s === "waiting_approval" ? "accent" : ""; }
+async function loadAgents() {
+  let d;
+  try { d = await get("/api/dash/agents"); } catch (e) { fill($("#runs"), [errorLine(e.message)]); return; }
+  const n = d.approvals;
+  fill($("#approvals"), [row(num(n) ? (n === 0 ? t("dash.agents.none_waiting") : tn("dash.agents.n_waiting", n)) : t("dash.agents.unsure"),
+                             t("dash.agents.ask"),
+                             num(n) && n === 0 ? null : btn(t("dash.agents.show"), "primary", showApprovals))]);
+  fill($("#runs"), d.error ? [errorLine(tr(d.error))] : d.runs.length ? d.runs.slice(0, 15).map(r =>
+    row(r.agent + ": " + String(r.task || "").slice(0, 140), (r.error || r.result || "").toString().slice(0, 200) || when(r.started),
+        h("div", "acts", null, [pill(tl("dash.run." + r.status, String(r.status).replace("_", " ")), runKind(r.status)), h("span", "v", ago(r.started))]))) : [empty(t("dash.agents.no_runs"))]);
+  fill($("#agents"), d.agents.length ? d.agents.map(a =>
+    row(a.name || a.id, (a.model || "") + (a.schedule ? ", " + a.schedule : ""), pill(a.enabled ? t("ui.on_cap") : t("ui.off_cap"), a.enabled ? "ok" : ""))) : [empty(t("dash.agents.no_agents"))]);
+}
+async function showApprovals() {
+  const out = $("#approvals-out");
+  result(out, {ok: true, output: t("dash.asking_password")});
+  const d = await post("/api/dash/approvals", {});
+  if (!d.ok) return result(out, d);
+  out.textContent = ""; out.className = "result";
+  if (!d.approvals.length) return fill($("#approvals"), [empty(t("dash.agents.none_waiting_dot"))]);
+  fill($("#approvals"), d.approvals.map(a => {
+    const details = Object.entries(a.details || {}).map(([k, v]) => k + ": " + (typeof v === "string" ? v : JSON.stringify(v))).join("\n");
+    const what = t("dash.agents.wants", {agent: a.agent, action: a.action});
+    const answer = verb => () => ask({title: verb === "approve" ? t("dash.approve.title") : t("dash.deny.title"),
+                                      body: what + (details ? "\n" + details : ""),
+                                      command: "pkexec forge-api POST /api/approvals/" + a.id + "/" + verb,
+                                      verb: verb === "approve" ? t("dash.approve") : t("dash.deny"), danger: verb === "deny"},
+                                     {action: verb === "approve" ? "approve" : "deny", id: a.id},
+                                     r => { result(out, r); if (r.ok && !r.working) loadAgents(); });
+    const left = h("div", "", null, [h("div", "t", what), h("div", "d mono", details.slice(0, 600)),
+                                     h("div", "d", t("dash.expires", {when: when(a.expires)}))]);
+    return h("div", "row", null, [left, h("div", "acts", null, [btn(t("dash.deny"), "danger", answer("deny")), btn(t("dash.approve"), "primary", answer("approve"))])]);
+  }));
+}
+
+// ---------- Activity ----------
+
+const KINDS = [["all", "dash.kind.all"], ["mode", "dash.kind.mode"], ["settings", "dash.kind.settings"], ["agent", "dash.kind.agent"],
+               ["backup", "dash.kind.backup"], ["update", "dash.kind.update"], ["health", "dash.kind.health"], ["hardware", "dash.kind.hardware"]];
+let kind = "all", entries = [];
+function event(e, short) {
+  const mark = h("i", "mark " + (KINDS.some(k => k[0] === e.kind) ? e.kind : ""));
+  return h("div", "ev", null, [h("span", "when", short ? ago(e.ts) : clock(e.ts)), mark,
+                                h("div", "", null, [h("div", "", tr(e.title)), e.detail && !short ? h("div", "d", tr(e.detail)) : null])]);
+}
+function renderTimeline() {
+  fill($("#kinds"), KINDS.map(([k, label]) => { const c = h("button", "chip", t(label)); c.setAttribute("aria-pressed", String(k === kind));
+    c.onclick = () => { kind = k; renderTimeline(); }; return c; }));
+  const shown = entries.filter(e => kind === "all" || e.kind === kind);
+  const nodes = [];
+  let day = null;
+  shown.forEach(e => {
+    const d = new Date(e.ts * 1000).toLocaleDateString(LOCALE, {weekday: "long", day: "numeric", month: "long"});
+    if (d !== day) { day = d; nodes.push(h("div", "day", d)); }
+    nodes.push(event(e));
+  });
+  fill($("#timeline"), nodes.length ? nodes : [empty(kind === "all" ? t("dash.nothing_recorded") : t("dash.nothing_kind"))]);
+}
+async function loadActivity() {
+  try { const d = await get("/api/dash/timeline"); entries = d.entries || [];
+        renderTimeline(); if (d.error) $("#timeline").prepend(errorLine(tr(d.error))); }
+  catch (e) { fill($("#timeline"), [errorLine(e.message)]); }
+}
+
+// ---------- Updates and recovery ----------
+
+async function loadUpdates() {
+  let d;
+  try { d = await get("/api/dash/updates"); } catch (e) { fill($("#releases"), [errorLine(e.message)]); return; }
+  const u = d.updates;
+  if (!u || !u.ok) { fill($("#releases"), [errorLine(tr((u && u.error) || d.error) || t("dash.upd.na"))]); return; }
+  $("#upd-msg").textContent = u.message ? tr(u.message) : t("dash.updates.history");
+  const rel = (dep, cls, label, note) => {
+    if (!dep) return null;
+    const r = h("div", "rel " + cls, null, [h("i", "node"),
+      h("div", "", null, [h("div", "t", dep.version || t("dash.upd.unknown_version")), h("div", "d", (dep.image || "") + (dep.timestamp ? ", " + t("dash.upd.built", {when: when(dep.timestamp)}) : "")), note ? h("div", "d", note) : null]),
+      pill(label, cls === "booted" ? "accent" : cls === "staged" ? "ok" : "")]);
+    return r;
+  };
+  const last = u.last_attempt || {};
+  fill($("#releases"), [
+    rel(u.staged, "staged", t("dash.upd.next"), t("dash.upd.next.help")),
+    rel(u.booted, "booted", u.booted_is_rollback ? t("dash.upd.running_older") : t("dash.upd.running"), null),
+    rel(u.rollback, "rollback", u.booted_is_rollback ? t("dash.upd.newer") : t("dash.upd.previous"), u.booted_is_rollback ? t("dash.upd.default_entry") : t("dash.upd.kept")),
+    vrow(t("dash.upd.auto"), tr(last.detail || ""), last.ts ? ago(last.ts) : ""),
+    vrow(t("dash.upd.build"), d.forge_version || "", ""),
+  ]);
+  const box = $("#rollback-box");
+  if (d.rollback_button) {
+    // From the default boot entry, rpm-ostree rollback switches to the other entry, so its version can be
+    // named. Booted from an older entry, another entry may become the default, so then no version is named.
+    const sure = u.booted_is_default && u.rollback && u.rollback.version;
+    fill(box, [row(t("dash.rb.title"), (sure ? t("dash.rb.makes", {version: u.rollback.version})
+                                          : u.booted_is_default ? t("dash.rb.makes_other")
+                                          : t("dash.rb.changes")) + " " + t("dash.rb.undo"),
+      btn(t("dash.rb.button"), "danger", () => ask({title: sure ? t("dash.rb.ask", {version: u.rollback.version}) : t("dash.rb.ask_unsure"),
+        body: (sure ? t("dash.rb.body", {version: u.rollback.version})
+                    : u.booted_is_default ? t("dash.rb.body_other")
+                    : t("dash.rb.body_unsure")) + " " + t("dash.rb.files_stay"),
+        command: "pkexec rpm-ostree rollback", verb: t("dash.rb.verb"), danger: true, typed: "rollback"},
+        {action: "rollback"}, r => result($("#rollback-out"), r))))]);
+  } else {
+    fill(box, [row(t("dash.rb.title"), u.update_ready ? t("dash.rb.waiting") : t("dash.rb.none"), null)]);
+  }
+}
+
+// ---------- Backups ----------
+
+async function loadBackups() {
+  const box = $("#backup");
+  let d;
+  try { d = await get("/api/dash/backup"); } catch (e) { fill(box, [errorLine(e.message)]); return; }
+  const b = d.backup;
+  if (!b) { fill(box, [h("h3", "", t("dash.bk.status")), errorLine(tr(d.error) || t("dash.bk.no_answer"))]); return; }
+  const out = h("div", "result");
+  const drive = b.drive_label || t("dash.bk.the_drive");
+  const now = btn(t("dash.bk.now"), "primary", () => ask({title: t("dash.bk.now_ask"), body: t("dash.bk.now_body", {drive}),
+      command: "forge-backup run", verb: t("dash.bk.now")}, {action: "backup-now"}, r => { result(out, r); if (r.ok) setTimeout(loadBackups, 15000); }));
+  if (!b.set_up) {
+    fill(box, [h("h3", "", t("dash.bk.not_set_up")),
+      h("ol", "steps", null, [h("li", "", t("dash.bk.step1", {drive: b.drive_label || "FORGEBACKUP"})),
+        h("li", "", null, [h("span", "", t("dash.bk.step2")), h("div", "cmd", null, [h("code", "", "forge-backup init")])]),
+        h("li", "", t("dash.bk.step3")),
+        h("li", "", t("dash.bk.step4"))])]);
+    return;
+  }
+  const last = b.last_success;
+  fill(box, [h("h3", "", t("dash.bk.last_good")),
+    h("div", "lead-num", null, [h("div", "v", ago(last)), h("div", "d", num(last) ? when(last) : t("dash.bk.none_yet"))]),
+    h("div", "facts-grid", null, [
+      [t("dash.bk.auto"), b.automatic ? t("dash.bk.every", {n: b.every_hours}) : t("ui.off_cap")], [t("dash.bk.drive"), b.drive_label || t("dash.unknown")],
+      [t("dash.bk.kept"), num(b.snapshot_count) ? String(b.snapshot_count) : t("dash.unknown")], [t("dash.bk.size"), size(b.size_bytes)],
+      [t("dash.bk.free"), size(b.drive_free_bytes)], [t("dash.bk.last_try"), b.last_run ? ago(b.last_run) : t("dash.never")],
+    ].map(([k, v]) => h("div", "fact", null, [h("div", "k", k), h("div", "v", v)]))),
+    b.message ? row(t("dash.bk.last_result"), tr(b.message), b.result ? pill(tl("dash.result." + b.result, b.result), b.result === "ok" ? "ok" : "bad") : null) : null,
+    b.overdue ? row(t("dash.home.backup_old"), t("dash.bk.plug_in", {drive}), pill(t("dash.bk.overdue"), "bad")) : null,
+    row(t("dash.bk.now"), t("dash.bk.restore_help"), now),
+    restoreTestRow(b, out), out]);
+}
+
+// ---------- Storage ----------
+
+async function loadStorage() {
+  let d;
+  try { d = await get("/api/dash/storage"); } catch (e) { fill($("#disks"), [errorLine(e.message)]); return; }
+  const s = d.shared, out = $("#shared-out");
+  const openNow = btn(t("dash.st.open_now"), "", () => ask({title: t("dash.st.open_ask"), body: t("dash.st.open_body", {label: (s && s.label) || "SHARED"}),
+      command: "forge-shared-drive", verb: t("dash.st.open_verb")}, {action: "open-shared-drive"}, r => { result(out, r); if (r.ok) setTimeout(loadStorage, 1000); }));
+  if (!s) fill($("#shared"), [errorLine(tr(d.shared_error) || t("dash.st.no_answer"))]);
+  else {
+    const kindOf = {mounted: "ok", read_only: "warn", off: "", not_mounted: "", missing: ""}[s.state];
+    fill($("#shared"), [row(s.enabled ? t("dash.st.drive", {label: s.label || ""}) : t("ui.off_cap"), tr(s.message || ""),
+                            h("div", "acts", null, [pill(tl("dash.st.state." + (s.state || "unknown"), String(s.state || "unknown").replace("_", " ")), kindOf === undefined ? "bad" : kindOf),
+                                                    s.enabled && s.state !== "mounted" ? openNow : null])),
+                        s.mountpoint ? vrow(t("dash.st.opened_at"), s.mountpoint, (s.fstype || "").toUpperCase()) : null,
+                        s.link ? vrow(t("dash.st.link"), "", String(s.link)) : null]);
+  }
+  const rows = [];
+  (d.disks || []).forEach(disk => {
+    rows.push(vrow((disk.model || disk.name) + (disk.rm ? " " + t("dash.st.removable") : ""), (disk.path || "") + (disk.tran ? ", " + disk.tran.toUpperCase() : ""), size(disk.size)));
+    (disk.children || []).forEach(p => {
+      const used = num(p.fsused) && num(p.fssize) && p.fssize > 0 ? p.fsused / p.fssize : null;
+      const bar = h("div", "use" + (used !== null && used > .9 ? " full" : ""), null, [h("i")]);
+      if (used !== null) bar.firstChild.style.width = Math.round(used * 100) + "%";
+      const left = h("div", "", null, [h("div", "t", (p.label || p.name) + (p.mountpoint ? " " + t("dash.st.at", {path: p.mountpoint}) : "")),
+        h("div", "d", [p.fstype, p.path].filter(Boolean).join(", ")), used !== null ? bar : null]);
+      rows.push(h("div", "row part", null, [left, h("div", "v", num(p.fsavail) ? t("dash.st.free_of", {free: size(p.fsavail), total: size(p.fssize)}) : size(p.size))]));
+    });
+  });
+  fill($("#disks"), rows.length ? rows : [d.error ? errorLine(tr(d.error)) : empty(t("dash.st.no_disks"))]);
+}
+
+// ---------- Sync ----------
+
+async function loadSync() {
+  const box = $("#sync");
+  let d;
+  try { d = await get("/api/dash/sync"); } catch (e) { fill(box, [errorLine(e.message)]); return; }
+  const s = d.sync;
+  if (!s) { fill(box, [errorLine(tr(d.error) || t("dash.sy.no_answer"))]); return; }
+  const out = h("div", "result");
+  const rows = [h("h3", "", s.this_pc ? t("dash.sy.this_pc", {name: s.this_pc}) : t("dash.sy.title")),
+                h("div", "sub", s.enabled ? t("dash.sy.on") : t("dash.sy.off"))];
+  if (s.message) rows.push(row(t("dash.sy.folder"), tr(s.message), null));
+  if (!s.message && !s.hosts.length) rows.push(empty(t("dash.sy.no_pcs")));
+  s.hosts.forEach(p => {
+    if (p.problem) { rows.push(row(p.host, t("dash.sy.cant_use", {why: tr(p.problem)}), pill(t("dash.sy.skipped"), "bad"))); return; }
+    // The dialog lists each change; applying is refused if the list changed after it was shown.
+    const apply = btn(t("dash.sy.use"), p.newer ? "primary" : "", async () => {
+      result(out, {ok: true, output: t("dash.sy.reading")});
+      const shown = await post("/api/dash/sync-diff", {host: p.host});
+      if (!shown.ok) return result(out, shown);
+      out.textContent = ""; out.className = "result";
+      ask({title: t("dash.sy.use_ask", {name: p.host}),
+           body: t("dash.sy.use_body"),
+           list: shown.text, command: "forge-settings-sync apply " + p.host, verb: t("dash.sy.use_verb")},
+          {action: "sync-apply", host: p.host, diff_hash: shown.hash}, r => { result(out, r); if (r.ok) setTimeout(loadSync, 500); });
+    });
+    rows.push(row(p.host, t("dash.sy.saved", {when: when(Date.parse(p.saved_at) / 1000)}) + ", " + tn("dash.sy.diffs", p.differences),
+                  h("div", "acts", null, [p.newer ? pill(t("dash.sy.newer"), "accent") : null, p.differences ? apply : pill(t("dash.sy.same"), "ok")])));
+  });
+  rows.push(out);
+  fill(box, rows);
+}
+
+// ---------- Virtual machines ----------
+
+async function loadVms() {
+  const box = $("#vms");
+  let d;
+  try { d = await get("/api/dash/vms"); } catch (e) { fill(box, [errorLine(e.message)]); return; }
+  if (!d.enabled) { fill(box, [h("h3", "", t("dash.vm.off")),
+    h("div", "sub", t("dash.vm.off.help"))]); return; }
+  const kindOf = s => s === "running" ? "ok" : s === "paused" ? "warn" : s === "crashed" ? "bad" : "";
+  fill(box, [h("h3", "", t("dash.vm.yours")), d.error ? errorLine(tr(d.error)) : null,
+    ...(d.vms.length ? d.vms.map(v => {
+      const r = row(v.name, v.id !== "-" ? t("dash.vm.id", {id: v.id}) : "", pill(tl("dash.vm.state." + v.state, v.state), kindOf(v.state)));
+      const cell = r.querySelector(".t");
+      r.classList.add("vm");
+      cell.title = v.name;
+      return r;
+    })
+                     : [empty(t("dash.vm.none"))])]);
+}
+
+// ---------- Creative hub ----------
+
+async function loadHub() {
+  const box = $("#hub");
+  let d;
+  try { d = await get("/api/dash/hub"); } catch (e) { fill(box, [errorLine(e.message)]); return; }
+  const s = d.hub;
+  if (!s) { fill(box, [errorLine(tr(d.error) || t("dash.hub.no_answer"))]); return; }
+  if (!s.set_up) { fill(box, [h("h3", "", t("dash.hub.not_set_up")), h("div", "sub", t("dash.hub.clone")),
+    h("div", "cmd small", null, [h("code", "", "forge-hub setup ~/creative-mcp-hub")])]); return; }
+  const out = h("div", "result");
+  const open = btn(t("dash.hub.open"), "primary", () => ask({title: t("dash.hub.open_ask"), body: t("dash.hub.open_body"),
+      command: "forge-hub dashboard", verb: t("dash.st.open_verb")}, {action: "hub-dashboard"}, r => result(out, r)));
+  const yn = v => v ? t("dash.yes") : t("dash.no");
+  fill(box, [h("h3", "", s.hub_running ? t("dash.hub.running") : s.hub_running === false ? t("dash.hub.not_running") : t("dash.hub.not_started")),
+    h("div", "facts-grid", null, [[t("dash.hub.built"), yn(s.hub_built)], [t("dash.hub.in_claude"), yn(s.claude_entry_present)],
+      [t("dash.agents.waiting"), num(s.pending_approvals) ? String(s.pending_approvals) : t("dash.unknown")], [t("dash.hub.version"), s.commit ? String(s.commit).slice(0, 10) : t("dash.unknown")]]
+      .map(([k, v]) => h("div", "fact", null, [h("div", "k", k), h("div", "v", v)]))),
+    ...(s.apps || []).map(a => row(a.id, a.lastError || "", pill(tl("dash.hub.state." + a.status, a.status), a.status === "connected" || a.status === "running" ? "ok" : a.lastError ? "bad" : ""))),
+    s.claude_config_problem ? errorLine(tr(s.claude_config_problem)) : null,
+    row(t("dash.hub.approvals"), t("dash.hub.start_claude"), open), out]);
+}
+
+// ---------- Diagnostics ----------
+
+const MARK = {ok: ["dash.mark.ok", "ok"], warn: ["dash.mark.warn", "warn"], info: ["dash.mark.info", ""], unknown: ["dash.mark.unknown", ""]};
+let fixRunning = false;
+async function loadDiagnostics() {
+  let d;
+  try { d = doctorCache && Date.now() - doctorCache.at < 30000 ? doctorCache : await get("/api/dash/doctor"); }
+  catch (e) { fill($("#report"), [errorLine(e.message)]); return; }
+  d.at = d.at || Date.now(); doctorCache = d;
+  const r = d.report;
+  if (!r) { fill($("#report"), [errorLine(tr(d.error) || t("dash.diag.failed"))]); fill($("#fixes"), []); return; }
+  const s = r.summary || {};
+  $("#doc-head").textContent = t("dash.diag.head", {ok: s.ok || 0, warn: s.warn || 0, unknown: s.unknown || 0});
+  fill($("#report"), (r.sections || []).map(sec => {
+    const m = MARK[sec.status] ? [t(MARK[sec.status][0]), MARK[sec.status][1]] : [sec.status, ""];
+    const items = h("ul", "sec-items", null, (sec.items || []).map(i => h("li", "", tr(i))));
+    return h("div", "row", null, [h("div", "", null, [h("div", "t", tr(sec.name)), items]), pill(m[0], m[1])]);
+  }));
+  const out = $("#fix-out");
+  const fixes = r.fixes || [];
+  fill($("#fixes"), fixes.length ? fixes.map(f => {
+    const cmd = (f.commands || []).map(c => c.join(" ")).join("; ");
+    const facts = t("dash.fix.risk", {risk: tl("dash.risk." + f.risk, f.risk)}) + " " + (f.reversible ? t("dash.fix.undo") : t("dash.fix.no_undo")) + " " + (f.needs_root ? t("dash.fix.password") : "");
+    const left = h("div", "", null, [h("div", "t", tr(f.title)), h("div", "d", tr(f.problem)), h("div", "d", tr(f.explanation) + " " + facts),
+                                     h("div", "d mono", cmd)]);
+    let right;
+    if (f.automatic) {
+      right = btn(t("dash.fix.run"), "", () => {
+        if (fixRunning) return;
+        ask({title: tr(f.title) + "?", body: tr(f.problem) + " " + tr(f.explanation) + " " + facts, command: "pkexec /usr/libexec/forge-doctor-fix " + f.id, verb: t("dash.fix.verb")},
+            {action: "doctor-fix", id: f.id}, res => {
+              fixRunning = !!res.working;
+              document.querySelectorAll("#fixes .btn").forEach(b => { b.disabled = fixRunning; });
+              result(out, res);
+              if (!fixRunning) { doctorCache = null; setTimeout(loadDiagnostics, 1500); }
+            });
+      });
+    } else {
+      right = btn(t("dash.fix.copy"), "", async () => { try { await navigator.clipboard.writeText(cmd); right.textContent = t("welcome.copied"); } catch (e) { right.textContent = t("welcome.select_copy"); } });
+    }
+    return h("div", "row", null, [left, right]);
+  }) : [empty(t("dash.fix.none"))]);
+  flag("diagnostics", s.warn > 0 ? "warn" : "");
+}
+$("#download").onclick = async () => {
+  $("#download").disabled = true;
+  try {
+    const r = await fetch("/api/dash/doctor.txt", {headers: H});
+    if (!r.ok) throw new Error();
+    const name = (/filename="([A-Za-z0-9._-]+)"/.exec(r.headers.get("Content-Disposition") || "") || [0, "forge-doctor.txt"])[1];
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(await r.blob()); a.download = name;
+    document.body.append(a); a.click(); a.remove();
+    $("#download").textContent = t("dash.diag.downloaded");
+  } catch (e) { $("#download").textContent = t("dash.diag.not_built"); }
+  $("#download").disabled = false;
+};
+
+$("#open-settings").onclick = async () => {
+  const r = await post("/api/dash/action", {action: "open-settings"});
+  $("#open-settings").textContent = r.ok ? t("dash.settings_opening") : t("ui.dash.failed");
+};
+
+// ---------- Backup restore test and Logs (forge-game builder) ----------
+
+// English text for the ids below. When the shared translation tables are merged in (see I18N.md),
+// the page's own t() is used and this fallback is never reached.
+const GAME_EN = {
+  "dash.bk.rt.title": "Restore test",
+  "dash.bk.rt.never": "Not tested yet. Forge tests about once a month while the backup drive is plugged in.",
+  "dash.bk.rt.last": "Last good test: {when}.",
+  "dash.bk.rt.ok": "OK", "dash.bk.rt.failed": "Failed", "dash.bk.rt.overdue": "Overdue",
+  "dash.bk.rt.button": "Test now",
+  "dash.bk.rt.confirm_title": "Test a restore now?",
+  "dash.bk.rt.confirm_body": "Restores a few random files from the newest backup into a new private temporary folder, compares them, checks a small part of the backup data, then deletes the folder. Your own files are never changed. The backup drive must be plugged in.",
+  "dash.home.rt_failed": "The last backup restore test failed",
+  "dash.home.rt_overdue": "No backup restore test for {n} days",
+  "dash.home.rt_never": "Your backup has not been test-restored yet",
+  "dash.home.rt_plug": "Plug in {drive} so Forge can test that your backup can be restored.",
+  "dash.details": "Details",
+  "dash.home.game_pending": "Switching back from gaming mode is still waiting",
+  "dash.home.game_pending_detail": "The AI agents still have the gaming limits, so the mode shows as gaming. Forge tries again every 15 seconds and at login to go back to {mode}. Details are on the Logs page (forge-game.service).",
+  "dash.logs.svc.all": "Everything", "dash.logs.svc.forge": "All Forge services", "dash.logs.svc.modes": "{name} (modes)",
+  "dash.logs.reading": "Reading the logs...", "dash.logs.none": "No lines match. Try a longer time or another level.",
+  "dash.logs.count.one": "{n} line, newest first.", "dash.logs.count.other": "{n} lines, newest first.",
+  "dash.logs.cut": "Only the newest lines are shown. Narrow the filter to see more.",
+  "dash.logs.sys_none": "You can't read the system journal, so only lines from your own services are shown. On Fedora, administrators (the wheel group) and members of the adm or systemd-journal groups can read it.",
+  "dash.logs.sys_own": "From the system journal only your own messages are shown. Administrators (the wheel group) and members of adm or systemd-journal see everything.",
+  "dash.logs.user_none": "Your own journal could not be read.",
+  "dash.logs.lvl.emergency": "emergency", "dash.logs.lvl.alert": "alert", "dash.logs.lvl.critical": "critical",
+  "dash.logs.lvl.err": "error", "dash.logs.lvl.warn": "warning", "dash.logs.lvl.notice": "notice",
+  "dash.logs.lvl.info_one": "info", "dash.logs.lvl.debug": "debug",
+};
+if (typeof window.t !== "function") {
+  window.t = (id, vars) => String(GAME_EN[id] || id).replace(/\{(\w+)\}/g, (m, k) => vars && k in vars ? String(vars[k]) : m);
+}
+if (typeof window.tn !== "function") {
+  window.tn = (id, n, vars) => t(id + (n === 1 ? ".one" : ".other"), Object.assign({n}, vars || {}));
+}
+if (typeof window.tr !== "function") window.tr = text => text;
+
+const RT_BAD = ["failed", "wrong_password"];
+function restoreTestNeed(b, go) {
+  const rt = b.restore_test;
+  if (!rt) return null;
+  const drive = b.drive_label || "FORGEBACKUP";
+  if (RT_BAD.includes(rt.result)) return row(t("dash.home.rt_failed"), tr(rt.message || ""), btn(t("dash.details"), "", go("backups")));
+  if (rt.overdue) return row(rt.last_success ? t("dash.home.rt_overdue", {n: rt.days_since}) : t("dash.home.rt_never"),
+                             t("dash.home.rt_plug", {drive}), btn(t("dash.details"), "", go("backups")));
+  return null;
+}
+function restoreTestRow(b, out) {
+  const rt = b.restore_test || {};
+  const test = btn(t("dash.bk.rt.button"), "", () => ask({title: t("dash.bk.rt.confirm_title"), body: t("dash.bk.rt.confirm_body"),
+      command: "forge-backup restore-test", verb: t("dash.bk.rt.button")}, {action: "restore-test"},
+      r => { result(out, r); if (r.ok) setTimeout(loadBackups, 20000); }));
+  const detail = num(rt.last_success) ? t("dash.bk.rt.last", {when: when(rt.last_success) + " (" + ago(rt.last_success) + ")"}) : t("dash.bk.rt.never");
+  const state = RT_BAD.includes(rt.result) ? pill(t("dash.bk.rt.failed"), "bad") : rt.overdue ? pill(t("dash.bk.rt.overdue"), "warn")
+              : rt.result === "ok" ? pill(t("dash.bk.rt.ok"), "ok") : null;
+  const left = h("div", "", null, [h("div", "t", t("dash.bk.rt.title")), h("div", "d", detail),
+                                   rt.message && rt.result !== "ok" ? h("div", "d", tr(rt.message)) : null]);
+  return h("div", "row", null, [left, h("div", "acts", null, [state, test])]);
+}
+
+const LOG_LEVEL_KIND = {emergency: "bad", alert: "bad", critical: "bad", error: "bad", warning: "warn"};
+const LOG_LEVEL_ID = {emergency: "dash.logs.lvl.emergency", alert: "dash.logs.lvl.alert", critical: "dash.logs.lvl.critical",
+                      error: "dash.logs.lvl.err", warning: "dash.logs.lvl.warn", notice: "dash.logs.lvl.notice",
+                      info: "dash.logs.lvl.info_one", debug: "dash.logs.lvl.debug"};
+let logServices = false, logSeq = 0, logTyping = null;
+function logServiceLabel(s) {
+  if (s === "all") return t("dash.logs.svc.all");
+  if (s === "forge") return t("dash.logs.svc.forge");
+  const name = s.replace(/\.service$/, "");
+  return name.endsWith("@*") ? t("dash.logs.svc.modes", {name: name.slice(0, -2)}) : name;
+}
+async function loadLogs() {
+  const box = $("#log-lines");
+  const seq = ++logSeq;
+  if (!box.childNodes.length) fill(box, [empty(t("dash.logs.reading"))]);
+  const d = await post("/api/dash/logs", {service: $("#log-service").value || "all", level: $("#log-level").value,
+                                          since: $("#log-since").value, search: $("#log-search").value.trim()});
+  if (seq !== logSeq) return;   // a newer request is on its way
+  if (!logServices && Array.isArray(d.services)) {
+    const sel = $("#log-service"), keep = sel.value;
+    sel.replaceChildren(...d.services.map(s => { const o = h("option", "", logServiceLabel(s)); o.value = s; return o; }));
+    sel.value = d.services.includes(keep) ? keep : "all";
+    logServices = true;
+  }
+  const notes = [];
+  const j = d.journals || {};
+  if (j.system && j.system.access === "none") notes.push(h("div", "loginfo", t("dash.logs.sys_none")));
+  if (j.system && j.system.access === "own") notes.push(h("div", "loginfo", t("dash.logs.sys_own")));
+  if (j.user && j.user.access === "none") notes.push(h("div", "loginfo", t("dash.logs.user_none")));
+  fill($("#log-access"), notes);
+  if (!d.ok) { fill(box, [errorLine(tr(d.error || d.output || ""))]); return; }
+  const lines = (d.entries || []).map(e => h("div", "logl", null, [
+    h("span", "when", new Date(e.ts * 1000).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false})),
+    h("span", "", null, [pill(t(LOG_LEVEL_ID[e.level] || "dash.logs.lvl.info_one"), LOG_LEVEL_KIND[e.level] || "")]),
+    h("span", "u mono", e.unit), h("span", "m mono", e.msg)]));
+  const head = h("div", "loginfo", tn("dash.logs.count", lines.length) + (d.cut ? " " + t("dash.logs.cut") : ""));
+  fill(box, lines.length ? [d.error ? errorLine(tr(d.error)) : null, head, ...lines] : [d.error ? errorLine(tr(d.error)) : null, empty(t("dash.logs.none"))]);
+}
+["#log-service", "#log-level", "#log-since"].forEach(s => { $(s).onchange = loadLogs; });
+$("#log-refresh").onclick = loadLogs;
+$("#log-search").oninput = () => { clearTimeout(logTyping); logTyping = setTimeout(loadLogs, 400); };
+$("#log-search").onkeydown = e => { if (e.key === "Enter") { clearTimeout(logTyping); loadLogs(); } };
+
+// ---------- Pages and polling ----------
+
+const LOADERS = {home: loadHome, agents: loadAgents, activity: loadActivity, updates: loadUpdates, backups: loadBackups,
+                 storage: loadStorage, sync: loadSync, vms: loadVms, hub: loadHub, diagnostics: loadDiagnostics, logs: loadLogs};
+let page = "home", metricTimer = null, slowTimer = null;
+function show() {
+  const want = (location.hash || "#home").slice(1);
+  page = Object.prototype.hasOwnProperty.call(LOADERS, want) ? want : "home";
+  document.querySelectorAll(".page").forEach(p => p.classList.toggle("on", p.id === "p-" + page));
+  document.querySelectorAll("#nav a").forEach(a => { if (a.dataset.page === page) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current"); });
+  LOADERS[page]();
+  schedule();
+}
+function schedule() {
+  clearInterval(metricTimer); clearInterval(slowTimer);
+  if (document.hidden) { liveState("paused", t("dash.paused")); return; }
+  if (page === "home") { pollMetrics(); metricTimer = setInterval(pollMetrics, 4000); }
+  else liveState("paused", t("dash.paused"));
+  slowTimer = setInterval(() => { if (!document.hidden && !$("#confirm").open) LOADERS[page](); }, page === "home" ? 60000 : page === "logs" ? 120000 : 30000);
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden && page === "home") LOADERS.home(); schedule(); });
+window.addEventListener("hashchange", show);
+// Keeps this page's server open while the tab is open, even when it is in the background.
+setInterval(() => fetch("/api/ping", {headers: H}).catch(() => {}), 30000);
+buildStrip();
+loadHistory().then(() => GAUGES.forEach(g => drawSpark(g)));
+show();
+if (page !== "home") loadHome();   // the PC name and the section flags come from the home data
+</script>
+</body>
+</html>

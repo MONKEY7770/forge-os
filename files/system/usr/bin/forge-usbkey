@@ -1,42 +1,89 @@
 #!/usr/bin/env python3
-"""forge-usbkey: unlock the encrypted Forge OS disk with a USB stick.
+"""forge-usbkey: unlock the encrypted Forge OS disk with one or more USB sticks.
 
-The USB stick needs:
-  - the drive name (label) set in Forge Settings (default FORGEKEY)
-  - a file called forge_key in its top folder, holding your secret text
+Every key stick needs the drive name (label) set in Forge Settings (default
+FORGEKEY), and a file called forge_key in its top folder. Each stick holds its
+own random key in its own slot, so one lost stick can be revoked on its own.
+Your normal password always keeps working.
 
-At boot, Forge OS waits a few seconds for that USB. If it's there, the disk
-unlocks by itself. If not, you type your normal password, which always works.
+  sudo forge-usbkey create NAME   put a new random key on a plugged-in stick and add it
+  sudo forge-usbkey add NAME      add a stick that already has a forge_key file
+  sudo forge-usbkey adopt NAME    give a name to a key slot the plugged-in stick already opens
+  sudo forge-usbkey list          show every USB key (works without the sticks)
+  sudo forge-usbkey audit         show every key slot, and check the plugged-in stick
+  sudo forge-usbkey test          check which key the plugged-in stick opens
+  sudo forge-usbkey revoke NAME   disable one stick, for example a lost one
+  sudo forge-usbkey remove        disable every USB key and turn USB unlock off
+  sudo forge-usbkey cleanup       delete leftover names whose key slot is already gone
+  sudo forge-usbkey forget NAME   drop an unclear record of an interrupted add (never removes a key)
+  sudo forge-usbkey status        show the current setup
 
-  sudo forge-usbkey setup    add the USB file as an extra unlock key
-  sudo forge-usbkey status   show whether USB unlock is set up
-  sudo forge-usbkey test     check the USB file opens the disk (changes nothing)
-  sudo forge-usbkey remove   stop using the USB (password still works)
-
-Important: the key is the file's exact contents. If you edit or re-save
-forge_key, it stops matching. Run setup again after any change.
+NAME is your own label for the stick, like home, backup or travel.
+Plug in one key stick at a time. If the stick is open in the file manager,
+eject it there first (don't unplug it). If you edit or re-save a stick's
+forge_key file it stops matching; revoke it and add it again.
 """
+import contextlib
+import fcntl
+import getpass
+import glob
 import json
 import os
+import re
+import secrets
+import signal
+import stat
+import string
 import subprocess
 import sys
 import tempfile
+import time
 
-sys.path.insert(0, "/usr/lib/forge")
+sys.path.insert(0, os.environ.get("FORGE_LIB", "/usr/lib/forge"))
 import forgecfg  # noqa: E402
 
-CRYPTTAB = "/etc/crypttab"
+CRYPTTAB = os.environ.get("FORGE_CRYPTTAB", "/etc/crypttab")
+USB_DIR = os.environ.get("FORGE_USB_DIR")           # tests only: use this folder as the stick
+TEST_KEYFILE = os.environ.get("FORGE_TEST_EXISTING_KEYFILE")  # tests only: stands in for typing the password
 KEY_NAME = "forge_key"
+TOKEN_TYPE = "forge-usbkey"
+SLOT_RE = re.compile(r"[0-9]{1,2}")
+# Root-only temporary files live on tmpfs (/run), so a key copy never reaches the disk.
+TMP_DIR = "/run" if os.geteuid() == 0 and os.path.isdir("/run") else None
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]{0,31}$")
+KEY_MIN, KEY_MAX = 16, 8192
+STICK_FSTYPES = ("vfat", "exfat")
+# Never use these as a key stick, even if they carry the right drive name.
+BAD_TYPES = {"loop", "rom", "crypt", "lvm", "dm", "mpath", "md"}
+BAD_PREFIXES = ("/dev/loop", "/dev/dm-", "/dev/md", "/dev/sr", "/dev/mapper/", "/dev/zram",
+                "/dev/nbd", "/dev/ram")
+CRITICAL_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+# Only one forge-usbkey may change the disk at a time.
+LOCK_PATH = "/run/forge-usbkey.lock" if CRYPTTAB == "/etc/crypttab" else CRYPTTAB + ".lock"
 
 
-def die(msg, code=1):
-    print(msg, file=sys.stderr)
-    sys.exit(code)
+class Fail(Exception):
+    pass
 
 
-def luks_devices():
-    """Encrypted volumes listed in /etc/crypttab: (name, device path)."""
+class NoStick(Fail):
+    pass
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, **kw)
+
+
+# Encrypted volumes and their LUKS metadata
+
+# Volumes whose LUKS header is kept elsewhere (crypttab header= option). forge-usbkey does not
+# manage those, so they count as unchecked: never skipped quietly.
+DETACHED = []
+
+
+def crypttab_entries():
     out = []
+    DETACHED.clear()
     try:
         with open(CRYPTTAB) as f:
             for line in f:
@@ -44,51 +91,931 @@ def luks_devices():
                 if len(parts) < 2 or parts[0].startswith("#"):
                     continue
                 dev = parts[1]
-                if dev.startswith("UUID="):
-                    dev = "/dev/disk/by-uuid/" + dev[5:]
+                for prefix, folder in (("UUID=", "by-uuid"), ("PARTUUID=", "by-partuuid"),
+                                       ("LABEL=", "by-label"), ("PARTLABEL=", "by-partlabel")):
+                    if dev.startswith(prefix):
+                        dev = f"/dev/disk/{folder}/" + dev[len(prefix):]
+                        break
+                opts = parts[3].split(",") if len(parts) > 3 else []
+                if any(o.startswith("header=") for o in opts):
+                    DETACHED.append(parts[0])
+                    continue
                 out.append((parts[0], dev))
     except FileNotFoundError:
         pass
     return out
 
 
-def find_usb(label):
-    """Return (key file path, temp mount dir or None)."""
-    dev = os.path.realpath(f"/dev/disk/by-label/{label}")
-    if not os.path.exists(f"/dev/disk/by-label/{label}"):
-        die(f"No drive named {label} found. Plug in the USB stick and check its drive name.")
-    with open("/proc/mounts") as f:
-        for line in f:
-            src, mnt = line.split()[:2]
-            if os.path.realpath(src) == dev:
-                return os.path.join(mnt.replace("\\040", " "), KEY_NAME), None
-    tmp = tempfile.mkdtemp(prefix="forge-usbkey-")
-    if subprocess.run(["mount", "-o", "ro", dev, tmp]).returncode != 0:
+# Volumes in crypttab that may hold USB keys but could not be read (unplugged, read errors).
+# While any exist, nothing may be reported as fully revoked, and no keys are added.
+MISSING = []
+
+
+def unchecked_note():
+    """Why a revoke can't be called complete: unreadable volumes and detached-header volumes."""
+    parts = []
+    if MISSING:
+        parts.append(f"{', '.join(MISSING)} (not connected or unreadable: connect it and run this again)")
+    if DETACHED:
+        parts.append(f"{', '.join(DETACHED)} (detached header, not managed by forge-usbkey: check its key "
+                     "slots with cryptsetup luksDump --header ...)")
+    return "; ".join(parts)
+
+
+def may_hold_keys(dev):
+    """For a volume that could not be read: could it be a LUKS2 disk (with USB keys) we just can't see?"""
+    if not os.path.exists(dev):
+        return True                      # unplugged, or not there right now
+    try:
+        mode = os.stat(dev).st_mode
+    except OSError:
+        return True
+    if not (stat.S_ISBLK(mode) or stat.S_ISREG(mode)):
+        return False                     # /dev/null, /dev/urandom...: never a LUKS2 disk
+    rc = run(["cryptsetup", "isLuks", "--type", "luks2", dev], capture_output=True).returncode
+    if rc != 1:
+        return True                      # can't tell
+    # cryptsetup also answers 1 for read errors and empty devices (a card reader with no card),
+    # so look for ourselves: only a full, clean read without a LUKS header means "not a LUKS disk".
+    try:
+        fd = os.open(dev, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            head = os.read(fd, 4096)
+        finally:
+            os.close(fd)
+    except OSError:
+        return True
+    if len(head) < 4096:
+        return True
+    luks1 = head[:6] == b"LUKS\xba\xbe" and head[6:8] == b"\x00\x01"
+    if head[:6] in (b"LUKS\xba\xbe", b"SKUL\xba\xbe") and not luks1:
+        return True
+    if backup_header_found(dev):
+        return True          # a LUKS2 backup header survives (even under a LUKS1 header): can't rule it out
+    if luks1:
+        # A LUKS1 header (same magic, version 1): no tokens, never managed here. Confirm with cryptsetup.
+        if run(["cryptsetup", "isLuks", "--type", "luks1", dev], capture_output=True).returncode == 0:
+            print(f"Note: {dev} is LUKS1. USB keys are not managed there.", file=sys.stderr)
+            return False
+        return True
+    return False
+
+
+def backup_header_found(dev):
+    """True if a LUKS2 backup header is there, or its places can't be read."""
+    # A wiped primary header can still be recovered from LUKS2's backup header, which sits at
+    # 16 KiB, 32 KiB ... 4 MiB depending on the header size. Any read error there: can't tell.
+    try:
+        fd = os.open(dev, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            size = os.lseek(fd, 0, os.SEEK_END)
+            for i in range(9):
+                off = 0x4000 << i
+                if off + 6 > size:
+                    break
+                magic = os.pread(fd, 6, off)
+                if len(magic) < 6 or magic == b"SKUL\xba\xbe":
+                    return True
+        finally:
+            os.close(fd)
+    except OSError:
+        return True
+    return False
+
+
+def luks_devices():
+    """Volumes USB keys can be managed on. Others (swap, LUKS1, unplugged drives) are skipped, out loud."""
+    out, seen = [], set()
+    MISSING.clear()
+    entries = crypttab_entries()
+    for vol in DETACHED:
+        print(f"Warning: {vol} keeps its LUKS header elsewhere (header= in crypttab). forge-usbkey never adds "
+              "USB keys there and can't check it; manage keys on it with cryptsetup.", file=sys.stderr)
+    for vol, dev in entries:
+        real = os.path.realpath(dev)
+        if real in seen:
+            print(f"Note: {vol} is the same disk as another line in crypttab, so it is handled once.",
+                  file=sys.stderr)
+            continue
+        try:
+            metadata(dev)
+        except Fail:
+            if may_hold_keys(dev):
+                MISSING.append(vol)
+                print(f"Warning: {vol} ({dev}) is not connected or can't be read right now. "
+                      "Its USB keys can't be checked or changed.", file=sys.stderr)
+            else:
+                print(f"Note: skipping {vol} ({dev}): it is not a LUKS2 volume.", file=sys.stderr)
+            continue
+        seen.add(real)
+        out.append((vol, dev))
+    return out
+
+
+def metadata(dev):
+    r = run(["cryptsetup", "luksDump", "--dump-json-metadata", dev], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Fail(f"{dev} is not a LUKS2 encrypted volume, so USB keys can't be managed on it.")
+    try:
+        meta = json.loads(r.stdout)
+        if not isinstance(meta, dict):
+            raise ValueError("not an object")
+        return meta
+    except ValueError:
+        raise Fail(f"Could not read the encryption details of {dev}.") from None
+
+
+def keyslots(dev):
+    return {int(k) for k in metadata(dev).get("keyslots", {})}
+
+
+def epoch(dev):
+    """The LUKS2 header's change counter. Every metadata write adds 1; reads don't change it."""
+    r = run(["cryptsetup", "luksDump", dev], capture_output=True, text=True)
+    m = re.search(r"^Epoch:\s*(\d+)", r.stdout or "", re.M)
+    if r.returncode != 0 or not m:
+        raise Fail(f"Could not read the encryption details of {dev}.")
+    return int(m.group(1))
+
+
+def all_tokens(dev):
+    """Every forge-usbkey record, including leftovers.
+
+    An add first writes a "pending" record (pending_slot N, no key slots, and the change counter
+    the disk will have right after our own key is added), then adds the key slot, then swaps the
+    record for the final one. If the add is killed half way, the pending record is:
+      unfinished: slot N exists and nothing else changed the disk since, so it is our stick's key
+      unclear:    slot N exists but the disk changed since, so N may be a key added another way
+      stale:      slot N does not exist (or belongs to something else): a harmless leftover
+    """
+    meta = metadata(dev)
+    slots = {int(k) for k in meta.get("keyslots", {})}
+    raw, bound_any = [], set()
+    for tid, tok in meta.get("tokens", {}).items():
+        mine = tok.get("type") == TOKEN_TYPE
+        live = [int(s) for s in tok.get("keyslots", []) if SLOT_RE.fullmatch(str(s)) and int(s) in slots]
+        bound_any.update(live)
+        if mine:
+            raw.append((int(tid), tok, live))
+    now = None
+    out = []
+    for tid, tok, live in raw:
+        rec = {"token_id": tid, "slot": live[0] if live else None, "name": str(tok.get("name", "?")),
+               "added": str(tok.get("added", "?")), "orphan": not live, "pending": None}
+        pend, want = str(tok.get("pending_slot", "")), str(tok.get("epoch_after_add", ""))
+        if tok.get("abandoned"):
+            rec["pending"] = "stale"      # a failed add's leftover: names no slot, swept like stale ones
+        elif not live and SLOT_RE.fullmatch(pend):
+            n = int(pend)
+            if n not in slots or n in bound_any:
+                rec["pending"] = "stale"
+            else:
+                if now is None:
+                    now = epoch(dev)
+                certain = re.fullmatch(r"[0-9]{1,12}", want) is not None and int(want) == now
+                rec.update(slot=n, orphan=False, pending="unfinished" if certain else "unclear")
+        out.append(rec)
+    return out
+
+
+def usb_tokens(dev):
+    """Our USB key records that point to a real key slot (unfinished adds included)."""
+    return [t for t in all_tokens(dev) if not t["orphan"]]
+
+
+def unfinished(dev):
+    """Records of interrupted adds whose key slot exists (unfinished or unclear)."""
+    return [t for t in usb_tokens(dev) if t["pending"]]
+
+
+def bound_slots(dev):
+    """Key slots that belong to any token at all (USB keys, TPM2, FIDO2, recovery keys...)."""
+    meta = metadata(dev)
+    out = set()
+    for tok in meta.get("tokens", {}).values():
+        out.update(int(s) for s in tok.get("keyslots", []) if SLOT_RE.fullmatch(str(s)))
+    return out
+
+
+def finish_unfinished(devs):
+    """An unfinished add is certainly this tool's key (nothing else changed the disk since).
+    Record it properly before doing anything else, because any later write would make it unclear."""
+    for vol, dev in devs:
+        for t in unfinished(dev):
+            if t["pending"] != "unfinished":
+                continue
+            with no_interrupts():
+                if not write_token(dev, t["token_id"], token_for(t["slot"], t["name"]), replace=True):
+                    raise Fail(f"{vol}: could not finish the record of the interrupted add '{t['name']}'. "
+                               "Nothing else was changed. Try again.")
+            print(f"{vol}: finished recording the interrupted add of USB key '{t['name']}' (key slot {t['slot']}).")
+
+
+def sweep_stale(devs):
+    """Delete leftover records of interrupted adds whose key slot never appeared (harmless)."""
+    for vol, dev in devs:
+        for t in all_tokens(dev):
+            if t["pending"] == "stale" and remove_token(dev, t["token_id"]):
+                print(f"{vol}: removed the leftover record of an interrupted add ('{t['name']}').")
+    # Key copies left behind by a killed run.
+    for folder in glob.glob(os.path.join(TMP_DIR or tempfile.gettempdir(), "forge-usbkey-key-*")):
+        m = re.match(r"forge-usbkey-key-(\d+)-", os.path.basename(folder))
+        if m:
+            try:
+                os.kill(int(m.group(1)), 0)
+                continue            # that run is still going
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                continue
+        wipe(os.path.join(folder, "key"))
+        with contextlib.suppress(OSError):
+            os.rmdir(folder)
+
+
+def read_password(vol, why):
+    """The current disk password, typed by you (tests read it from a file)."""
+    if TEST_KEYFILE:
+        with open(TEST_KEYFILE, "rb") as f:
+            return f.read()
+    pw = getpass.getpass(f"{vol}: enter your current disk password to {why}: ").encode()
+    if not pw:
+        raise Fail("No password typed. Nothing was changed.")
+    return pw
+
+
+def password_slot(dev, pw):
+    ok, r = checked(["cryptsetup", "open", "--test-passphrase", "-v", "--key-file", "-", dev], input=pw)
+    if not ok:
+        return None
+    m = re.search(rb"Key slot (\d+) unlocked", (r.stdout or b"") + (r.stderr or b""))
+    return int(m.group(1)) if m else -1
+
+
+def password_opens(dev, pw, slot):
+    return checked(["cryptsetup", "open", "--test-passphrase", "--key-slot", str(slot), "--key-file", "-", dev],
+                   input=pw)[0]
+
+
+def free_token_id(dev):
+    used = {int(t) for t in metadata(dev).get("tokens", {})}
+    for t in range(32):
+        if t not in used:
+            return t
+    raise Fail("No free record slots left on the disk (LUKS2 allows 32).")
+
+
+def free_slot(dev):
+    used = keyslots(dev)
+    for s in range(32):
+        if s not in used:
+            return s
+    raise Fail("No free key slots left on the disk (LUKS2 allows 32).")
+
+
+def checked(cmd, **kw):
+    """Run a cryptsetup key check. True: the key opens. False: it does not (exit code 2).
+    Any other error (for example not enough memory) is NOT read as "no": it stops the command."""
+    r = run(cmd, capture_output=True, **kw)
+    if r.returncode in (0, 2):
+        return r.returncode == 0, r
+    raise Fail(f"cryptsetup could not check the key (error {r.returncode}, for example not enough memory). "
+               "Stopped here to be safe; nothing more was changed.")
+
+
+def opens(dev, keyfile, slot=None):
+    cmd = ["cryptsetup", "open", "--test-passphrase", "--key-file", keyfile]
+    if slot is not None:
+        cmd += ["--key-slot", str(slot)]
+    return checked(cmd + [dev])[0]
+
+
+def slot_opened_by(dev, keyfile):
+    """The key slot this key file opens, or None."""
+    ok, r = checked(["cryptsetup", "open", "--test-passphrase", "-v", "--key-file", keyfile, dev], text=True)
+    if not ok:
+        return None
+    m = re.search(r"Key slot (\d+) unlocked", (r.stdout or "") + (r.stderr or ""))
+    if m:
+        return int(m.group(1))
+    for s in sorted(keyslots(dev)):
+        if opens(dev, keyfile, s):
+            return s
+    return None
+
+
+@contextlib.contextmanager
+def only_one_run():
+    """Two forge-usbkey runs at once could pick the same key slot or name."""
+    try:
+        fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as e:
+        raise Fail(f"Could not open the lock file {LOCK_PATH} ({e.strerror}). Nothing was changed.") from None
+    try:
+        wait = float(os.environ.get("FORGE_USBKEY_LOCK_WAIT", "10"))
+        end = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= end:
+                    raise Fail("Another forge-usbkey is running. Finish that one first, then try again.") from None
+                time.sleep(0.2)
+        yield
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def no_interrupts():
+    """Ctrl-C, kill or a closed terminal can't stop us half way."""
+    old = {s: signal.signal(s, signal.SIG_IGN) for s in CRITICAL_SIGNALS}
+    try:
+        yield
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
+
+
+def default_signals():
+    # Lets you cancel the password prompt itself with Ctrl-C.
+    for s in CRITICAL_SIGNALS:
+        signal.signal(s, signal.SIG_DFL)
+
+
+# The USB stick
+
+def lsblk_json():
+    r = run(["lsblk", "--json", "--paths", "-o", "NAME,LABEL,TYPE,TRAN,RM,HOTPLUG,FSTYPE,PKNAME,MOUNTPOINTS"],
+            capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Fail("Could not list the drives (lsblk failed).")
+    return json.loads(r.stdout)
+
+
+def _flag(v):
+    return v is True or str(v).strip().lower() in ("1", "true")
+
+
+def _flatten(devs, out):
+    for d in devs or []:
+        out.append(d)
+        _flatten(d.get("children"), out)
+    return out
+
+
+def _usable_stick(d, by_name):
+    if d.get("type") not in ("part", "disk") or d.get("fstype") not in STICK_FSTYPES:
+        return False
+    chain = [d]
+    if d.get("type") == "part":
+        parent = by_name.get(d.get("pkname"))
+        if not parent or parent.get("type") != "disk":
+            return False
+        chain.append(parent)
+    for x in chain:
+        name = str(x.get("name") or "")
+        if x.get("type") in BAD_TYPES or name.startswith(BAD_PREFIXES):
+            return False
+    usb = any(x.get("tran") == "usb" for x in chain)
+    removable = any(_flag(x.get("rm")) or _flag(x.get("hotplug")) for x in chain)
+    return usb and removable
+
+
+def select_stick(label, data):
+    """Pick the one removable USB drive called label from an lsblk listing."""
+    flat = _flatten(data.get("blockdevices"), [])
+    by_name = {}
+    for d in flat:
+        by_name.setdefault(d.get("name"), d)
+    named = [d for n, d in by_name.items() if d.get("label") == label]
+    if not named:
+        raise NoStick(f"No drive named {label} found. Plug in the key stick and check its drive name.")
+    if len(named) > 1:
+        raise Fail(f"More than one drive is named {label}. Plug in only one key stick at a time, "
+                   "and make sure no other drive uses that name.")
+    if not _usable_stick(named[0], by_name):
+        raise Fail(f"A drive named {label} was found, but it is not a removable USB stick with a FAT or "
+                   "exFAT file system, so it won't be used.")
+    return named[0]
+
+
+def find_usb(label, writable=False):
+    """Return (stick folder, temp mount or None)."""
+    if USB_DIR:
+        if not os.path.isdir(USB_DIR):
+            raise NoStick(f"No drive named {label} found. Plug in the key stick and check its drive name.")
+        return USB_DIR, None
+    d = select_stick(label, lsblk_json())
+    if any(m for m in (d.get("mountpoints") or [])):
+        raise Fail(f"The key stick {label} is already open. Eject it in the file manager first "
+                   "(don't unplug it), then run this again.")
+    # The mount goes inside a root-only folder, and the stick's files are root-only too,
+    # so other users can't read the key while it is mounted.
+    parent = tempfile.mkdtemp(prefix="forge-usbkey-")
+    tmp = os.path.join(parent, "stick")
+    os.mkdir(tmp, 0o700)
+    opts = ("rw" if writable else "ro") + ",nosuid,nodev,noexec,noatime,uid=0,gid=0,umask=077"
+    r = run(["mount", "-t", d["fstype"], "-o", opts, d["name"], tmp], capture_output=True, text=True)
+    if r.returncode != 0:
         os.rmdir(tmp)
-        die(f"Could not open the USB drive {label}.")
-    return os.path.join(tmp, KEY_NAME), tmp
+        os.rmdir(parent)
+        if "busy" in (r.stderr or "") or "already mounted" in (r.stderr or ""):
+            raise Fail(f"The key stick {label} is in use. Eject it in the file manager first "
+                       "(don't unplug it), then run this again.")
+        raise Fail(f"Could not open the USB drive {label}.")
+    return tmp, tmp
 
 
 def release(tmp):
     if tmp:
-        subprocess.run(["umount", tmp])
+        if run(["umount", tmp]).returncode != 0:
+            print(f"Warning: could not unmount the key stick from {tmp}.", file=sys.stderr)
+            return
         os.rmdir(tmp)
+        with contextlib.suppress(OSError):
+            os.rmdir(os.path.dirname(tmp))
 
 
-def check_key_file(path):
-    if not os.path.isfile(path):
-        die(f"The USB has no file called {KEY_NAME} in its top folder.")
-    data = open(path, "rb").read()
-    if len(data) < 16:
-        die(f"{KEY_NAME} is too short. Use at least 16 characters (64 random ones is best).")
-    if data.endswith(b"\n"):
-        print("Note: forge_key ends with a line break. That's fine, it becomes part of the key.")
+def read_key_file(folder):
+    """Read the key once through a checked file handle and return its bytes."""
+    path = os.path.join(folder, KEY_NAME)
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        raise Fail(f"The stick has no file called {KEY_NAME} in its top folder.")
+    except OSError:
+        raise Fail(f"{KEY_NAME} on the stick is not a normal file (a link or special file). Not using it.")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Fail(f"{KEY_NAME} on the stick is not a normal file. Not using it.")
+        if st.st_size < KEY_MIN:
+            raise Fail(f"{KEY_NAME} is too short. Use at least 16 characters (create makes 64 random ones).")
+        if st.st_size > KEY_MAX:
+            raise Fail(f"{KEY_NAME} is larger than 8 KB. That doesn't look like a key file.")
+        data = b""
+        while len(data) <= KEY_MAX:
+            chunk = os.read(fd, KEY_MAX + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(fd)
+    if len(data) != st.st_size or not KEY_MIN <= len(data) <= KEY_MAX:
+        raise Fail(f"{KEY_NAME} changed while it was being read. Try again.")
+    return data
 
 
-def opens(dev, keyfile):
-    r = subprocess.run(["cryptsetup", "open", "--test-passphrase", "--key-file", keyfile, dev],
-                       capture_output=True)
-    return r.returncode == 0
+def wipe(path):
+    """Overwrite a file with zeros, then delete it."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_NOFOLLOW)
+        try:
+            os.write(fd, b"\0" * os.fstat(fd).st_size)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(path)
+
+
+@contextlib.contextmanager
+def private_key_copy(data):
+    """A root-only copy of the key, so later changes on the stick can't change what is used."""
+    folder = tempfile.mkdtemp(prefix=f"forge-usbkey-key-{os.getpid()}-", dir=TMP_DIR)
+    path = os.path.join(folder, "key")
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        yield path
+    finally:
+        wipe(path)
+        os.rmdir(folder)
+
+
+def stick_key(label, create=False):
+    """Read (or for create, first write) the stick's key. The stick is unmounted again before returning."""
+    folder, tmp = find_usb(label, writable=create)
+    try:
+        if create:
+            path = os.path.join(folder, KEY_NAME)
+            if os.path.lexists(path):
+                raise Fail(f"This stick already has a {KEY_NAME} file. Use 'add' for it, "
+                           "or use a different stick.")
+            key = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(64))
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(key)
+                f.flush()
+                os.fsync(f.fileno())
+            print(f"Wrote a new random key to the stick ({KEY_NAME}).")
+            data = read_key_file(folder)
+            if data != key.encode():
+                raise Fail(f"{KEY_NAME} on the stick doesn't read back correctly. Not adding it.")
+            return data
+        return read_key_file(folder)
+    finally:
+        release(tmp)
+
+
+def check_name(name, devs, must_be_new=True):
+    if not NAME_RE.match(name or ""):
+        raise Fail("Name must be 1 to 32 letters, numbers, spaces, - or _, starting with a letter or number.")
+    taken = {t["name"].lower() for _, dev in devs for t in usb_tokens(dev)}
+    if must_be_new and name.lower() in taken:
+        raise Fail(f"A USB key called {name} already exists. Pick another name, or revoke the old one first.")
+
+
+# Actions
+
+def write_token(dev, token_id, token, replace=False):
+    """Write one forge-usbkey record. True only if it is really there. Never raises."""
+    try:
+        folder = tempfile.mkdtemp(prefix="forge-usbkey-tok-")
+        tok_path = os.path.join(folder, "token.json")
+        try:
+            with open(tok_path, "w") as f:
+                json.dump(token, f)
+            cmd = ["cryptsetup", "token", "import", "--token-id", str(token_id)]
+            if replace:
+                cmd.append("--token-replace")
+            r = run(cmd + ["--json-file", tok_path, dev], capture_output=True, text=True)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tok_path)
+            os.rmdir(folder)
+        if r.returncode != 0:
+            return False
+        got = metadata(dev).get("tokens", {}).get(str(token_id), {})
+        return all(got.get(k) == v for k, v in token.items())
+    except Exception:  # noqa: BLE001 (any surprise here means "not recorded")
+        return False
+
+
+def remove_token(dev, token_id, expect=None):
+    """Delete a record. With expect (a name), only if the record at that id is really ours."""
+    if expect is not None:
+        try:
+            tok = metadata(dev).get("tokens", {}).get(str(token_id), {})
+        except Exception:  # noqa: BLE001
+            return False
+        if tok.get("type") != TOKEN_TYPE or tok.get("name") != expect:
+            return False
+    try:
+        return run(["cryptsetup", "token", "remove", "--token-id", str(token_id), dev],
+                   capture_output=True, text=True).returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def token_for(slot, name, epoch_after_add=None):
+    tok = {"type": TOKEN_TYPE, "name": name, "added": time.strftime("%Y-%m-%d")}
+    if epoch_after_add is not None:
+        tok.update(keyslots=[], pending_slot=str(slot), epoch_after_add=str(epoch_after_add))
+    else:
+        tok["keyslots"] = [str(slot)]
+    return tok
+
+
+def slot_active(dev, slot):
+    """True or False, or None if the disk could not be read."""
+    try:
+        return slot in keyslots(dev)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def undo_new_slot(vol, dev, keyfile, slot, token_id, name):
+    """Remove a just-added slot using the new key itself (no password needed), then check it is gone."""
+    with contextlib.suppress(Exception):
+        run(["cryptsetup", "luksRemoveKey", dev, keyfile], capture_output=True)
+    if slot_active(dev, slot) is False:
+        remove_token(dev, token_id)   # if this fails, the record is stale and is swept on the next run
+        raise Fail("Could not record the USB key's name, so it was removed again. Nothing was changed.")
+    raise Fail(f"WARNING: could not finish recording the USB key '{name}' AND could not remove it again.\n"
+               f"Key slot {slot} on {vol} is STILL ACTIVE: this stick still unlocks the disk.\n"
+               f"It is listed as an UNFINISHED USB key '{name}'. Fix it now: sudo forge-usbkey adopt {name} "
+               f"(with this stick plugged in), or: sudo forge-usbkey revoke {name}")
+
+
+def only_password_left(dev, slot):
+    """True if every other key slot belongs to a token (USB key, TPM2, FIDO2...), so this slot,
+    which has none, must be the typed password."""
+    taken = bound_slots(dev) | {t["slot"] for t in unfinished(dev)}
+    return not (keyslots(dev) - taken - {slot})
+
+
+def fix_hint(t):
+    if t["pending"] == "unfinished":
+        return (f"plug that stick in and run: sudo forge-usbkey adopt {t['name']}\n"
+                f"or, if the stick is lost: sudo forge-usbkey revoke {t['name']}")
+    return (f"plug that stick in and run: sudo forge-usbkey adopt {t['name']}\n"
+            f"The disk changed after that add, so key slot {t['slot']} may be a password or key you added "
+            f"another way. If so: sudo forge-usbkey forget {t['name']}")
+
+
+def plan_add(devs, keyfile, name):
+    """Volumes that still need this key. Refuse anything unclear."""
+    todo = []
+    for vol, dev in devs:
+        for t in unfinished(dev):
+            raise Fail(f"{vol}: an earlier add of USB key '{t['name']}' was interrupted (key slot {t['slot']}). "
+                       "Sort that out first: " + fix_hint(t))
+        slot = slot_opened_by(dev, keyfile)
+        if slot is None:
+            todo.append((vol, dev))
+            continue
+        names = [t["name"] for t in usb_tokens(dev) if t["slot"] == slot]
+        if names and names[0].lower() == name.lower():
+            print(f"{vol}: this stick's key is already added as '{names[0]}'.")
+            continue
+        if names:
+            raise Fail(f"{vol}: this stick is a copy of the USB key '{names[0]}' (same forge_key). It can't "
+                       f"have a second name. Revoking '{names[0]}' would disable both sticks. Nothing was changed.\n"
+                       "To give it its own key instead, use a stick without forge_key: sudo forge-usbkey create NAME")
+        if only_password_left(dev, slot):
+            raise Fail(f"{vol}: this stick's forge_key is the same as your disk password. It will not be added "
+                       "as a USB key, because revoking it later would remove your password. Nothing was changed.\n"
+                       "Delete forge_key from the stick, then use: sudo forge-usbkey create NAME")
+        raise Fail(f"{vol}: this stick already unlocks the disk (key slot {slot}), but that slot has no "
+                   "name, so list and revoke can't see it. Nothing was changed.\n"
+                   "Give it a name with: sudo forge-usbkey adopt NAME")
+    return todo
+
+
+def abandon_record(vol, dev, token_id, name):
+    """Drop our pending record after a failure before the key was added. If it can't be dropped,
+    make it unclear, so it can never be revoked or finished without the stick."""
+    if remove_token(dev, token_id, expect=name):
+        return ""
+    try:
+        tok = metadata(dev).get("tokens", {}).get(str(token_id), {})
+        if tok.get("type") != TOKEN_TYPE or tok.get("name") != name:
+            return ""   # our record was never written there (it may be another tool's): leave it alone
+    except Exception:  # noqa: BLE001
+        pass
+    marker = {"type": TOKEN_TYPE, "name": name, "keyslots": [], "pending_slot": "none", "abandoned": "1"}
+    if write_token(dev, token_id, marker, replace=True):
+        return f" A leftover record '{name}' remains (it names no key slot); it is removed on the next run."
+    print(f"WARNING: {vol}: a leftover record '{name}' (record id {token_id}) could not be removed or marked. "
+          "Check with: sudo forge-usbkey audit", file=sys.stderr)
+    return " A leftover record remains (see the warning)."
+
+
+def add_key(devs, keyfile, name):
+    added = []
+    for vol, dev in plan_add(devs, keyfile, name):
+        # Check the password first, so nothing is written for a wrong one, and so nothing
+        # interactive happens between writing the record and adding the key.
+        pw = read_password(vol, f"add the USB key '{name}'")
+        if password_slot(dev, pw) is None:
+            raise Fail(f"{vol}: wrong password. Nothing was changed.")
+        slot, token_id = free_slot(dev), free_token_id(dev)
+        with no_interrupts():
+            # 1. Write down what is about to happen, so even a hard kill leaves a record.
+            #    Any failure before the key is added drops (or neutralises) that record.
+            before = epoch(dev)
+            written = False
+            try:
+                written = write_token(dev, token_id, token_for(slot, name, epoch_after_add=before + 2))
+                if not written:
+                    raise Fail("could not write the USB key record")
+                if epoch(dev) != before + 1:
+                    raise Fail("something else changed the disk at the same moment")
+            except Exception as e:  # noqa: BLE001
+                left = abandon_record(vol, dev, token_id, name)
+                why = str(e).rstrip(".") if isinstance(e, Fail) else "an unexpected error"
+                raise Fail(f"{vol}: {why}. No key was added.{left} Try again.") from None
+            # 2. Add the key. The password goes in on stdin: no prompt in this window.
+            try:
+                rc = run(["cryptsetup", "luksAddKey", "--key-slot", str(slot), "--key-file", "-", dev, keyfile],
+                         input=pw, capture_output=True).returncode
+            except Exception:  # noqa: BLE001
+                rc = None
+            # 3. Trust the disk, not the exit code: is the slot there, and is it ours?
+            active = slot_active(dev, slot)
+            if active is False:
+                left = abandon_record(vol, dev, token_id, name)
+                raise Fail(f"{vol}: could not add the USB key. No key was added.{left}")
+            try:
+                stick_ok = opens(dev, keyfile, slot)
+            except Exception:  # noqa: BLE001
+                stick_ok = None   # could not tell
+            try:
+                clean_add = rc == 0 and epoch(dev) == before + 2   # our add was the only change
+            except Exception:  # noqa: BLE001
+                clean_add = None
+            if stick_ok is True or (stick_ok is None and active is True and clean_add is True):
+                pass   # ours
+            elif stick_ok is False and clean_add is not True:
+                # Something else took that slot first: it is not ours, so drop our record.
+                left = abandon_record(vol, dev, token_id, name)
+                raise Fail(f"{vol}: key slot {slot} was taken by something else at the same moment. "
+                           f"No key was added.{left} Try again.")
+            elif stick_ok is False or active is None or clean_add is None:
+                # Contradictory or unreadable: keep the pending record as it is. Its change counter
+                # decides later whether it is certainly ours (finished on the next run) or unclear.
+                raise Fail(f"{vol}: key slot {slot} may now hold this stick's key, but it could not be confirmed. "
+                           f"It is listed as an interrupted add of '{name}'. Check it: sudo forge-usbkey audit "
+                           "(with the stick plugged in)")
+            else:
+                # The slot exists, the stick check could not run, and the disk changed in other ways.
+                left = "" if write_token(dev, token_id, dict(token_for(slot, name, epoch_after_add=0),
+                                                             epoch_after_add=""), replace=True) else \
+                    " (its record could not be marked unclear: check with audit)"
+                raise Fail(f"{vol}: key slot {slot} exists now, but it could not be confirmed as this stick's key. "
+                           f"It is listed as an unclear add of '{name}'{left}. Check it: sudo forge-usbkey audit "
+                           "(with the stick plugged in)")
+            # 4. Swap the pending record for the final one in one step.
+            if not write_token(dev, token_id, token_for(slot, name), replace=True):
+                undo_new_slot(vol, dev, keyfile, slot, token_id, name)
+        added.append(vol)
+        if not opens(dev, keyfile, slot):
+            raise Fail(f"{vol}: the USB key '{name}' was added and recorded (key slot {slot}), but checking that "
+                       f"the stick opens it failed. Run: sudo forge-usbkey test\n"
+                       f"If it still fails, remove it: sudo forge-usbkey revoke {name}")
+    return added
+
+
+def adopt(devs, keyfile, name):
+    """Name the key slot the plugged-in stick opens. Every volume is checked first, then written,
+    so a refusal on one volume never leaves the others half done. Returns the names used."""
+    plan = []   # (vol, dev, slot, action, record)
+    for vol, dev in devs:
+        slot = slot_opened_by(dev, keyfile)
+        if slot is None:
+            print(f"{vol}: this stick does NOT open this disk.")
+            continue
+        recs = [t for t in usb_tokens(dev) if t["slot"] == slot]
+        for t in unfinished(dev):
+            if t["name"].lower() == name.lower() and t["slot"] != slot:
+                raise Fail(f"{vol}: the unfinished add '{t['name']}' is key slot {t['slot']}, but this stick opens "
+                           f"key slot {slot}. This is not that stick. Nothing was changed.")
+        if recs and not recs[0]["pending"]:
+            if recs[0]["name"].lower() != name.lower():
+                raise Fail(f"{vol}: this stick is already the USB key '{recs[0]['name']}' (it may be a copy of it). "
+                           "Nothing was changed.")
+            plan.append((vol, dev, slot, "same", recs[0]))
+            continue
+        # Never name the password (or the last key that is not some token's) as a USB key.
+        if only_password_left(dev, slot):
+            raise Fail(f"{vol}: this stick's forge_key opens key slot {slot}, which is the same as your disk "
+                       "password. It will not be named as a USB key, because revoking it later would remove "
+                       "your password. Nothing was changed.")
+        if recs:
+            if recs[0]["name"].lower() != name.lower():
+                raise Fail(f"{vol}: this stick belongs to the interrupted add '{recs[0]['name']}'. "
+                           f"Run: sudo forge-usbkey adopt {recs[0]['name']}")
+            plan.append((vol, dev, slot, "finish", recs[0]))
+            continue
+        for ovol, odev in devs:
+            for t in usb_tokens(odev):
+                if t["name"].lower() == name.lower() and not opens(odev, keyfile, t["slot"]):
+                    raise Fail(f"{vol}: a USB key called {name} already exists on {ovol}, and this stick is not "
+                               "it. Pick another name. Nothing was changed.")
+        plan.append((vol, dev, slot, "name", None))
+    if not plan:
+        raise Fail("This stick doesn't open any encrypted disk here, so there is nothing to adopt.")
+    result = []
+    for vol, dev, slot, action, rec in plan:
+        if action == "same":
+            print(f"{vol}: key slot {slot} already has the name '{rec['name']}'.")
+            result.append(rec["name"])
+            continue
+        with no_interrupts():
+            if action == "finish":
+                if not write_token(dev, rec["token_id"], token_for(slot, rec["name"]), replace=True):
+                    raise Fail(f"{vol}: could not finish the record for '{rec['name']}'. It is still listed as "
+                               "unfinished.")
+                print(f"{vol}: finished the interrupted add. Key slot {slot} is the USB key '{rec['name']}'.")
+                result.append(rec["name"])
+                continue
+            token_id = free_token_id(dev)
+            if not write_token(dev, token_id, token_for(slot, name)):
+                raise Fail(f"{vol}: could not record the name for key slot {slot}. It still works but has no name.")
+        print(f"{vol}: key slot {slot} is now the USB key '{name}'.")
+        result.append(name)
+    return result
+
+
+def revoke(devs, name):
+    """Disable a key. Returns False if a leftover name record could not be deleted."""
+    found, clean = False, True
+    for vol, dev in devs:
+        for tok in usb_tokens(dev):
+            if tok["name"].lower() != name.lower():
+                continue
+            found = True
+            if tok["pending"] == "unclear":
+                clean = False
+                print(f"{vol}: NOT revoked: '{tok['name']}' is an interrupted add, and the disk changed after it, "
+                      f"so key slot {tok['slot']} may be a password or key you added another way. "
+                      + fix_hint(tok).replace("\n", " "), file=sys.stderr)
+                continue
+            if not keyslots(dev) - {tok["slot"]}:
+                raise Fail(f"'{tok['name']}' is the only way left to unlock {vol}. Not revoking it.")
+            pw = read_password(vol, f"revoke '{tok['name']}'")
+            if password_slot(dev, pw) is None:
+                raise Fail(f"{vol}: wrong password. '{tok['name']}' still works.")
+            # The password you just typed must not open the slot being removed: that slot would be
+            # a password, not a USB key, whatever its record says.
+            if password_opens(dev, pw, tok["slot"]):
+                raise Fail(f"{vol}: key slot {tok['slot']} opens with the password you typed, so it is a "
+                           f"password, not a USB key. Not revoking it. Its record '{tok['name']}' is wrong "
+                           f"(record id {tok['token_id']}); remove only the record with: "
+                           f"sudo cryptsetup token remove --token-id {tok['token_id']} {dev}")
+            r = run(["cryptsetup", "luksKillSlot", "--key-file", "-", dev, str(tok["slot"])],
+                    input=pw, capture_output=True)
+            if tok["slot"] in keyslots(dev):
+                raise Fail(f"Could not revoke '{tok['name']}' on {vol}. It still works.")
+            print(f"{vol}: USB key '{tok['name']}' revoked.")
+            if not remove_token(dev, tok["token_id"]):
+                clean = False
+                print(f"{vol}: the key no longer works, but its name record could not be deleted. "
+                      "Delete it with: sudo forge-usbkey cleanup", file=sys.stderr)
+    if not found:
+        if MISSING or DETACHED:
+            raise Fail(f"No USB key called {name} on the disks forge-usbkey can check. "
+                       f"NOT revoked on {unchecked_note()}. The stick may still open those.")
+        raise Fail(f"No USB key called {name}. See: sudo forge-usbkey list")
+    return clean
+
+
+def forget(devs, name):
+    """Drop the record of an interrupted add. Never removes a key slot."""
+    found = False
+    for vol, dev in devs:
+        for t in all_tokens(dev):
+            if t["name"].lower() != name.lower() or not t["pending"]:
+                continue
+            found = True
+            if t["pending"] == "unfinished":
+                raise Fail(f"{vol}: '{t['name']}' is certainly a USB key (key slot {t['slot']}), so dropping its "
+                           "record would hide a working key. Use: sudo forge-usbkey adopt " + t["name"] +
+                           " (with the stick), or revoke " + t["name"])
+            if not remove_token(dev, t["token_id"]):
+                raise Fail(f"{vol}: could not delete the record '{t['name']}'.")
+            if t["slot"] is not None:
+                print(f"{vol}: dropped the record '{t['name']}'. Key slot {t['slot']} was NOT removed: whatever "
+                      "opens it still works. Check with: sudo forge-usbkey audit")
+            else:
+                print(f"{vol}: dropped the leftover record '{t['name']}'.")
+    if not found:
+        raise Fail(f"No interrupted add called {name}. forget only drops records of interrupted adds. "
+                   "See: sudo forge-usbkey list")
+
+
+def cleanup(devs):
+    ok = True
+    for vol, dev in devs:
+        for t in all_tokens(dev):
+            if not t["orphan"]:
+                continue
+            r = run(["cryptsetup", "token", "remove", "--token-id", str(t["token_id"]), dev],
+                    capture_output=True, text=True)
+            if r.returncode != 0:
+                ok = False
+                print(f"{vol}: could not delete the leftover name '{t['name']}'.", file=sys.stderr)
+            else:
+                print(f"{vol}: deleted the leftover name '{t['name']}'.")
+    return ok
+
+
+def audit(devs, keyfile):
+    """Print every key slot. Returns False if the stick opens a slot with no name."""
+    ok = True
+    for vol, dev in devs:
+        toks = all_tokens(dev)
+        stick_slot = slot_opened_by(dev, keyfile) if keyfile else None
+        print(f"{vol}:")
+        for s in sorted(keyslots(dev)):
+            recs = [t for t in toks if t["slot"] == s]
+            mine = " (the plugged-in stick)" if s == stick_slot else ""
+            if recs and recs[0]["pending"]:
+                ok = False
+                state = "UNFINISHED" if recs[0]["pending"] == "unfinished" else "UNCLEAR (maybe not a USB key)"
+                print(f"  slot {s}: {state} add of USB key '{recs[0]['name']}'{mine}. Fix: " +
+                      fix_hint(recs[0]).replace("\n", " "))
+            elif recs:
+                print(f"  slot {s}: USB key '{recs[0]['name']}'{mine}")
+            elif s == stick_slot:
+                ok = False
+                print(f"  slot {s}: opened by the plugged-in stick but not registered. "
+                      "Fix: sudo forge-usbkey adopt NAME")
+            else:
+                print(f"  slot {s}: other (password or unknown)")
+        for t in toks:
+            if t["orphan"]:
+                print(f"  ! name '{t['name']}' points to a key slot that no longer exists. "
+                      "Delete it with: sudo forge-usbkey cleanup")
+    return ok
 
 
 def set_setting(on):
@@ -97,72 +1024,174 @@ def set_setting(on):
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump(vals, f)
         tmp = f.name
-    r = subprocess.run(["/usr/libexec/forge-apply", "--import", tmp])
+    apply = os.environ.get("FORGE_APPLY", "/usr/libexec/forge-apply")
+    r = run([apply, "--import", tmp], capture_output=True, text=True)
     os.unlink(tmp)
     return r.returncode == 0
 
 
-def main():
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+def main(argv):
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if os.geteuid() != 0 and not USB_DIR:
+        raise Fail("Run this with sudo, for example: sudo forge-usbkey list")
+    with only_one_run():
+        return run_command(argv)
+
+
+def run_command(argv):
+    cmd = argv[0] if argv else "status"
+    name = " ".join(argv[1:]).strip()
     if cmd in ("-h", "--help", "help"):
         print(__doc__.strip())
         return 0
-    if os.geteuid() != 0:
-        die("Run this with sudo, for example: sudo forge-usbkey setup")
+    if os.geteuid() != 0 and not USB_DIR:
+        raise Fail("Run this with sudo, for example: sudo forge-usbkey list")
+    vals, errors = forgecfg.validate(forgecfg.values())
 
-    vals = forgecfg.values()
-    label = vals["security.usb_key_label"]
+    def stick_label():
+        # Only commands that look for the stick need valid settings.
+        if errors:
+            raise Fail("Forge Settings has invalid values, so the key stick won't be looked for until they "
+                       "are fixed:\n  " + "\n  ".join(errors))
+        return vals["security.usb_key_label"]
+
     devs = luks_devices()
     if not devs:
-        die("No encrypted disk found in /etc/crypttab. USB unlock only works on an encrypted install.")
+        raise Fail("No encrypted disk found in /etc/crypttab. USB keys only work on an encrypted install.")
+    if cmd not in ("status", "list", "audit", "test"):
+        finish_unfinished(devs)
+        sweep_stale(devs)
+    if cmd in ("add", "create", "setup", "adopt") and MISSING:
+        raise Fail(f"{', '.join(MISSING)} is not connected or can't be read, so this stick can't be checked "
+                   "against it (it might already have a key or a name there). Connect it, then try again. "
+                   "Nothing was changed.")
 
-    if cmd == "status":
-        print(f"USB unlock setting: {'on' if vals['security.usb_unlock'] else 'off'}")
-        print(f"USB drive name: {label}, wait time: {vals['security.usb_key_timeout_sec']}s")
-        for name, dev in devs:
-            print(f"Encrypted volume: {name} ({dev})")
-        print("Run 'sudo forge-usbkey test' with the USB plugged in to check the key works.")
+    if cmd == "forget":
+        if not name:
+            raise Fail("Say which record to drop, for example: sudo forge-usbkey forget home")
+        forget(devs, name)
         return 0
 
-    if cmd == "remove" and not os.path.exists(f"/dev/disk/by-label/{label}"):
-        # Lost or unplugged USB: stop using it at boot. The old key slot stays
-        # until you run remove again with the USB, but nothing looks for it.
-        set_setting(False)
-        print("USB unlock turned off. Plug the USB in and run remove again to fully delete its key.")
+    if cmd in ("status", "list"):
+        label = vals.get("security.usb_key_label", "(invalid, fix it in Forge Settings)")
+        unlock = {True: "on", False: "off"}.get(vals.get("security.usb_unlock"), "?")
+        print(f"USB unlock: {unlock}, drive name {label}, wait {vals.get('security.usb_key_timeout_sec', '?')}s")
+        for e in errors:
+            print(f"Warning: invalid setting: {e}")
+        for vol, dev in devs:
+            toks = all_tokens(dev)
+            live = [t for t in toks if not t["orphan"]]
+            print(f"{vol}: {len(live)} USB key(s)")
+            for t in live:
+                note = ""
+                if t["pending"]:
+                    state = "UNFINISHED" if t["pending"] == "unfinished" else "UNCLEAR"
+                    note = f"  {state}: an add was interrupted. Fix: " + fix_hint(t).replace("\n", " ")
+                print(f"  - {t['name']} (slot {t['slot']}, added {t['added']}){note}")
+            for t in toks:
+                if t["orphan"]:
+                    print(f"  ! '{t['name']}': its key slot no longer exists, so this name is a leftover. "
+                          "Delete it with: sudo forge-usbkey cleanup")
         return 0
 
-    keyfile, tmp = find_usb(label)
-    try:
-        check_key_file(keyfile)
-        if cmd == "test":
-            for name, dev in devs:
-                print(f"{name}: {'USB key works' if opens(dev, keyfile) else 'USB key does NOT open this disk'}")
-            return 0
-        if cmd == "setup":
-            for name, dev in devs:
-                if opens(dev, keyfile):
-                    print(f"{name}: USB key already added.")
-                    continue
-                print(f"{name}: enter your current disk password to add the USB key.")
-                if subprocess.run(["cryptsetup", "luksAddKey", dev, keyfile]).returncode != 0:
-                    die("Could not add the USB key. Nothing else was changed.")
-            if not set_setting(True):
-                die("The key was added, but turning on USB unlock failed. Check Forge Settings.")
-            print("Done. Reboot with the USB plugged in to test it. Your password still works too.")
-            return 0
-        if cmd == "remove":
+    if cmd == "revoke":
+        if not name:
+            raise Fail("Say which key to revoke, for example: sudo forge-usbkey revoke travel")
+        clean = revoke(devs, name)
+        if MISSING or DETACHED:
+            print(f"NOT revoked on {unchecked_note()}. The stick may still open those.", file=sys.stderr)
+            return 1
+        if not any(usb_tokens(dev) for _, dev in devs):
             set_setting(False)
-            for name, dev in devs:
-                if opens(dev, keyfile):
-                    subprocess.run(["cryptsetup", "luksRemoveKey", dev, keyfile])
-                    print(f"{name}: USB key removed.")
-            print("Done. Only your password unlocks the disk now.")
-            return 0
-    finally:
-        release(tmp)
+            print("That was the last USB key, so USB unlock is now off.")
+        return 0 if clean else 1
+
+    if cmd == "remove":
+        # Check every volume first, so nothing is half done.
+        for vol, dev in devs:
+            forge = {t["slot"] for t in usb_tokens(dev)}
+            if forge and not keyslots(dev) - forge:
+                raise Fail(f"{vol} has no password or other key left, only USB keys. Removing them all would "
+                           "lock you out. Add a password first: sudo cryptsetup luksAddKey " + dev)
+        names = sorted({t["name"] for _, dev in devs for t in usb_tokens(dev)})
+        clean = True
+        for n in names:
+            clean = revoke(devs, n) and clean
+        if MISSING or DETACHED:
+            print(f"NOT done on {unchecked_note()}. USB keys there may still work, so USB unlock stays on.",
+                  file=sys.stderr)
+            return 1
+        if not clean or any(usb_tokens(dev) for _, dev in devs):
+            print("Some USB keys could not be revoked (see above), so USB unlock stays on.", file=sys.stderr)
+            return 1
+        set_setting(False)
+        print("Every USB key is revoked and USB unlock is off. Your password still works.")
+        return 0
+
+    if cmd == "cleanup":
+        return 0 if cleanup(devs) else 1
+
+    if cmd == "audit":
+        try:
+            data = stick_key(stick_label())
+        except NoStick:
+            data = None
+            print("No key stick plugged in, so no stick was checked.")
+        except Fail as e:
+            data = None
+            print(f"The key stick was not checked: {e}")
+        if data is None:
+            return 0 if audit(devs, None) else 1
+        with private_key_copy(data) as keyfile:
+            return 0 if audit(devs, keyfile) else 1
+
+    if cmd == "test":
+        with private_key_copy(stick_key(stick_label())) as keyfile:
+            for vol, dev in devs:
+                slot = slot_opened_by(dev, keyfile)
+                names = [t["name"] for t in usb_tokens(dev) if t["slot"] == slot] if slot is not None else []
+                if names:
+                    print(f"{vol}: opens as {names[0]}")
+                elif slot is not None:
+                    print(f"{vol}: opens key slot {slot}, which has NO name. Fix: sudo forge-usbkey adopt NAME")
+                else:
+                    print(f"{vol}: this stick does NOT open this disk")
+        return 0
+
+    if cmd == "adopt":
+        if not name:
+            raise Fail("Give the key a name, for example: sudo forge-usbkey adopt home")
+        # Only the format here: adopt() decides about taken names, because it knows which
+        # key slot the stick opens (the stick may already be that key).
+        check_name(name, devs, must_be_new=False)
+        with private_key_copy(stick_key(stick_label())) as keyfile:
+            names = adopt(devs, keyfile, name)
+        if not set_setting(True):
+            raise Fail("The key was named, but turning on USB unlock failed. Check Forge Settings.")
+        print(f"Done. The stick is now listed as '{names[0]}'.")
+        return 0
+
+    if cmd in ("add", "create", "setup"):
+        name = name or ("key-1" if cmd == "setup" else "")
+        if not name:
+            raise Fail(f"Give the stick a name, for example: sudo forge-usbkey {cmd} home")
+        check_name(name, devs)
+        with private_key_copy(stick_key(stick_label(), create=(cmd == "create"))) as keyfile:
+            add_key(devs, keyfile, name)
+        if not set_setting(True):
+            raise Fail("The key was added, but turning on USB unlock failed. Check Forge Settings.")
+        print(f"Done. Reboot with the '{name}' stick plugged in to test it. Your password still works too.")
+        return 0
+
     print(__doc__.strip())
     return 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Fail as e:
+        print(e, file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,11 @@
+# Screenshot test image only (never in the real Forge OS image).
+[Unit]
+Description=Forge OS screenshot test probe
+After=systemd-user-sessions.service
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/forge-screenshot-probe
+
+[Install]
+WantedBy=multi-user.target

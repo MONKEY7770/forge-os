@@ -1,0 +1,12 @@
+[Unit]
+Description=Forge OS backup restore test (about monthly, only when backups are set up)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/forge-backup restore-test --auto
+# Games and the desktop come first.
+Nice=19
+IOSchedulingClass=idle
+CPUWeight=20
+# Listing, restoring and checking each have their own limit; this stops anything that still hangs.
+TimeoutStartSec=3h

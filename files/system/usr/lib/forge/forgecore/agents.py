@@ -20,6 +20,8 @@ import time
 import urllib.parse
 import uuid
 
+from .policy import clean_details
+
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 LIFECYCLES = ("on-demand", "persistent")
 CLOUD_PREFIXES = {"openai", "anthropic", "openrouter"}
@@ -324,6 +326,10 @@ class Tools:
             return f"Error: {e}"
 
 
+def _no_constants(name):
+    raise ValueError(f"{name} is not allowed")
+
+
 def _short(text, n=SUMMARY_LEN) -> str:
     text = "" if text is None else str(text)
     text = " ".join(text.split())
@@ -370,8 +376,13 @@ class Runner:
                 "started": r[8], "ended": r[9]}
 
     def _update(self, run_id, **fields):
+        # What is stored (and shown by /api/runs, which the viewer token can read) has secrets
+        # hidden. The model still works with the real text; only the record is redacted.
         if "steps" in fields:
-            fields["steps"] = json.dumps(fields["steps"], default=str)
+            fields["steps"] = json.dumps(clean_details(fields["steps"], 20_000), default=str)
+        for k in ("result", "error"):
+            if isinstance(fields.get(k), str):
+                fields[k] = clean_details(fields[k], len(fields[k]) + 8192)
         cols = ", ".join(f"{k}=?" for k in fields)
         with self._lock:
             self._db.execute(f"UPDATE runs SET {cols} WHERE id=?", (*fields.values(), run_id))
@@ -411,7 +422,8 @@ class Runner:
         run_id = uuid.uuid4().hex
         with self._lock:
             self._db.execute("INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?,?)",
-                             (run_id, agent_id, task, trigger, "queued", "[]", None, None, time.time(), None))
+                             (run_id, agent_id, clean_details(task, len(task) + 8192), trigger, "queued", "[]",
+                              None, None, time.time(), None))
             self._db.commit()
         return run_id, spec
 
@@ -476,14 +488,16 @@ class Runner:
                 return True  # unsure means ask
         return is_cloud_model(model)
 
-    def _check(self, agent_id, action, details, run_id, ttl_s) -> tuple[str, str | None]:
+    def _check(self, agent_id, action, details, run_id, ttl_s) -> tuple[str, str | None, str | None]:
+        """Returns (decision, approval id, reason for a refusal or None)."""
         try:
             r = self.policy.check(agent_id, action, details, run_id=run_id, ttl_s=ttl_s) or {}
             decision = r.get("decision")
-            return (decision if decision in ("allow", "ask", "deny") else "deny"), r.get("approval_id")
+            reason = r.get("reason") if isinstance(r.get("reason"), str) else None
+            return (decision if decision in ("allow", "ask", "deny") else "deny"), r.get("approval_id"), reason
         except Exception:
             # If the policy cannot answer, the safe answer is no.
-            return "deny", None
+            return "deny", None, None
 
     def _wait(self, run_id, approval_id, timeout_s) -> str:
         """Wait for the user, in short chunks so cancel still works. Returns approved, denied or expired."""
@@ -525,11 +539,11 @@ class Runner:
 
     def _gate(self, run_id, agent_id, action, details, timeout_s) -> tuple[bool, str, str | None]:
         """Ask the policy. Returns (allowed, decision label, message if blocked)."""
-        decision, approval_id = self._check(agent_id, action, details, run_id, timeout_s)
+        decision, approval_id, reason = self._check(agent_id, action, details, run_id, timeout_s)
         if decision == "allow":
             return True, "allow", None
         if decision == "deny":
-            return False, "deny", "Not allowed by policy"
+            return False, "deny", reason or "Not allowed by policy"
         answer = self._wait(run_id, approval_id, timeout_s)
         if answer == "approved":
             return True, "ask:approved", None
@@ -589,8 +603,9 @@ class Runner:
                 raw = fn.get("arguments") or "{}"
                 decision = None
                 try:
-                    args = json.loads(raw) if isinstance(raw, str) else raw
-                except ValueError:
+                    # NaN and Infinity are not JSON: refused, so they can't reach the policy or the logs.
+                    args = json.loads(raw, parse_constant=_no_constants) if isinstance(raw, str) else raw
+                except (ValueError, RecursionError):
                     args = None
                 if n >= MAX_TOOL_CALLS_PER_STEP:
                     result = "Skipped: too many tool calls in one step"
@@ -615,8 +630,10 @@ class Runner:
                 if len(result) > TOOL_RESULT_MAX:
                     result = result[:TOOL_RESULT_MAX] + "\n[truncated]"
                 messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
+                # Hidden first, cut after: a cut must never leave half a secret visible.
+                shown = json.dumps(clean_details(args, 20_000)) if args is not None else clean_details(str(raw))
                 steps.append({"type": "tool", "name": name, "decision": decision, "ts": time.time(),
-                              "summary": _short(f"{raw} -> {result}")})
+                              "summary": _short(clean_details(f"{shown} -> {result}", 40_000))})
             # One write per model step keeps the database quiet.
             self._update(run_id, steps=steps)
             if self._cancelled(run_id):
@@ -665,11 +682,16 @@ class Runner:
             self._db.commit()
         return cur.rowcount
 
-    def start_scheduler(self, every_s: float = 60, daily=None):
+    def start_scheduler(self, every_s: float = 60, daily=None, prune_ok=None):
+        """prune_ok: if given, old runs are only deleted while it returns True (a trusted clock)."""
         if self._sched_thread and self._sched_thread.is_alive():
             return
         self._sched_stop.clear()
-        daily_jobs = [self.prune] + list(daily or [])
+        def prune_if_ok():
+            if prune_ok is None or prune_ok():
+                self.prune()
+
+        daily_jobs = [prune_if_ok] + list(daily or [])
 
         def loop():
             last_daily = None

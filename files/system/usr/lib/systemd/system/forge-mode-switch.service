@@ -1,0 +1,35 @@
+[Unit]
+Description=Forge OS: set the AI agents' limits for a mode when forge-game asks (one word per request)
+Requires=forge-mode-switch.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/forge-mode-apply --serve
+# Root, because systemd only lets root (with CAP_SYS_ADMIN) change agents.slice without polkit.
+# Everything else is taken away.
+CapabilityBoundingSet=CAP_SYS_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+# Other processes are hidden; loginctl and systemctl only talk D-Bus, they don't read /proc.
+ProtectProc=invisible
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+TimeoutStopSec=30

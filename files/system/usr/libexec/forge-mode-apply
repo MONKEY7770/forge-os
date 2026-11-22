@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""forge-mode-apply: set the AI agents' CPU priority and memory limit for one mode.
+
+  forge-mode-apply MODE     set them now (as root)
+  forge-mode-apply --serve  the forge-mode-switch service: answers requests on the socket systemd hands
+                            over (/run/forge-mode.sock, only root and the wheel group can open it)
+
+The only part of switching modes that needs root (agents.slice is a system slice). forge-game asks for it
+when a game starts or ends, without a password. MODE is gaming, agents, creative, quiet, or default (the
+values from Forge Settings, Agent resource limits). Only checked settings are read; nothing is changed
+when the settings file has problems.
+
+A request is one line with one of those five words, nothing else. It is done only when the asking
+process's uid (from the kernel, SO_PEERCRED) is in the wheel group AND is the user of the active,
+local, graphical session on seat0 (asked from logind with loginctl). Every connection counts toward
+RATE_MAX per minute per user, checked before anything is read; each user gets one connection at a
+time (more are refused at once and not counted), and a client that sends nothing is dropped after READ_TIMEOUT_S.
+The service quits after IDLE_S without requests; systemd starts it again on the next one.
+"""
+import collections
+import grp
+import os
+import pwd
+import re
+import selectors
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.environ.get("FORGE_LIB", "/usr/lib/forge"))
+import forgecfg  # noqa: E402
+
+MODES = ("gaming", "agents", "creative", "quiet", "default")
+# Test seams, only read with the test marker (systemd never sets these for the service).
+TEST = os.environ.get("FORGE_MODE_SWITCH_TEST") == "1"
+ADMIN_GROUP = (os.environ.get("FORGE_MODE_SWITCH_GROUP") if TEST else None) or "wheel"
+IDLE_S = float(os.environ.get("FORGE_MODE_SWITCH_IDLE_S", "120") if TEST else 120)
+READ_TIMEOUT_S = 0.5
+REQUEST_MAX = 16          # bytes: the longest word plus a newline
+RATE_MAX = 10             # requests per user per RATE_WINDOW_S
+RATE_WINDOW_S = 60
+SESSION_ID = re.compile(r"[A-Za-z0-9]{1,32}")
+
+
+def apply(mode):
+    """Returns (ok, message)."""
+    vals, errors = forgecfg.validate(forgecfg.values())
+    if errors:
+        return False, "Settings have problems, so nothing was changed:\n  " + "\n  ".join(errors)
+    prefix = "agents." if mode == "default" else f"modes.{mode}."
+    cpu, mem = vals[prefix + "cpu_weight"], vals[prefix + "memory_high_pct"]
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (cpu, mem)):
+        return False, "Unexpected setting values, nothing was changed."
+    try:
+        r = subprocess.run(["systemctl", "set-property", "--runtime", "agents.slice", f"CPUWeight={cpu}",
+                            f"MemoryHigh={mem}%"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"systemctl could not run ({e})"
+    if r.returncode != 0:
+        return False, f"systemctl set-property failed: {r.stderr.strip()[-300:]}"
+    return True, f"Agent limits set for {mode} mode: CPU priority {cpu}, memory soft limit {mem}%."
+
+
+# ---------- the service ----------
+
+def is_admin(uid, group=None):
+    """uid is in the admin group (as its main group or a listed member)."""
+    try:
+        gr = grp.getgrnam(group or ADMIN_GROUP)
+        pw = pwd.getpwuid(uid)
+    except (KeyError, OverflowError):
+        return False
+    return pw.pw_gid == gr.gr_gid or pw.pw_name in gr.gr_mem
+
+
+def _loginctl(args):
+    try:
+        r = subprocess.run(["loginctl", *args], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def has_active_local_session(uid):
+    """uid is the user of seat0's active session, and that session is local, graphical and active."""
+    out = _loginctl(["show-seat", "seat0", "--property=ActiveSession", "--value"])
+    sid = (out or "").strip()
+    if not SESSION_ID.fullmatch(sid):
+        return False
+    out = _loginctl(["show-session", sid, "--property=User", "--property=Remote", "--property=Active",
+                     "--property=Type", "--property=Class", "--property=State"])
+    props = {}
+    for line in (out or "").splitlines()[:20]:
+        k, sep, v = line.partition("=")
+        if sep:
+            props[k] = v.strip()
+    return (props.get("User") == str(uid) and props.get("Remote") == "no" and props.get("Active") == "yes"
+            and props.get("Type") in ("wayland", "x11") and props.get("Class") == "user"
+            and props.get("State") == "active")
+
+
+def parse_request(data):
+    """The mode word from one request, or None."""
+    if len(data) > REQUEST_MAX or not data.endswith(b"\n") or data.count(b"\n") != 1:
+        return None
+    word = data[:-1].decode("ascii", "replace")
+    return word if word in MODES else None
+
+
+def decide(uid, pid, word):
+    """The answer for a complete request (rate limit and the one-at-a-time rule were checked on accept)."""
+    if word is None:
+        return "error: send one of: " + ", ".join(MODES)
+    if not is_admin(uid):
+        return "error: only administrators may switch modes this way"
+    if not has_active_local_session(uid):
+        return "error: only for the user of the active local desktop session"
+    ok, msg = apply(word)
+    print(f"uid {uid} (pid {pid}): {word}: {msg}", flush=True)
+    return "ok" if ok else "error: " + msg.splitlines()[0][:200]
+
+
+def reply(conn, text):
+    try:
+        conn.setblocking(True)
+        conn.settimeout(READ_TIMEOUT_S)
+        conn.sendall((text + "\n").encode())
+    except OSError:
+        pass
+    finally:
+        conn.close()
+
+
+def serve():
+    if os.environ.get("LISTEN_FDS") != "1" or os.environ.get("LISTEN_PID") != str(os.getpid()):
+        print("forge-mode-apply --serve only runs from forge-mode-switch.socket", file=sys.stderr)
+        return 2
+    sock = socket.socket(fileno=3)
+    if sock.family != socket.AF_UNIX or sock.type != socket.SOCK_STREAM:
+        print("not a unix stream socket", file=sys.stderr)
+        return 2
+    sock.setblocking(False)
+    recent = collections.defaultdict(collections.deque)   # uid -> connection times (rate limit)
+    clients = {}    # conn -> {"uid", "pid", "data", "deadline"}; at most one per uid
+    last = time.monotonic()
+    with selectors.DefaultSelector() as sel:
+        sel.register(sock, selectors.EVENT_READ)
+        while True:
+            now = time.monotonic()
+            waits = [c["deadline"] - now for c in clients.values()] + [last + IDLE_S - now]
+            events = sel.select(max(min(waits), 0))
+            now = time.monotonic()
+            for key, _ in events:
+                if key.fileobj is sock:
+                    while True:     # every waiting connection, decided before anything is read
+                        try:
+                            conn, _ = sock.accept()
+                        except (BlockingIOError, InterruptedError):
+                            break
+                        except OSError:
+                            break
+                        last = now
+                        pid, uid, _gid = struct.unpack("3i", conn.getsockopt(
+                            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+                        times = recent[uid]
+                        while times and now - times[0] > RATE_WINDOW_S:
+                            times.popleft()
+                        if len(times) >= RATE_MAX:
+                            reply(conn, "error: too many requests, try again in a minute")
+                            continue
+                        if any(c["uid"] == uid for c in clients.values()):
+                            # Refused at once and not counted: a burst from your own program must not
+                            # lock you out for a minute. It costs one accept and one short reply.
+                            reply(conn, "error: busy, one request at a time")
+                            continue
+                        times.append(now)   # counted before anything is read
+                        conn.setblocking(False)
+                        clients[conn] = {"uid": uid, "pid": pid, "data": b"", "deadline": now + READ_TIMEOUT_S}
+                        sel.register(conn, selectors.EVENT_READ)
+                    continue
+                conn = key.fileobj
+                c = clients[conn]
+                try:
+                    chunk = conn.recv(REQUEST_MAX + 1)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    chunk = b""
+                c["data"] += chunk
+                if chunk and b"\n" not in c["data"] and len(c["data"]) <= REQUEST_MAX:
+                    continue
+                sel.unregister(conn)
+                del clients[conn]
+                word = parse_request(c["data"])
+                reply(conn, decide(c["uid"], c["pid"], word))
+                last = time.monotonic()
+            for conn, c in list(clients.items()):
+                if time.monotonic() >= c["deadline"]:
+                    sel.unregister(conn)
+                    del clients[conn]
+                    reply(conn, "error: send one of: " + ", ".join(MODES))
+            if not clients and time.monotonic() - last >= IDLE_S:
+                return 0        # idle: systemd starts us again on the next request
+
+
+def main(argv):
+    if argv == ["--serve"]:
+        return serve()
+    if len(argv) != 1 or argv[0] not in MODES:
+        print("Usage: forge-mode-apply gaming|agents|creative|quiet|default", file=sys.stderr)
+        return 2
+    ok, msg = apply(argv[0])
+    print(msg, file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

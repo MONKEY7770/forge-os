@@ -1,0 +1,990 @@
+#!/usr/bin/env python3
+"""forge-appearance-background: puts the Background settings into effect on the Plasma desktop.
+
+Runs as you, never as root (forge-appearance and Forge Settings start it). Commands:
+
+  apply     read the section's values (JSON on stdin) and change the wallpaper
+  options   print the lists the Settings page offers (Wallpaper Engine wallpapers, screens) as JSON
+  guard     watch plasmashell for a minute after a video or Wallpaper Engine background was applied,
+            and go back to the last picture that worked if it keeps crashing (started by apply)
+
+The wallpaper is changed through Plasma's own desktop scripting (org.kde.PlasmaShell.evaluateScript
+over D-Bus). The script always comes from one fixed template; the values go into it only as a JSON
+literal, so no text from a setting or a file can become code. Files come only from your media library
+(or, for Wallpaper Engine, from the Steam workshop folder, checked item by item). The Plasma file
+plasma-org.kde.plasma.desktop-appletsrc is only ever written by the crash guard, and only after
+plasmashell has stopped.
+"""
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
+import zlib
+
+sys.path.insert(0, os.environ.get("FORGE_LIB", "/usr/lib/forge"))
+import forgeappearance as fa  # noqa: E402
+
+STDIN_MAX = 1024 * 1024
+CALL_TIMEOUT_S = 30
+VIDEO_PLUGIN = "luisbocanegra.smart.video.wallpaper.reborn"
+WE_PLUGIN = "com.github.captsilver.wallpaperEngineKde"
+RISKY = (VIDEO_PLUGIN, WE_PLUGIN)       # third-party plugins that can crash plasmashell
+PLASMA_UNIT = "plasma-plasmashell.service"
+GUARD_UNIT = "forge-background-guard"
+APPLETS = "plasma-org.kde.plasma.desktop-appletsrc"
+WATCH_S = 60                # plasmashell's own limit: 3 starts in 60 s, then it gives up
+POLL_S = 2
+STOP_WAIT_S = 15
+GUARD_RUNTIME_S = 180
+GRADIENT_W, GRADIENT_H = 960, 540
+WE_APP = "431960"
+WORKSHOP_MAX = 1000         # wallpapers listed at most (the most the Settings page keeps in a list)
+SCAN_MAX = 20000            # folder entries looked at, at most
+PROJECT_MAX = 256 * 1024    # project.json files are a few KB
+VDF_MAX = 256 * 1024
+APPLETS_MAX = 8 * 1024 * 1024
+RECOVERY_MAX_S = 120        # a recovery marker older than this is from a guard that died
+STOPPED = ("inactive", "failed")   # the only is-active answers that mean "stopped"
+GUARD_STOP_S = 45           # systemd's limit for stopping the guard unit (then SIGKILL); keeps logout short
+RECOVERY_CALL_S = 10        # each command during a recovery
+CONNECTOR_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}"
+DIGITS_RE = r"[0-9]{1,20}"
+
+# What each choice on the page means for the plugin (the plugins' own numbers, from their main.xml
+# and QML). The schema's options must match these tables exactly (tests check that).
+SELECT_TABLES = {
+    "type": {"picture": "org.kde.image", "slideshow": "org.kde.slideshow", "video": VIDEO_PLUGIN,
+             "wallpaper_engine": WE_PLUGIN, "color": "org.kde.color", "gradient": "org.kde.image"},
+    # org.kde.image FillMode (QtQuick Image.fillMode) and Blur (blurs only the empty space around it).
+    "fill": {"crop": (2, False), "fit": (1, False), "fit_blur": (1, True), "stretch": (0, False),
+             "center": (6, False), "center_blur": (6, True), "tile": (3, False)},
+    "slide_order": {"random": 0, "oldest": 3, "newest": 4},
+    "video_fill": {"crop": 2, "fit": 1, "stretch": 0},
+    "video_pause": {"busy": 0, "active": 1, "visible": 2, "never": 3},
+    "video_blur": {"never": 5, "always": 4, "paused": 3, "busy": 0},
+    "day_night": {"off": 0, "time": 2, "theme": 3},
+    "we_fill": {"crop": 1, "fit": 0, "stretch": 2},
+    "we_pause": {"busy": 2, "fullscreen": 5, "active": 3, "visible": 1, "never": 0},
+    "gradient_direction": {"down": (0, 1), "right": (1, 0), "diagonal": (1, 1), "diagonal_up": (1, -1)},
+    "screen": {"all": None, "one": None},
+}
+# Sound follows the pause choice: muted while the video is paused, never muted otherwise.
+VIDEO_MUTE = {"busy": 0, "active": 1, "visible": 2, "never": 4}
+MUTE_ALWAYS = 5
+USED_KEYS = ("type", "picture", "slide_interval", "slide_order", "fill", "video", "video_fill", "video_blur",
+             "video_blur_radius", "day_night", "night_video", "day_starts", "night_starts", "we_item", "we_scenes",
+             "we_fill", "fps", "speed", "volume", "video_pause", "we_pause", "pause_on_battery", "color", "color2",
+             "gradient_direction", "screen", "screen_connector")
+
+SCRIPT_TEMPLATE = """// Forge OS: change the desktop wallpaper (made from a fixed template; only the JSON below changes).
+const p = __FORGE_PARAMS__;
+let target = -1;
+if (p.connector !== null) {
+  target = screenForConnector(p.connector);
+}
+if (p.connector !== null && target < 0) {
+  print("forge-error: no-screen");
+} else {
+  let n = 0;
+  for (const d of desktops()) {
+    if (target >= 0 && d.screen !== target) {
+      continue;
+    }
+    d.wallpaperPlugin = p.plugin;
+    d.currentConfigGroup = ["Wallpaper", p.plugin, "General"];
+    for (const k of Object.keys(p.config)) {
+      d.writeConfig(k, p.config[k]);
+    }
+    n++;
+  }
+  print("forge-ok " + n);
+}
+"""
+
+
+class Refused(Exception):
+    """Not applied. The text is for the user."""
+
+
+class Nothing(Exception):
+    """Nothing to do (nothing chosen yet). Not a failure."""
+
+
+def say(text):
+    print(text, flush=True)
+
+
+# Small helpers
+
+def clean_title(s, limit=80):
+    s = "".join(c for c in s if unicodedata.category(c) not in ("Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"))
+    return " ".join(s.split())[:limit].strip()
+
+
+def read_small(path, limit, dir_fd=None):
+    """Bytes of a regular file of at most limit bytes, never following a link, never blocking. None otherwise."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+            return None
+        data = b""
+        while len(data) <= limit:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            data += chunk
+        return data if len(data) <= limit else None
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def xdg(name, fallback):
+    base = os.environ.get(name, "")
+    return base if os.path.isabs(base) else os.path.join(os.path.expanduser("~"), fallback)
+
+
+def private_dir(path):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise Refused(f"{path} is not a private folder of yours, so nothing was changed")
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        os.chmod(path, 0o700)
+    return path
+
+
+def write_atomic(path, data):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def file_url(path):
+    """file:// URL the way Plasma's own settings write it. Paths with characters a URL can't carry as
+    they are (%, #, ?) are refused rather than guessed at."""
+    if not os.path.isabs(path) or re.search(r"[%#?\x00-\x1f\x7f]", path):
+        raise Refused("that file's folder name has characters Plasma can't use (%, # or ?)")
+    return "file://" + path
+
+
+def which(*names):
+    for n in names:
+        p = shutil.which(n)
+        if p:
+            return p
+    return None
+
+
+def run(argv, timeout=CALL_TIMEOUT_S):
+    """(returncode, stdout, stderr); returncode None if it could not run or took too long."""
+    try:
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, "", str(e)
+    return r.returncode, r.stdout, r.stderr
+
+
+# State: the last background that worked, the pending check, what the guard did
+
+def state_dir():
+    return private_dir(os.path.join(xdg("XDG_STATE_HOME", os.path.join(".local", "state")), "forge", "background"))
+
+
+def write_state(name, obj):
+    write_atomic(os.path.join(state_dir(), name), (json.dumps(obj) + "\n").encode())
+
+
+def read_state(name):
+    data = read_small(os.path.join(state_dir(), name), 64 * 1024)
+    try:
+        return json.loads(data.decode("utf-8")) if data else None
+    except (ValueError, RecursionError):
+        return None
+
+
+def drop_state(name):
+    try:
+        os.unlink(os.path.join(state_dir(), name))
+    except FileNotFoundError:
+        pass
+
+
+def read_last_good():
+    d = read_state("last-good.json")
+    if (isinstance(d, dict) and isinstance(d.get("path"), str) and isinstance(d.get("url"), str)
+            and d["url"] == "file://" + d["path"]):
+        return {"url": d["url"], "path": d["path"]}
+    return None
+
+
+def read_pending():
+    d = read_state("pending.json")
+    if (isinstance(d, dict) and d.get("plugin") in RISKY and type(d.get("restarts")) is int
+            and d["restarts"] >= 0 and isinstance(d.get("gen"), str)):
+        return d
+    return None
+
+
+def current_gen():
+    d = read_state("current.json")
+    return d.get("gen") if isinstance(d, dict) and isinstance(d.get("gen"), str) else None
+
+
+def pid_alive(pid):
+    if type(pid) is not int or pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def recovery_running():
+    """True while a guard is switching the desktop back (its marker is fresh and its process lives)."""
+    d = read_state("recovering.json")
+    return (isinstance(d, dict) and isinstance(d.get("at"), (int, float)) and 0 <= time.time() - d["at"] < RECOVERY_MAX_S
+            and pid_alive(d.get("pid")) and guard_cmdline_ok(d["pid"]))
+
+
+# Plugins and media
+
+def plugin_installed(pid):
+    roots = [os.environ.get("FORGE_PLASMA_WALLPAPERS") or "/usr/share/plasma/wallpapers",
+             os.path.join(xdg("XDG_DATA_HOME", os.path.join(".local", "share")), "plasma", "wallpapers")]
+    return any(os.path.isfile(os.path.join(r, pid, "metadata.json")) for r in roots)
+
+
+def library_file(payload, mid, accept):
+    """Path of a media item in your library, checked again here: the id is from the library, the path is
+    the library's own file for it (still a regular file, not a link) and the kind fits."""
+    if not isinstance(mid, str) or not re.fullmatch(fa.MEDIA_ID_RE, mid):
+        raise Refused("that file is not in your media library")
+    item = fa.media_index().get(mid)
+    path = fa.media_path(mid)
+    given = (payload.get("media") or {}).get(mid) if isinstance(payload.get("media"), dict) else None
+    if item is None or path is None or not isinstance(given, dict) or given.get("path") != path:
+        raise Refused("that file is not in your media library any more")
+    if item["kind"] not in fa.ACCEPT[accept]:
+        raise Refused("that file is not a " + ("video" if accept == "video" else "picture"))
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        raise Refused("that file can't be opened any more")
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise Refused("that file is not a regular file")
+    finally:
+        os.close(fd)
+    return path
+
+
+# Gradient: a PNG made here, since Plasma has no gradient wallpaper
+
+def gradient_png(c1, c2, direction, w=GRADIENT_W, h=GRADIENT_H):
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    steps = 1024
+    table = [bytes(round(a[k] + (b[k] - a[k]) * i / (steps - 1)) for k in range(3)) for i in range(steps)]
+    dx, dy = SELECT_TABLES["gradient_direction"][direction]
+    xs = [x / (w - 1) for x in range(w)]
+    weight = abs(dx) + abs(dy)
+    raw = bytearray()
+    for y in range(h):
+        ty = y / (h - 1)
+        ty = 1 - ty if dy < 0 else ty
+        if dx == 0:
+            row = table[round(ty * (steps - 1))] * w
+        else:
+            row = b"".join(table[round((xs[x] * dx + ty * abs(dy)) / weight * (steps - 1))] for x in range(w))
+        raw += b"\x00" + row
+
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b""))
+
+
+def make_gradient(c1, c2, direction):
+    gen = private_dir(os.path.join(fa.data_dir(), "generated"))
+    name = "gradient-" + hashlib.sha256(f"{c1}{c2}{direction}{GRADIENT_W}x{GRADIENT_H}".encode()).hexdigest()[:16] + ".png"
+    path = os.path.join(gen, name)
+    try:
+        st = os.lstat(path)
+        fresh = not stat.S_ISREG(st.st_mode)
+    except FileNotFoundError:
+        fresh = True
+    if fresh:
+        write_atomic(path, gradient_png(c1, c2, direction))
+    keep = {name} | {v for v in shown_gradients().values()}
+    last = read_last_good()
+    if last and os.path.dirname(last["path"]) == gen:
+        keep.add(os.path.basename(last["path"]))
+    for other in os.listdir(gen):
+        if other.startswith("gradient-") and other not in keep:
+            try:
+                os.unlink(os.path.join(gen, other))
+            except OSError:
+                pass
+    return path
+
+
+def shown_gradients():
+    """target ("all" or a connector) -> gradient file name, for what the screens show now."""
+    d = read_state("gradients.json")
+    if not isinstance(d, dict):
+        return {}
+    return {k: v for k, v in list(d.items())[:32] if isinstance(k, str) and isinstance(v, str)
+            and re.fullmatch(r"gradient-[0-9a-f]{16}\.png", v)}
+
+
+def remember_gradient(connector, path):
+    shown = {} if connector is None else shown_gradients()
+    shown.pop(connector or "all", None)
+    if path and os.path.basename(os.path.dirname(path)) == "generated":
+        shown[connector or "all"] = os.path.basename(path)
+    write_state("gradients.json", shown)
+
+
+# Wallpaper Engine: subscribed workshop items in the Steam library (every project.json is untrusted)
+
+def steam_libraries():
+    home = os.path.expanduser("~")
+    bases = [os.path.join(home, ".local", "share", "Steam"),
+             os.path.join(home, ".var", "app", "com.valvesoftware.Steam", ".local", "share", "Steam")]
+    out = []
+    for base in bases:
+        if not os.path.isdir(base):
+            continue
+        out.append(base)
+        data = read_small(os.path.join(base, "steamapps", "libraryfolders.vdf"), VDF_MAX)
+        text = data.decode("utf-8", "replace") if data else ""
+        for m in re.finditer(r'"path"\s+"([^"\\\x00-\x1f]{1,4096})"', text):
+            p = m.group(1)
+            if os.path.isabs(p) and os.path.isdir(p):
+                out.append(os.path.normpath(p))
+    seen, libs = set(), []
+    for p in out:
+        key = os.path.realpath(p)
+        if key not in seen:
+            seen.add(key)
+            libs.append(p)
+    return libs
+
+
+def _file_inside(item_fd, rel):
+    """True if rel (a/b/c) is a regular file inside the item folder, with no link anywhere on the way."""
+    parts = rel.split("/")
+    if not rel or rel.startswith("/") or any(p in ("", ".", "..") for p in parts) or len(parts) > 8:
+        return False
+    fds = []
+    try:
+        cur = item_fd
+        for p in parts[:-1]:
+            cur = os.open(p, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=cur)
+            fds.append(cur)
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=cur)
+        try:
+            return stat.S_ISREG(os.fstat(fd).st_mode)
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+    finally:
+        for f in fds:
+            os.close(f)
+
+
+def _one_item(content_fd, content, name, library):
+    try:
+        ifd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=content_fd)
+    except OSError:
+        return None          # a link (to anywhere) or not a folder
+    try:
+        data = read_small("project.json", PROJECT_MAX, dir_fd=ifd)
+        if data is None:
+            return None
+        try:
+            proj = json.loads(data.decode("utf-8"))
+        except (ValueError, RecursionError):
+            return None
+        if not isinstance(proj, dict):
+            return None
+        kind = proj.get("type").lower() if isinstance(proj.get("type"), str) else None
+        rel = proj.get("file")
+        if kind not in ("video", "web", "scene") or not isinstance(rel, str) or len(rel) > 255:
+            return None
+        if re.search(r"[\x00-\x1f\x7f\\%#?]", rel):
+            return None
+        # Scenes are usually packed: project.json names scene.json, which is inside scene.pkg next to it.
+        # The plugin's renderer opens <file with the extension .pkg> first, so that counts too.
+        packed = kind == "scene" and "." in rel.rsplit("/", 1)[-1] and _file_inside(ifd, rel.rsplit(".", 1)[0] + ".pkg")
+        if not (packed or _file_inside(ifd, rel)):
+            return None
+        title = clean_title(proj["title"]) if isinstance(proj.get("title"), str) else ""
+        return {"id": name, "title": title or f"Wallpaper {name}", "type": kind, "file": rel,
+                "dir": os.path.join(content, name), "library": library}
+    finally:
+        os.close(ifd)
+
+
+def workshop_items():
+    items, seen = [], set()
+    for lib in steam_libraries():
+        content = os.path.join(lib, "steamapps", "workshop", "content", WE_APP)
+        try:
+            cfd = os.open(content, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            names = []
+            with os.scandir(cfd) as it:
+                for i, e in enumerate(it):
+                    if i >= SCAN_MAX:
+                        break
+                    if re.fullmatch(DIGITS_RE, e.name):
+                        names.append(e.name)
+            for name in sorted(names, key=int):
+                if len(items) >= WORKSHOP_MAX:
+                    return items
+                if name in seen:
+                    continue
+                item = _one_item(cfd, content, name, lib)
+                if item:
+                    seen.add(name)
+                    items.append(item)
+        finally:
+            os.close(cfd)
+    return items
+
+
+def find_item(wid):
+    """One workshop item by its number, checked the same way as in the list. None if not found."""
+    for lib in steam_libraries():
+        content = os.path.join(lib, "steamapps", "workshop", "content", WE_APP)
+        try:
+            cfd = os.open(content, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            item = _one_item(cfd, content, wid, lib)
+        finally:
+            os.close(cfd)
+        if item:
+            return item
+    return None
+
+
+def connectors():
+    """Connected screens by connector name (DP-1, HDMI-A-1, ...), from the kernel's DRM list."""
+    root = os.environ.get("FORGE_SYS_DRM") or "/sys/class/drm"
+    out = []
+    try:
+        names = sorted(os.listdir(root))[:256]
+    except OSError:
+        return out
+    for name in names:
+        m = re.fullmatch(r"card[0-9]{1,3}-(.+)", name)
+        if not m or not re.fullmatch(CONNECTOR_RE, m.group(1)):
+            continue
+        data = read_small(os.path.join(root, name, "status"), 64)
+        if data and data.strip() == b"connected" and m.group(1) not in out:
+            out.append(m.group(1))
+    return sorted(out)
+
+
+# Building the change
+
+def _num(v, lo, hi):
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:
+        raise Refused("a setting is out of range. Open Forge Settings and save the Background section again")
+    return v
+
+
+def _pick(values, key):
+    v = values.get(key)
+    if v not in SELECT_TABLES[key]:
+        raise Refused(f"unknown choice for {key}. Open Forge Settings and save the Background section again")
+    return v
+
+
+def _color(values, key):
+    v = values.get(key)
+    if not isinstance(v, str) or not re.fullmatch(r"#[0-9a-f]{6}", v):
+        raise Refused("a color is not valid. Open Forge Settings and save the Background section again")
+    return v
+
+
+def plan(payload):
+    """(plugin, config, what) for the chosen background. Refused or Nothing otherwise."""
+    v = payload.get("values")
+    if not isinstance(v, dict):
+        raise Refused("no Background values were given")
+    kind = _pick(v, "type")
+    plugin = SELECT_TABLES["type"][kind]
+    if kind in ("picture", "slideshow"):
+        fill, blur = SELECT_TABLES["fill"][_pick(v, "fill")]
+        if kind == "picture":
+            if not v.get("picture"):
+                raise Nothing("choose a picture first")
+            path = library_file(payload, v["picture"], "image")
+            return plugin, {"Image": file_url(path), "FillMode": fill, "Blur": blur, "Color": "#000000"}, "picture"
+        if not any(m["kind"] in fa.ACCEPT["image"] for m in fa.media_list()):
+            raise Nothing("add pictures to your media library first")
+        minutes = _num(v.get("slide_interval"), 1, 1440)
+        return plugin, {"SlidePaths": [fa.media_dir()], "SlideInterval": int(minutes) * 60,
+                        "SlideshowMode": SELECT_TABLES["slide_order"][_pick(v, "slide_order")],
+                        "FillMode": fill, "Blur": blur, "Color": "#000000"}, "slideshow"
+    if kind == "color":
+        return plugin, {"Color": _color(v, "color")}, "solid color"
+    if kind == "gradient":
+        path = make_gradient(_color(v, "color"), _color(v, "color2"), _pick(v, "gradient_direction"))
+        return plugin, {"Image": file_url(path), "FillMode": 0, "Blur": False, "Color": "#000000"}, "gradient"
+    volume = _num(v.get("volume"), 0, 100)
+    speed = _num(v.get("speed"), 0.25, 2)
+    battery = v.get("pause_on_battery")
+    if not isinstance(battery, bool):
+        raise Refused("pause on battery must be on or off")
+    if kind == "video":
+        if not v.get("video"):
+            raise Nothing("choose a video first")
+        if not plugin_installed(VIDEO_PLUGIN):
+            raise Refused("the video wallpaper plugin is not installed in this build")
+        mode = SELECT_TABLES["day_night"][_pick(v, "day_night")]
+        main = library_file(payload, v["video"], "video")
+        videos = [(main, 4)]
+        if mode and v.get("night_video"):
+            videos = [(main, 2), (library_file(payload, v["night_video"], "video"), 0)]
+        else:
+            mode = 0
+        urls = [{"filename": file_url(p), "enabled": True, "duration": 0, "customDuration": 0, "playbackRate": 0.0,
+                 "alternativePlaybackRate": 0.0, "loop": False, "dayNightPhase": phase} for p, phase in videos]
+        pause = _pick(v, "video_pause")
+        cfg = {"VideoUrls": json.dumps(urls), "FillMode": SELECT_TABLES["video_fill"][_pick(v, "video_fill")],
+               "PauseMode": SELECT_TABLES["video_pause"][pause],
+               "MuteMode": VIDEO_MUTE[pause] if volume > 0 else MUTE_ALWAYS, "Volume": round(volume / 100, 2),
+               "PlaybackRate": float(speed), "BatteryPausesVideo": battery, "PauseBatteryLevel": 100,
+               "BlurMode": SELECT_TABLES["video_blur"][_pick(v, "video_blur")],
+               "BlurRadius": int(_num(v.get("video_blur_radius"), 8, 128)), "DayNightCycleMode": mode}
+        if mode == 2:
+            cfg["DayNightCycleSunriseTime"] = int(_num(v.get("day_starts"), 0, 23)) * 60
+            cfg["DayNightCycleSunsetTime"] = int(_num(v.get("night_starts"), 0, 23)) * 60
+        return plugin, cfg, "video"
+    # Wallpaper Engine
+    wid = v.get("we_item")
+    if not wid:
+        raise Nothing("choose a Wallpaper Engine wallpaper first")
+    if not plugin_installed(WE_PLUGIN):
+        raise Refused("Wallpaper Engine support is not included in this build")
+    if not isinstance(wid, str) or not re.fullmatch(DIGITS_RE, wid):
+        raise Refused("that is not a Steam workshop number")
+    item = find_item(wid)
+    if item is None:
+        raise Refused("that wallpaper is not in your Steam library (or its files look wrong)")
+    if item["type"] == "scene" and v.get("we_scenes") is not True:
+        raise Refused("scene wallpapers can crash the desktop. Turn on 'Allow scene wallpapers' first")
+    return plugin, {"SteamLibraryPath": file_url(item["library"]), "WallpaperWorkShopId": wid,
+                    "WallpaperSource": file_url(item["dir"]) + "/" + item["file"] + "+" + item["type"],
+                    "Fps": int(_num(v.get("fps"), 5, 60)), "MuteAudio": volume == 0, "Volume": int(volume),
+                    "Speed": float(speed), "PauseMode": SELECT_TABLES["we_pause"][_pick(v, "we_pause")],
+                    "DisplayMode": SELECT_TABLES["we_fill"][_pick(v, "we_fill")],
+                    "PauseOnBatPower": battery}, f"Wallpaper Engine: {item['title']}"
+
+
+def target_screen(values):
+    if _pick(values, "screen") == "all":
+        return None
+    c = values.get("screen_connector")
+    if not isinstance(c, str) or not re.fullmatch(CONNECTOR_RE, c):
+        raise Refused("choose which screen (its connector name, like DP-1)")
+    return c
+
+
+def kind_of(what):
+    return what.split(":", 1)[0]
+
+
+def build_script(plugin, config, connector):
+    params = {"plugin": plugin, "config": config, "connector": connector}
+    return SCRIPT_TEMPLATE.replace("__FORGE_PARAMS__", json.dumps(params, ensure_ascii=True, sort_keys=True))
+
+
+def send_script(script):
+    """Runs the script in plasmashell. Returns the script's printed answer. Refused with a plain reason."""
+    exe = which("dbus-send")
+    if exe:
+        argv = [exe, "--session", "--print-reply", f"--reply-timeout={CALL_TIMEOUT_S * 1000}",
+                "--dest=org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript",
+                "string:" + script]
+    else:
+        exe = which("qdbus6", "qdbus-qt6", "qdbus")
+        if not exe:
+            raise Refused("no D-Bus tool found (dbus-send or qdbus)")
+        argv = [exe, "org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", script]
+    rc, out, err = run(argv, CALL_TIMEOUT_S + 5)
+    text = out + err
+    if rc == 0:
+        return out
+    if "Widgets are locked" in text:
+        raise Refused("the desktop is locked (widgets are locked). Unlock widgets, then try again")
+    if any(x in text for x in ("ServiceUnknown", "not provided by any", "NoReply", "Failed to open connection",
+                               "Unable to autolaunch")):
+        raise Refused("the Plasma desktop is not running (log in to a Plasma session first)")
+    if "Administrative policies" in text:
+        raise Refused("an administrator policy blocks desktop scripts")
+    short = " ".join(text.split())[-200:]
+    raise Refused("Plasma did not accept the change" + (f" ({short})" if short else ""))
+
+
+# The crash guard
+
+def systemctl(*args, timeout=20):
+    exe = which("systemctl")
+    return run([exe, "--user", *args], timeout) if exe else (None, "", "no systemctl")
+
+
+def shell_restarts(running=False):
+    """How often systemd restarted plasmashell, or None if it is not a loaded systemd unit here.
+    running=True: also None unless the unit is active now (plasmashell really runs under it)."""
+    rc, out, _ = systemctl("show", "-p", "LoadState", "-p", "ActiveState", "-p", "NRestarts", PLASMA_UNIT)
+    props = dict(line.split("=", 1) for line in out.splitlines() if "=" in line) if rc == 0 else {}
+    n = props.get("NRestarts", "").strip()
+    if props.get("LoadState", "").strip() != "loaded" or not n.isdigit():
+        return None
+    if running and props.get("ActiveState", "").strip() != "active":
+        return None
+    return int(n)
+
+
+def shell_active_state():
+    rc, out, _ = systemctl("is-active", PLASMA_UNIT, timeout=RECOVERY_CALL_S)
+    return out.strip()
+
+
+def shell_state():
+    rc, out, _ = systemctl("show", "-p", "ActiveState", "--value", PLASMA_UNIT)
+    return out.strip() if rc == 0 else ""
+
+
+def guard_cmdline_ok(pid):
+    """True if pid is this program's own "guard" command, run by you."""
+    try:
+        if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+            return False
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            argv = f.read(4096).split(b"\0")
+    except OSError:
+        return False
+    return os.path.realpath(__file__).encode() in argv and argv[-2:] == [b"guard", b""]
+
+
+def stop_guard():
+    """End a running guard (the user unit, or the detached one by its pid). Never during a recovery: that
+    one finishes and starts plasmashell again by itself."""
+    drop_state("pending.json")
+    if recovery_running():
+        return
+    systemctl("stop", GUARD_UNIT + ".service")
+    d = read_state("guard.json")
+    if isinstance(d, dict) and pid_alive(d.get("pid")) and guard_cmdline_ok(d["pid"]):
+        try:
+            os.kill(d["pid"], signal.SIGTERM)
+        except OSError:
+            pass
+    drop_state("guard.json")
+
+
+def start_guard():
+    """Starts the guard as a short-lived user unit. Returns False if systemd-run could not start it."""
+    exe = which("systemd-run")
+    if not exe:
+        return False
+    keep = [f"--setenv={k}={os.environ[k]}" for k in ("FORGE_LIB", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+                                                      "XDG_STATE_HOME")
+            if os.path.isabs(os.environ.get(k, "")) and "\n" not in os.environ[k]]
+    argv = [exe, "--user", "--quiet", "--collect", f"--unit={GUARD_UNIT}",
+            f"--property=RuntimeMaxSec={GUARD_RUNTIME_S}", f"--property=TimeoutStopSec={GUARD_STOP_S}", *keep,
+            "--", os.path.realpath(__file__), "guard"]
+    try:
+        # No pipes: nothing it starts can hold this program's output open.
+        rc = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            timeout=CALL_TIMEOUT_S).returncode
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return rc == 0
+
+
+def start_guard_detached():
+    """Fallback when systemd-run can't start the unit: the guard as its own detached process (own session,
+    no inherited input or output), so apply still returns at once."""
+    try:
+        p = subprocess.Popen([os.path.realpath(__file__), "guard"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                             close_fds=True)
+    except OSError:
+        return False
+    if isinstance(getattr(p, "pid", None), int):
+        write_state("guard.json", {"pid": p.pid})
+    return True
+
+
+def start_shell_if_stopped():
+    """After a recovery that was cut short: plasmashell may still be stopped. Start it, and wait a little."""
+    if shell_active_state() not in STOPPED:
+        return
+    systemctl("reset-failed", PLASMA_UNIT)
+    systemctl("start", PLASMA_UNIT)
+    end = time.monotonic() + STOP_WAIT_S
+    while shell_active_state() != "active" and time.monotonic() < end:
+        time.sleep(POLL_S)
+
+
+def applets_path():
+    return os.path.join(xdg("XDG_CONFIG_HOME", ".config"), APPLETS)
+
+
+def risky_containments(path):
+    """Ids of the desktop containments that use a third-party wallpaper plugin. Read only."""
+    data = read_small(path, APPLETS_MAX)
+    if data is None:
+        return []
+    ids, current = [], None
+    for line in data.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if line.startswith("["):
+            m = re.fullmatch(r"\[Containments\]\[([0-9]{1,9})\]", line)
+            current = m.group(1) if m else None
+        elif current and line.startswith("wallpaperplugin="):
+            if line.split("=", 1)[1].strip() in RISKY and current not in ids:
+                ids.append(current)
+    return ids
+
+
+def recover(plugin):
+    """plasmashell keeps crashing: stop it, switch the desktops that use a third-party plugin back to
+    org.kde.image (the last picture that worked, or Plasma's default), start it again. Runs once.
+    A SIGTERM (for example from a later apply) can't cut it short: plasmashell is always started again."""
+    say(f"plasmashell keeps crashing since {plugin} was applied. Going back to the last background that worked.")
+    # SIG_IGN, not a handler: an ignored signal stays ignored in the commands started from here, so a
+    # SIGTERM to the whole unit (logout, a later apply) can't cut a kwriteconfig6 write in half. systemd's
+    # TimeoutStopSec (GUARD_STOP_S) still ends it with SIGKILL, and each command has RECOVERY_CALL_S.
+    previous = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    write_state("recovering.json", {"pid": os.getpid(), "at": time.time()})
+    switched = False
+    try:
+        systemctl("stop", PLASMA_UNIT, timeout=RECOVERY_CALL_S)
+        end = time.monotonic() + STOP_WAIT_S
+        while shell_active_state() not in STOPPED:
+            if time.monotonic() >= end:
+                say("plasmashell is not confirmed stopped, so its settings file was not touched.")
+                return 1
+            time.sleep(POLL_S)
+        kw = which("kwriteconfig6")
+        path = applets_path()
+        last = read_last_good()
+        if last and not (os.path.lexists(last["path"]) and stat.S_ISREG(os.lstat(last["path"]).st_mode)):
+            last = None
+        if not kw:
+            say("kwriteconfig6 is missing, so the wallpaper could not be switched back.")
+            return 1
+        for cid in risky_containments(path):
+            base = [kw, "--file", path, "--group", "Containments", "--group", cid]
+            run(base + ["--key", "wallpaperplugin", "org.kde.image"], RECOVERY_CALL_S)
+            img = base + ["--group", "Wallpaper", "--group", "org.kde.image", "--group", "General", "--key", "Image"]
+            run(img + ([last["url"]] if last else ["--delete"]), RECOVERY_CALL_S)
+        switched = True
+        write_state("recovered.json", {"plugin": plugin, "at": time.time(), "picture": bool(last)})
+        say("Switched back to " + ("your last picture." if last else "Plasma's default wallpaper."))
+        return 0
+    finally:
+        systemctl("reset-failed", PLASMA_UNIT, timeout=RECOVERY_CALL_S)
+        systemctl("start", PLASMA_UNIT, timeout=RECOVERY_CALL_S)
+        drop_state("recovering.json")
+        signal.signal(signal.SIGTERM, previous)
+        if not switched:
+            say("plasmashell was started again without changes.")
+
+
+def guard():
+    pending = read_pending()
+    drop_state("pending.json")       # whatever happens next, this check runs only once
+    if pending is None:
+        say("Nothing to watch.")
+        return 0
+    gen = pending["gen"]
+    base = pending["restarts"]
+    try:   # tests only: a shorter watch (never longer than the normal one)
+        watch = min(WATCH_S, max(0.0, float(os.environ.get("FORGE_BG_WATCH_S", WATCH_S))))
+    except ValueError:
+        watch = WATCH_S
+    end = time.monotonic() + watch
+    while True:
+        if current_gen() != gen:
+            say("A newer background was applied; this check ends.")
+            return 0
+        n = shell_restarts()
+        if n is None:
+            say("Can't see plasmashell's service, so it is not watched.")
+            return 0
+        base = min(base, n)
+        if n - base >= 2 or shell_state() == "failed":
+            if current_gen() != gen:
+                return 0
+            return recover(pending["plugin"])
+        if time.monotonic() >= end:
+            say("The desktop stayed up. Nothing to do.")
+            return 0
+        time.sleep(POLL_S)
+
+
+# Commands
+
+def read_payload():
+    data = sys.stdin.read(STDIN_MAX + 1)
+    if len(data) > STDIN_MAX:
+        raise Refused("the input is too large")
+    try:
+        payload = json.loads(data)
+    except (ValueError, RecursionError):
+        raise Refused("the input is not JSON")
+    if not isinstance(payload, dict) or not isinstance(payload.get("values"), dict):
+        raise Refused("the input has no Background values")
+    return payload
+
+
+def apply():
+    try:
+        payload = read_payload()
+        values = payload["values"]
+        connector = target_screen(values)
+        plugin, config, what = plan(payload)
+    except Nothing as e:
+        say(f"Nothing changed: {e}.")
+        return 0
+    except Refused as e:
+        say(f"Not applied: {e}.")
+        return 1
+    if recovery_running():
+        say("Not applied: Forge is restarting the desktop after a crash. Try again in a minute.")
+        return 1
+    if read_state("recovering.json") is not None:
+        # A recovery that was cut short (its process is gone): make sure plasmashell runs again.
+        start_shell_if_stopped()
+        drop_state("recovering.json")
+    risky = plugin in RISKY
+    stop_guard()
+    gen = secrets.token_hex(8)
+    write_state("current.json", {"gen": gen})      # any older guard sees this and ends
+    before = shell_restarts(running=True) if risky else None
+    guarded = False
+    if before is not None:
+        # Watch from before the change: a plugin can crash plasmashell while it is being applied.
+        write_state("pending.json", {"plugin": plugin, "restarts": before, "at": time.time(), "gen": gen})
+        guarded = start_guard()
+    rc, lines = 1, []
+    try:
+        answer = send_script(build_script(plugin, config, connector))
+        m = re.search(r"forge-ok ([0-9]+)", answer)
+        if "forge-error: no-screen" in answer:
+            lines.append(f"Not applied: no screen called {connector} is connected. Check the connector name.")
+        elif not m:
+            lines.append("Not applied: Plasma gave no answer.")
+        elif m.group(1) == "0":
+            lines.append("Not applied: Plasma has no desktop to change.")
+        else:
+            rc = 0
+            lines.append(f"Background applied: {what} on {f'screen {connector}' if connector else 'all screens'}.")
+            remember_gradient(connector, config["Image"][len("file://"):] if kind_of(what) == "gradient" else None)
+            if plugin == "org.kde.image":
+                write_state("last-good.json", {"url": config["Image"], "path": config["Image"][len("file://"):]})
+    except Refused as e:
+        lines.append(f"Not applied: {e}.")
+    if read_state("recovered.json") is not None:
+        drop_state("recovered.json")
+        lines.append("Note: last time the desktop crashed with that background, so Forge switched back.")
+    if risky and before is None:
+        lines.append("The crash guard is off: plasmashell is not running as a systemd service here.")
+    if before is not None and not guarded:
+        lines.append("The crash guard runs in the background (without systemd-run)." if start_guard_detached()
+                     else "The crash guard could not start.")
+    say("\n".join(lines))
+    return rc
+
+
+def options():
+    try:
+        read_payload()
+    except Refused:
+        pass
+    items = workshop_items() if plugin_installed(WE_PLUGIN) else []
+    kinds = {"video": "video", "web": "web", "scene": "scene, experimental"}
+    if not plugin_installed(WE_PLUGIN):
+        note = "Wallpaper Engine support is not included in this build."
+    elif not items:
+        note = ("No Wallpaper Engine wallpapers found in your Steam library. "
+                "Subscribe to some in Steam (Wallpaper Engine needs to be bought there).")
+    elif len(items) >= WORKSHOP_MAX:
+        note = f"Showing the first {WORKSHOP_MAX} wallpapers from your Steam library."
+    else:
+        note = f"{len(items)} wallpapers found in your Steam library."
+    screens = connectors()
+    out = {"fields": {
+        "we_item": {"choices": [{"value": i["id"], "label": f"{i['title']} ({kinds[i['type']]})"} for i in items],
+                    "note": note},
+        "screen_connector": {"choices": [{"value": c, "label": c} for c in screens],
+                             "note": "" if screens else "No connected screens found. Type the connector name."},
+    }}
+    print(json.dumps(out))
+    return 0
+
+
+def is_root():
+    return os.geteuid() == 0
+
+
+def main(argv):
+    if is_root():
+        say("forge-appearance-background: don't run this as root. The background is per user.")
+        return 2
+    cmd = {"apply": apply, "options": options, "guard": guard}.get(argv[0] if len(argv) == 1 else "")
+    if cmd is None:
+        say("Usage: forge-appearance-background apply|options|guard")
+        return 2
+    return cmd()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -188,6 +188,33 @@ def is_ollama_cloud(model: str) -> bool:
     return name.endswith("-cloud") or name.endswith(":cloud")
 
 
+# How long an Ollama /api/show answer is trusted.
+SHOW_CACHE_S = 300
+SHOW_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+
+
+def show_says_remote(data) -> bool:
+    """True if an Ollama /api/show reply says the model runs somewhere else.
+
+    A local copy of a cloud model (ollama cp x:120b-cloud mine, or a Modelfile
+    FROM a cloud model) has a normal name but still sends prompts to ollama.com."""
+    for part in (data, data.get("details")):
+        if not isinstance(part, dict):
+            continue
+        for k, v in part.items():
+            if "remote" in str(k).lower() and v:      # remote_host, remote_model, ...
+                return True
+        if str(part.get("format") or "").lower() == "remote":
+            return True
+        if is_ollama_cloud(str(part.get("parent_model") or "")):
+            return True
+    for line in str(data.get("modelfile") or "").splitlines():
+        words = line.split()
+        if len(words) >= 2 and words[0].upper() == "FROM" and is_ollama_cloud(words[1]):
+            return True
+    return False
+
+
 class Gateway:
     def __init__(self, secrets: SecretStore, db_path: str, providers: list[dict] | None = None,
                  transport: "httpx.BaseTransport | None" = None, async_transport=None):
@@ -200,6 +227,8 @@ class Gateway:
         self._db_lock = threading.Lock()
         self._rate_lock = threading.Lock()
         self._hits = {}
+        self._show_lock = threading.Lock()
+        self._show_cache = {}   # model -> (time it expires, True if remote)
         _ensure_private_file(db_path)
         with self._db() as db:
             db.executescript("""
@@ -235,12 +264,75 @@ class Gateway:
         return provider, name
 
     def is_local(self, model: str) -> bool:
-        """True only if the model runs on this machine. Unknown or unusable models count as not local."""
+        """True only if the model runs on this machine. Unknown or unusable models count as not local.
+
+        For Ollama models this asks Ollama (/api/show), because a local name can point
+        to a cloud model. If Ollama can't answer, the model counts as not local."""
         try:
             provider, name = self.route(model)
         except LookupError:
             return False
-        return bool(provider.get("local")) and not is_ollama_cloud(name)
+        if not provider.get("local") or is_ollama_cloud(name):
+            return False
+        if provider["name"] != "ollama":
+            return True
+        remote, _ = self.ollama_remote(provider, name)
+        return remote is False
+
+    # Ollama /api/show check, shared by is_local and the /v1 gate
+
+    def _show_url(self, provider):
+        base = provider["base_url"]
+        return (base[:-3] if base.endswith("/v1") else base) + "/api/show"
+
+    def _show_cached(self, name):
+        with self._show_lock:
+            hit = self._show_cache.get(name)
+            if hit and hit[0] > time.monotonic():
+                return hit[1]
+            self._show_cache.pop(name, None)
+        return None
+
+    def _show_result(self, provider, name, r):
+        """Turn a /api/show reply into (remote, error). remote is None if unknown."""
+        status = r.status_code
+        try:
+            data = r.json() if status == 200 else None
+        except ValueError:
+            data = None
+        if status == 404:
+            return None, f"Model {name} not found in {provider['name']}."
+        if status != 200 or not isinstance(data, dict):
+            return None, f"{provider['name']} could not say where model {name} runs (error {status})."
+        remote = show_says_remote(data)
+        with self._show_lock:
+            self._show_cache[name] = (time.monotonic() + SHOW_CACHE_S, remote)
+        return remote, None
+
+    def ollama_remote(self, provider, name) -> tuple:
+        """(True, None) if the Ollama model runs remotely, (False, None) if locally,
+        (None, error message) if Ollama could not tell us."""
+        cached = self._show_cached(name)
+        if cached is not None:
+            return cached, None
+        try:
+            with httpx.Client(transport=self.transport, timeout=SHOW_TIMEOUT) as c:
+                r = c.post(self._show_url(provider), json={"model": name})
+        except httpx.HTTPError:
+            return None, f"Could not reach {provider['name']} at {provider['base_url']}. Is it running?"
+        return self._show_result(provider, name, r)
+
+    async def ollama_remote_async(self, provider, name) -> tuple:
+        """Same as ollama_remote, for async code."""
+        cached = self._show_cached(name)
+        if cached is not None:
+            return cached, None
+        try:
+            async with httpx.AsyncClient(transport=self.async_transport, timeout=SHOW_TIMEOUT) as c:
+                r = await c.post(self._show_url(provider), json={"model": name})
+        except httpx.HTTPError:
+            return None, f"Could not reach {provider['name']} at {provider['base_url']}. Is it running?"
+        return self._show_result(provider, name, r)
 
     def providers_status(self) -> list[dict]:
         return [{"name": p["name"], "base_url": p["base_url"], "local": bool(p.get("local")),
@@ -459,6 +551,19 @@ def make_v1_router(gw: Gateway) -> APIRouter:
             where = "Ollama cloud models" if provider.get("local") else provider["name"]
             return None, None, None, None, _oai_error(
                 403, f"This gateway key may only use local models, not {where}.", "permission_error")
+        if not key["allow_cloud"] and provider["name"] == "ollama":
+            # A local name can be a copy of a cloud model, so ask Ollama where it runs.
+            remote, problem = await gw.ollama_remote_async(provider, name)
+            if remote is None:
+                # Fail closed, but say why, so a stopped Ollama doesn't look like a permission problem.
+                status = 404 if "not found" in problem else 502
+                gw.record_usage(key["id"], key["name"], provider["name"], name, 0, 0, status, 0)
+                kind = "invalid_request_error" if status == 404 else "provider_error"
+                return None, None, None, None, _oai_error(status, problem, kind)
+            if remote:
+                return None, None, None, None, _oai_error(
+                    403, f"This gateway key may only use local models. {name} is a local name for an "
+                         f"Ollama cloud model.", "permission_error")
         return key, provider, name, dict(body, model=name), None
 
     def client():

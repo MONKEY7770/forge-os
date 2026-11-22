@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""forge-virt: turn virtual machine support on or off (the "Virtual machines" setting).
+
+Does what Bazzite's "ujust setup-virtualization" does (recipe 84-bazzite-virt.just,
+checked at ublue-os/bazzite commit fbc91909): the libvirtd service, virt-manager and its
+QEMU extension from Flathub, two kernel options, the swtpm folder and SELinux labels.
+That recipe can't run here (it refuses root and asks for a sudo password), so the same
+steps are done directly. Run by forge-virt.service, which forge-apply starts.
+
+Differences from the recipe, on purpose:
+- VM rights (the libvirt group) go to every administrator (wheel group), because there
+  is no "user who ran the command". Managing system VMs is close to root access.
+- Everything Forge changes is recorded, and turning the setting off undoes only that.
+  A setup you made yourself with ujust is never removed.
+- Turning it off also takes back the libvirt group membership Forge gave.
+"""
+import fcntl
+import grp
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, os.environ.get("FORGE_LIB", "/usr/lib/forge"))
+import forgecfg  # noqa: E402
+
+STATE = os.environ.get("FORGE_VIRT_STATE", "/var/lib/forge-virt")
+ROOT = os.environ.get("FORGE_VIRT_ROOT", "")          # for testing only
+GROUP_FILE = os.environ.get("FORGE_GROUP_FILE")       # for testing only
+RECORD = os.path.join(STATE, "state.json")
+
+APPS = ("org.virt_manager.virt-manager", "org.virt_manager.virt_manager.Extension.Qemu")
+KARGS = ("kvm.ignore_msrs=1", "kvm.report_ignored_msrs=0")
+UNITS = ("libvirtd.service", "bazzite-libvirtd-setup.service")
+USER_NAME = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+
+
+class BadRecord(Exception):
+    pass
+
+
+def run(*cmd, timeout=1800):
+    try:
+        r = subprocess.run(list(cmd), capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"{cmd[0]} failed: {e}", file=sys.stderr)
+        return None
+    return r
+
+
+def ok(*cmd, timeout=1800):
+    r = run(*cmd, timeout=timeout)
+    if r is not None and r.returncode != 0:
+        print(f"{' '.join(cmd)} failed: {(r.stderr or r.stdout).strip()[:300]}", file=sys.stderr)
+    return r is not None and r.returncode == 0
+
+
+def members(group):
+    """Members of a group, or None if the group does not exist."""
+    if GROUP_FILE:
+        with open(GROUP_FILE) as f:
+            for line in f:
+                parts = line.rstrip("\n").split(":")
+                if len(parts) == 4 and parts[0] == group:
+                    return [m for m in parts[3].split(",") if m]
+        return None
+    try:
+        return list(grp.getgrnam(group).gr_mem)
+    except KeyError:
+        return None
+
+
+def installed(app):
+    r = run("flatpak", "info", "--system", app, timeout=60)
+    return r is not None and r.returncode == 0
+
+
+def enabled(unit):
+    r = run("systemctl", "is-enabled", unit, timeout=60)
+    return r is not None and r.stdout.strip() == "enabled"
+
+
+def unit_exists(unit):
+    return any(os.path.exists(ROOT + d + unit) for d in ("/usr/lib/systemd/system/", "/etc/systemd/system/"))
+
+
+def current_kargs():
+    r = run("rpm-ostree", "kargs", timeout=120)
+    if r is None or r.returncode != 0:
+        print("Not sure which kernel options are set: rpm-ostree kargs did not answer.", file=sys.stderr)
+        return None
+    return r.stdout.split()
+
+
+def load_record():
+    """The record of what Forge changed. Only a plain file that root owns is trusted."""
+    try:
+        fd = os.open(RECORD, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return {"added_users": [], "installed_flatpaks": [], "added_kargs": [], "enabled_units": [],
+                "prepared": False}
+    except OSError as e:
+        raise BadRecord(f"{RECORD} can't be read safely ({e.strerror}).")
+    with os.fdopen(fd) as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_size > 65536:
+            raise BadRecord(f"{RECORD} is not a normal file owned by this service.")
+        try:
+            data = json.loads(f.read())
+        except ValueError:
+            raise BadRecord(f"{RECORD} is damaged.")
+    if not isinstance(data, dict):
+        raise BadRecord(f"{RECORD} is damaged.")
+
+    def names(key, allowed):
+        vals = data.get(key)
+        return [v for v in vals if isinstance(v, str) and allowed(v)] if isinstance(vals, list) else []
+    return {"added_users": names("added_users", USER_NAME.match),
+            "installed_flatpaks": names("installed_flatpaks", APPS.__contains__),
+            "added_kargs": names("added_kargs", KARGS.__contains__),
+            "enabled_units": names("enabled_units", UNITS.__contains__),
+            "prepared": data.get("prepared") is True}
+
+
+def save_record(rec):
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=STATE, prefix=".state-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(rec, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, RECORD)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def remember(rec, key, value):
+    if value not in rec[key]:
+        rec[key].append(value)
+    save_record(rec)
+
+
+def turn_on(rec):
+    failed = changed = False
+
+    # VM rights for administrators.
+    if members("libvirt") is None:
+        failed |= not ok("groupadd", "--system", "libvirt")
+    have = members("libvirt") or []
+    wheel = members("wheel")
+    admins = wheel or []
+    for user in admins:
+        if user != "root" and USER_NAME.match(user) and user not in have:
+            if ok("usermod", "-aG", "libvirt", user):
+                remember(rec, "added_users", user)
+                changed = True
+            else:
+                failed = True
+    # Someone Forge gave VM rights who is no longer an administrator loses them again.
+    # (Only when the wheel group could be read: an unreadable group says nothing about anyone.)
+    for user in [u for u in rec["added_users"] if wheel is not None and u not in admins]:
+        if user in have and not ok("gpasswd", "-d", user, "libvirt"):
+            failed = True
+            continue
+        rec["added_users"].remove(user)
+        save_record(rec)
+
+    # The libvirt service.
+    if unit_exists("libvirtd.service") and not enabled("libvirtd.service"):
+        failed |= not ok("systemctl", "enable", "--now", "libvirtd.service")
+        if enabled("libvirtd.service"):     # recorded even if it was enabled but failed to start
+            remember(rec, "enabled_units", "libvirtd.service")
+            changed = True
+
+    # virt-manager and its QEMU extension.
+    missing = [a for a in APPS if not installed(a)]
+    if missing:
+        if not ok("flatpak", "install", "--system", "--noninteractive", "flathub", *missing):
+            failed = True
+        for app in missing:
+            if installed(app):
+                remember(rec, "installed_flatpaks", app)
+                changed = True
+
+    # Kernel options (they take effect after a restart).
+    have = current_kargs()
+    if have is None:
+        failed = True
+    else:
+        want = [k for k in KARGS if k not in have and k not in rec["added_kargs"]]
+        if want:
+            if ok("rpm-ostree", "kargs", *[f"--append-if-missing={k}" for k in want], timeout=600):
+                for k in want:
+                    remember(rec, "added_kargs", k)
+                changed = True
+            else:
+                failed = True
+
+    # Once: the swtpm folder, SELinux labels, and Bazzite's enable-libvirtd-after-restart helper.
+    if not rec["prepared"]:
+        swtpm = ROOT + "/var/lib/swtpm-localca"
+        try:
+            os.makedirs(swtpm, exist_ok=True)
+            done = ok("chown", "tss", swtpm)
+        except OSError as e:
+            print(f"Can't make the folder {swtpm} ({e.strerror}).", file=sys.stderr)
+            done = False
+        done &= ok("restorecon", "-rv", ROOT + "/var/lib/libvirt")
+        done &= ok("restorecon", "-rv", ROOT + "/var/log/libvirt")
+        if unit_exists("bazzite-libvirtd-setup.service") and not enabled("bazzite-libvirtd-setup.service"):
+            if ok("systemctl", "enable", "bazzite-libvirtd-setup.service"):
+                remember(rec, "enabled_units", "bazzite-libvirtd-setup.service")
+            else:
+                done = False
+        if done:
+            rec["prepared"] = True
+            save_record(rec)
+            changed = True
+        failed |= not done
+
+    if changed:
+        print("Virtual machines are set up. Restart the PC to finish, then open Virtual Machine Manager.")
+    return 1 if failed else 0
+
+
+def turn_off(rec):
+    failed = False
+    for unit in reversed(rec["enabled_units"]):
+        if enabled(unit) and not ok("systemctl", "disable", "--now", unit):
+            failed = True
+            continue
+        rec["enabled_units"].remove(unit)
+        save_record(rec)
+    apps = [a for a in rec["installed_flatpaks"] if installed(a)]
+    if apps and not ok("flatpak", "uninstall", "--system", "--noninteractive", *apps):
+        failed = True
+    else:
+        rec["installed_flatpaks"] = []
+        save_record(rec)
+    if rec["added_kargs"]:
+        have = current_kargs()
+        drop = [k for k in rec["added_kargs"] if have is None or k in have]
+        if have is None or (drop and not ok("rpm-ostree", "kargs", *[f"--delete-if-present={k}" for k in drop],
+                                            timeout=600)):
+            failed = True
+        else:
+            rec["added_kargs"] = []
+            save_record(rec)
+    have = members("libvirt") or []
+    for user in list(rec["added_users"]):
+        if user in have and not ok("gpasswd", "-d", user, "libvirt"):
+            failed = True
+            continue
+        rec["added_users"].remove(user)
+        save_record(rec)
+    if failed:
+        return 1
+    os.unlink(RECORD)
+    print("Virtual machine support that Forge set up was removed. Restart the PC to finish.")
+    return 0
+
+
+def wanted():
+    """True or False from the settings, or None if the settings file has problems."""
+    vals, errors = forgecfg.validate(forgecfg.values())
+    if errors:
+        print("Settings have problems, so nothing is changed:\n  " + "\n  ".join(errors), file=sys.stderr)
+        return None
+    return bool(vals.get("virt.enabled"))
+
+
+def run_once(on):
+    try:
+        exists = os.path.lexists(RECORD)
+        rec = load_record()
+    except BadRecord as e:
+        print(f"{e} Nothing is changed. Remove it if you are sure no VM setup is half done.", file=sys.stderr)
+        return 1
+    if on:
+        return turn_on(rec)
+    if exists:
+        return turn_off(rec)
+    return 0
+
+
+def main():
+    # One run at a time, even when started by hand next to the service.
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    fd = os.open(os.path.join(STATE, ".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    on = wanted()
+    if on is None:
+        return 0
+    for _ in range(3):
+        rc = run_once(on)
+        # Setting up can take many minutes. If the setting changed meanwhile, systemd joined that
+        # start into this run, so follow the change here.
+        now = wanted()
+        if now is None or now == on:
+            return rc
+        on = now
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

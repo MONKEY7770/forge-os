@@ -1,0 +1,16 @@
+[Unit]
+Description=Forge OS: set up or remove virtual machine support (Virtual machines setting)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/forge-virt
+StateDirectory=forge-virt
+StateDirectoryMode=0700
+Environment=FORGE_VIRT_STATE=/var/lib/forge-virt
+# The virt-manager download can be slow on a poor connection.
+TimeoutStartSec=30min
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

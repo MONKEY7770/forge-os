@@ -7,16 +7,27 @@
   forge-api POST /api/models/pull '{"name": "qwen3:8b"}'
   forge-api PUT /api/settings '{"values": {"ai.keep_alive_min": 10}}'
 
-The token is read from /etc/forge/core.token (readable by admin users).
+Reading works for admin users. Changes need the admin token, so use sudo:
+  sudo forge-api PUT /api/settings '{"values": {"ai.keep_alive_min": 10}}'
+Secrets, gateway keys and usage, the audit log and the policy also need sudo.
 All endpoints are listed at http://127.0.0.1:47900/docs
 """
+import http.client
 import os
 import pwd
 import sys
-import urllib.error
-import urllib.request
+import time
 
 TOKEN_PATH = os.environ.get("FORGE_CORE_TOKEN", "/etc/forge/core.token")
+VIEWER_TOKEN_PATH = os.environ.get("FORGE_VIEWER_TOKEN", "/etc/forge/viewer.token")
+
+
+def read_token(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
 
 
 def port():
@@ -27,20 +38,62 @@ def port():
         return 47900
 
 
+def safe_for_terminal(text):
+    """Show control and text-direction characters as \\uXXXX, so what you read (for example
+    an approval) is what is really there: a right-to-left mark can make text look reversed."""
+    import unicodedata
+    out = []
+    for ch in text:
+        if ch in "\n\t" or unicodedata.category(ch) not in ("Cc", "Cf", "Cs", "Co"):
+            out.append(ch)
+        else:
+            out.append(f"\\u{ord(ch):04x}")
+    return "".join(out)
+
+
+def forge_uid():
+    """The forge user's uid. Tests without a forge user may name one (FORGE_API_FORGE_UID) or skip
+    the owner checks (FORGE_API_SKIP_OWNER_CHECK=1); neither is read when a forge user exists."""
+    try:
+        return pwd.getpwnam("forge").pw_uid
+    except KeyError:
+        if os.environ.get("FORGE_API_FORGE_UID", "").isdigit():
+            return int(os.environ["FORGE_API_FORGE_UID"])
+        return "skip" if os.environ.get("FORGE_API_SKIP_OWNER_CHECK") == "1" else None
+
+
+def connection_owner(port, client_port):
+    """Owner uid of the server side of our connection 127.0.0.1:client_port -> 127.0.0.1:port."""
+    local, remote = f"0100007F:{port:04X}", f"0100007F:{client_port:04X}"
+    for _ in range(20):   # the server side appears as soon as the kernel accepts the connection
+        try:
+            with open("/proc/net/tcp") as f:
+                for line in f.readlines()[1:]:
+                    cols = line.split()
+                    if cols[1] == local and cols[2] == remote and cols[3] == "01":
+                        return int(cols[7])
+        except OSError:
+            return None
+        time.sleep(0.05)
+    return None
+
+
 def listener_is_forge(port):
     """True if the process listening on 127.0.0.1:<port> belongs to the forge user.
     Stops another local user from catching the token by taking the port first."""
-    try:
-        forge_uid = pwd.getpwnam("forge").pw_uid
-    except KeyError:
-        return os.environ.get("FORGE_API_SKIP_OWNER_CHECK") == "1"
+    uid = forge_uid()
+    if uid == "skip":
+        return True
+    if uid is None:
+        return False
+    forge_uid_ = uid
     want = f"0100007F:{port:04X}"
     try:
         with open("/proc/net/tcp") as f:
             for line in f.readlines()[1:]:
                 cols = line.split()
                 if cols[1] == want and cols[3] == "0A":   # 0A means listening
-                    return int(cols[7]) == forge_uid
+                    return int(cols[7]) == forge_uid_
     except OSError:
         pass
     return False
@@ -53,30 +106,49 @@ def main():
         return 0 if a else 1
     method, path = a[0].upper(), a[1]
     body = a[2].encode() if len(a) > 2 else None
-    try:
-        token = open(TOKEN_PATH).read().strip()
-    except OSError:
-        print(f"Can't read {TOKEN_PATH}. Admin users can read it; try with sudo.", file=sys.stderr)
+    # Admin token when we can read it (root), else the read-only viewer token.
+    # FORGE_API_VIEWER=1 forces the viewer token (forge-health uses this).
+    token = "" if os.environ.get("FORGE_API_VIEWER") == "1" else read_token(TOKEN_PATH)
+    if not token:
+        if method != "GET":
+            print("Changes need admin rights: run sudo forge-api ...", file=sys.stderr)
+            return 1
+        token = read_token(VIEWER_TOKEN_PATH)
+    if not token:
+        print(f"Can't read {VIEWER_TOKEN_PATH}. Admin users can read it; try with sudo.", file=sys.stderr)
         return 1
     p = port()
     if not listener_is_forge(p):
         print("Forge Core is not running (or something else is using its port). Not sending the token.",
               file=sys.stderr)
         return 1
-    req = urllib.request.Request(f"http://127.0.0.1:{p}{path}", data=body, method=method,
-                                 headers={"Authorization": f"Bearer {token}",
-                                          "Content-Type": "application/json"})
+    conn = http.client.HTTPConnection("127.0.0.1", p)
     try:
-        with urllib.request.urlopen(req, timeout=None) as r:
-            for line in r:
-                sys.stdout.write(line.decode())
-            sys.stdout.write("\n")
-    except urllib.error.HTTPError as e:
-        print(f"Error {e.code}: {e.read().decode()}", file=sys.stderr)
-        return 1
-    except urllib.error.URLError:
+        conn.connect()
+    except OSError:
         print("Forge Core is not running. Check: systemctl status forge-core", file=sys.stderr)
         return 1
+    try:
+        # Check again on this exact connection, before anything is sent: Forge Core may have
+        # restarted since the first check, and someone else may have taken the port.
+        uid = forge_uid()
+        if uid != "skip" and connection_owner(p, conn.sock.getsockname()[1]) != uid:
+            print("The program answering on Forge Core's port is not Forge Core. Not sending the token.",
+                  file=sys.stderr)
+            return 1
+        conn.request(method, path, body=body, headers={"Authorization": f"Bearer {token}",
+                                                       "Content-Type": "application/json"})
+        r = conn.getresponse()
+        data = r.read().decode(errors="replace")
+        if r.status >= 400:
+            print(f"Error {r.status}: {safe_for_terminal(data)}", file=sys.stderr)
+            return 1
+        sys.stdout.write(safe_for_terminal(data) + "\n")
+    except OSError:
+        print("Forge Core stopped answering. Check: systemctl status forge-core", file=sys.stderr)
+        return 1
+    finally:
+        conn.close()
     return 0
 
 

@@ -1,14 +1,32 @@
 name: build-iso
 # Builds installer ISOs for both Forge OS images.
-# Run it by hand: Actions tab, "build-iso", "Run workflow".
+# Runs every Sunday on its own, from the newest image (images are only published after the
+# tests and scanners pass, and the signature is checked again below). Or run it by hand:
+# Actions tab, "build-iso", "Run workflow".
 # Each ISO appears as a downloadable artifact at the bottom of the finished run.
+# By hand you can pick the image tag (default latest), for example br-<branch>-candidate-45 for a
+# test branch. Only tags our build makes are accepted. The signature of exactly that tag is
+# checked, and the installer is built from the digest that was checked (not the tag again).
 on:
   workflow_dispatch:
     inputs:
       fedora_version:
         description: "Fedora version of the image (check the image tags if unsure)"
+        # A fixed list, not free text: the value reaches a shell inside the installer action.
+        # Add a new version here when the image moves to it.
+        type: choice
+        options:
+          - "45"
         default: "45"
         required: true
+      image_tag:
+        description: "Image tag: latest, testing, br-<branch>-candidate-45 or <sha7>-candidate-45"
+        # Checked by forge_release.py iso-tag (only the tag forms our build makes) before any use.
+        type: string
+        default: "latest"
+        required: true
+  schedule:
+    - cron: "23 9 * * 0"   # Sunday 09:23 UTC, a few hours after the daily image build
 
 jobs:
   iso:
@@ -24,6 +42,29 @@ jobs:
           - forge-os            # NVIDIA
           - forge-os-universal  # AMD, Intel, virtual machines
     steps:
+      # Only build an installer from an image that carries our signature (public key only).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+      # Scheduled runs have no input: latest. The ISO is built from the digest checked here, so
+      # nothing pushed to the tag afterwards can end up in it.
+      - name: Verify the image signature and pin its digest
+        id: image
+        env:
+          IMAGE: ghcr.io/monkey7770/${{ matrix.image }}
+          TAG_INPUT: ${{ inputs.image_tag }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          TAG="$(python3 .github/scripts/forge_release.py iso-tag "$TAG_INPUT")"
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          cosign verify --key cosign.pub "$IMAGE:$TAG" > /tmp/verify.json
+          DIGEST="$(python3 .github/scripts/forge_release.py digest < /tmp/verify.json)"
+          FOLLOW="$(python3 .github/scripts/forge_release.py iso-follow-tag "$TAG")"
+          echo "src=docker://$IMAGE@$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "tag=$FOLLOW" >> "$GITHUB_OUTPUT"
+          echo "ISO from $IMAGE:$TAG = $DIGEST (signature checked); the installed system follows $FOLLOW"
+
       - name: Free disk space (ISOs are large)
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
@@ -32,22 +73,32 @@ jobs:
 
       - name: Build ISO
         id: build
-        uses: jasonn3/build-container-installer@main
+        # Pinned to a commit (main on 2026-11-19) so a change upstream can't alter our ISOs.
+        # To update: check the new commits, then put the new full commit SHA here.
+        uses: jasonn3/build-container-installer@21ba332383d8499c2b6e3ba26cef86052d81f847
         with:
           arch: x86_64
           image_repo: ghcr.io/monkey7770   # must be lowercase
           image_name: ${{ matrix.image }}
-          image_tag: latest
-          image_signed: false
-          version: ${{ inputs.fedora_version }}
+          # The image is copied from the checked digest. image_tag is what the installed system
+          # follows for updates (and part of the ISO's volume id, at most 32 characters).
+          image_src: ${{ steps.image.outputs.src }}
+          image_tag: ${{ steps.image.outputs.tag }}
+          enable_cache_skopeo: "false"
+          # The installed system only accepts updates that carry our signature.
+          image_signed: true
+          version: ${{ inputs.fedora_version || '45' }}   # scheduled runs have no inputs
           variant: Kinoite
           iso_name: ${{ matrix.image }}.iso
-          # Bazzite's NVIDIA and other kernel modules are signed with this key.
-          secure_boot_key_url: https://github.com/ublue-os/akmods/raw/main/certs/public_key.der
+          # Bazzite's NVIDIA and other kernel modules are signed with this key. Pinned to a commit
+          # (main on 2026-11-19) so it can't change under us. sha256 of the file:
+          # 4e5c68474cb133fd8984d9599762cece9100c3e6cd8a9709aeaabd85dd9e70d1
+          # (CN=ublue kernel, O=Universal Blue, valid to 2124).
+          secure_boot_key_url: https://github.com/ublue-os/akmods/raw/8231c337b7f0f6fc18b72410adabe637be5ad039/certs/public_key.der
           enrollment_password: universalblue
 
       - name: Upload ISO
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: ${{ matrix.image }}-iso
           path: |
@@ -56,3 +107,79 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
+
+  # Boots each new ISO in a virtual machine with UEFI firmware (OVMF), with Secure Boot off and
+  # on (Microsoft's keys, like a normal PC):
+  # 1. Firmware runs on the unmodified ISO: the firmware must start its boot loader (shim) and a
+  #    graphical screen must appear. This alone does not prove the installer started.
+  # 2. Installer runs on a test copy whose grub.cfg adds a serial console (console=ttyS0). Every
+  #    other file (kernel, initrd, shim, GRUB) is checked to be byte-identical first. They pass only
+  #    when the serial console shows the kernel starting and then the installer (anaconda).
+  # Screens, serial logs and results are uploaded as "<image>-boot-test", pass or fail.
+  boot-test:
+    name: UEFI boot test (${{ matrix.image }})
+    needs: iso
+    runs-on: ubuntu-latest
+    timeout-minutes: 300   # four boots, each with its own limit: 20 min with KVM, 60 min without
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - forge-os            # NVIDIA
+          - forge-os-universal  # AMD, Intel, virtual machines
+    env:
+      ISO: iso/${{ matrix.image }}.iso
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The ISO and its test copy are on disk at the same time (two large files), like the iso job.
+      - name: Free disk space (the ISO and its test copy are large)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Download the ISO from this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: ${{ matrix.image }}-iso
+          path: iso
+
+      - name: Install QEMU, UEFI firmware and ISO tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf xorriso mtools
+          # Let QEMU use hardware acceleration (GitHub's documented udev rule).
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm || echo "No KVM on this runner: the boot test runs slower, with a longer limit."
+          df -h .
+
+      - name: Firmware run, Secure Boot off (also checks the ISO against its checksum file)
+        run: python3 .github/scripts/iso_boot_check.py --iso "$ISO" --checksum "$ISO-CHECKSUM" --out boot-test/firmware-secure-boot-off
+
+      - name: Firmware run, Secure Boot on (Microsoft keys)
+        if: ${{ !cancelled() }}
+        run: python3 .github/scripts/iso_boot_check.py --iso "$ISO" --secure-boot --out boot-test/firmware-secure-boot-on
+
+      - name: Installer run on the serial console, Secure Boot off
+        if: ${{ !cancelled() }}
+        run: python3 .github/scripts/iso_boot_check.py --iso "$ISO" --serial-copy --out boot-test/installer-secure-boot-off
+
+      - name: Installer run on the serial console, Secure Boot on (Microsoft keys)
+        if: ${{ !cancelled() }}
+        run: python3 .github/scripts/iso_boot_check.py --iso "$ISO" --serial-copy --secure-boot --out boot-test/installer-secure-boot-on
+
+      - name: Upload the screens and serial logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: ${{ matrix.image }}-boot-test
+          path: boot-test/
+          if-no-files-found: warn
+          retention-days: 14

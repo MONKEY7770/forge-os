@@ -7,5 +7,16 @@ description: Forge OS (AMD, Intel and virtual machines). Bazzite KDE with AI age
 base-image: ghcr.io/ublue-os/bazzite
 image-version: stable
 
+# Forge OS version (45.YYYYMMDD.N, set by CI in FORGE_VERSION) and commit, in Forge's own labels.
+# Bazzite's org.opencontainers.image.version stays as it is. CI checks the label before any channel tag.
+labels:
+  org.forgeos.version: "${FORGE_VERSION}"
+  org.forgeos.commit: "${GITHUB_SHA}"
+
+# BlueBuild pushes only "candidate" tags (never "latest"); CI checks the image, then points "latest"
+# (main) or "testing" (testing branch) at its digest. See .github/workflows/build.yml.
+alt-tags:
+  - candidate
+
 modules:
   - from-file: common-modules.yml

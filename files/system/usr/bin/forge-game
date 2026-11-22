@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+"""forge-game: gaming helpers for Forge OS (runs as you, never as root).
+
+  forge-game overlay apply        write your MangoHud overlay file from Forge Settings (Gaming)
+  forge-game watch [--once]       switch to gaming mode while a game runs, and back after
+  forge-game restore [--force]    switch back now if a game switched the mode (and no game runs)
+  forge-game status [--json]      overlay, mode and the games found right now
+
+Games are found by reading /proc, only your own processes: a Steam game runs under Steam's
+"reaper SteamLaunch AppId=N" process for its whole life, and Roblox runs as "sober" (Sober).
+Feral GameMode is not used: Bazzite removes it from its image.
+
+The overlay only shows in games you start with MangoHud (in Steam: launch options
+"mangohud %command%"). Forge never turns MangoHud on for every app.
+"""
+import datetime
+import html
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.environ.get("FORGE_LIB", "/usr/lib/forge"))
+import forgecfg  # noqa: E402
+
+PROC = os.environ.get("FORGE_GAME_PROC", "/proc")
+MODES = ("gaming", "agents", "creative", "quiet")
+BACK_MODES = MODES + ("default",)
+PROFILES = ("performance", "balanced", "power-saver")
+MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,200}")
+APPID = re.compile(r"AppId=([0-9]{1,12})")
+MAX_MODELS = 8
+POLL_S = 5            # seconds between looks at /proc
+EXIT_POLLS = 3        # the game must be gone this many looks in a row (15 s) before switching back
+CMDLINE_MAX = 65536
+GAME_COMMS = ("reaper", "sober")
+KEYS = ("gaming.overlay", "gaming.auto_mode", "modes.gaming.power", "modes.gaming.unload_models")
+
+MARKER = "# forge-managed: MangoHud overlay (Forge Settings, Gaming, Game overlay)"
+OVERLAY = {
+    # Hidden until you press the toggle key. Only written over a file Forge made before.
+    "off": ["no_display"],
+    # One small FPS counter.
+    "minimal": ["fps_only"],
+    # FPS, frame times and the graph, GPU and CPU load and temperature, VRAM and RAM.
+    "full": ["fps", "frametime", "frame_timing", "gpu_stats", "gpu_temp", "gpu_core_clock", "gpu_power",
+             "cpu_stats", "cpu_temp", "vram", "ram"],
+}
+TOGGLE_KEY = "Shift_R+F12"
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+# ---------- settings and small files ----------
+
+def settings():
+    """The checked settings, or None when the settings file has problems (then nothing switches)."""
+    vals, errors = forgecfg.validate(forgecfg.values())
+    if errors:
+        return None
+    return {k: vals.get(k) for k in KEYS}
+
+
+def home():
+    return os.path.realpath(os.path.expanduser("~"))
+
+
+def state_dir():
+    base = os.environ.get("XDG_STATE_HOME")
+    if not base or not os.path.isabs(base):
+        base = os.path.join(home(), ".local/state")
+    return os.path.join(base, "forge")
+
+
+def read_small(path, limit=4096, follow=True):
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | (0 if follow else os.O_NOFOLLOW)
+    fd = os.open(path, flags)
+    try:
+        return os.read(fd, limit)
+    finally:
+        os.close(fd)
+
+
+def write_atomic(path, text, mode=0o600):
+    """Replace path in one step with a new file (never written through a link)."""
+    tmp = f"{path}.tmp{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def run(argv, timeout=60):
+    """Run a fixed argv. Returns (exit code, stdout); code None if it could not run."""
+    try:
+        p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"{argv[0]} could not run: {e}")
+        return None, ""
+    if p.returncode != 0 and p.stderr.strip():
+        log(f"{argv[0]}: {p.stderr.strip()[-300:]}")
+    return p.returncode, p.stdout
+
+
+# ---------- MangoHud overlay ----------
+
+def overlay_text(preset):
+    lines = [MARKER,
+             "# Written by Forge OS from Forge Settings. Change it there: this file is replaced.",
+             "# To keep your own MangoHud settings instead, delete the first line. Forge then leaves this file alone.",
+             f"# Preset: {preset}. Right Shift+F12 shows or hides the overlay in a game.",
+             f"toggle_hud={TOGGLE_KEY}",
+             "position=top-left"]
+    return "\n".join(lines + OVERLAY[preset]) + "\n"
+
+
+def mangohud_file():
+    """Where MangoHud reads your own config: $XDG_CONFIG_HOME/MangoHud/MangoHud.conf (MangoHud's
+    src/config.cpp and src/file_utils.cpp), else ~/.config/MangoHud/MangoHud.conf."""
+    base = os.environ.get("XDG_CONFIG_HOME")
+    if not base or not os.path.isabs(base):
+        base = os.path.join(home(), ".config")
+    return os.path.join(base, "MangoHud", "MangoHud.conf")
+
+
+def overlay_state(path):
+    """"none", "forge" (a file Forge wrote), "own" (yours) or "link"."""
+    if not os.path.lexists(path):
+        return "none"
+    if os.path.islink(path):
+        return "link"
+    try:
+        first = read_small(path, 512, follow=False).decode("utf-8", "replace").split("\n", 1)[0]
+    except OSError:
+        return "own"
+    return "forge" if first.strip() == MARKER else "own"
+
+
+def cmd_overlay_apply():
+    vals = settings()
+    if vals is None:
+        print("The Forge settings have problems, so the overlay file was not changed. Run: forge-config list")
+        return 1
+    preset = vals["gaming.overlay"] if vals["gaming.overlay"] in OVERLAY else "off"
+    path = mangohud_file()
+    state = overlay_state(path)
+    if state == "link":
+        print(f"{path} is a link, so Forge leaves it alone.")
+        return 0
+    if state == "own":
+        print(f"{path} is your own MangoHud file, so Forge does not change it. "
+              "To let Forge Settings manage it, rename or delete it.")
+        return 0
+    if state == "none" and preset == "off":
+        return 0    # nothing to hide, and no file nobody asked for
+    os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+    text = overlay_text(preset)
+    if state == "forge":
+        try:
+            if read_small(path, 65536, follow=False).decode("utf-8", "replace") == text:
+                return 0
+        except OSError:
+            pass
+    write_atomic(path, text, 0o644)
+    print(f"MangoHud overlay: {preset}. Written to {path}.")
+    return 0
+
+
+# ---------- finding games ----------
+
+def _proc_text(d, name, limit):
+    return read_small(os.path.join(d, name), limit, follow=False).decode("utf-8", "replace")
+
+
+def find_games(proc=None):
+    """Your running games, from /proc. Cheap: only `comm` is read for most processes."""
+    proc = proc or PROC
+    me = os.getuid()
+    found = []
+    try:
+        names = os.listdir(proc)
+    except OSError:
+        return found
+    for pid in names:
+        if not pid.isdigit():
+            continue
+        d = os.path.join(proc, pid)
+        try:
+            if os.lstat(d).st_uid != me:
+                continue
+            comm = _proc_text(d, "comm", 64).strip()
+            if comm not in GAME_COMMS:
+                continue
+            st = _proc_text(d, "stat", 1024)
+            state = st[st.rfind(")") + 2:][:1] if ")" in st else ""
+            if state in ("Z", "X", "x", ""):
+                continue
+            if comm == "sober":
+                found.append({"pid": int(pid), "kind": "roblox", "appid": None})
+                continue
+            args = read_small(os.path.join(d, "cmdline"), CMDLINE_MAX, follow=False).split(b"\0")
+            args = [a.decode("utf-8", "replace") for a in args]
+            if not args or os.path.basename(args[0]) != "reaper" or "SteamLaunch" not in args[1:3]:
+                continue
+            for a in args[1:8]:
+                if a == "--":
+                    break
+                m = APPID.fullmatch(a)
+                if m:
+                    found.append({"pid": int(pid), "kind": "steam", "appid": m.group(1)})
+                    break
+        except (OSError, ValueError):
+            continue    # the process ended while we looked
+    return sorted(found, key=lambda g: g["pid"])
+
+
+# ---------- modes ----------
+
+def mode_path():
+    return os.path.join(state_dir(), "mode")
+
+
+def current_mode():
+    try:
+        mode = read_small(mode_path(), 64, follow=False).decode("utf-8", "replace").strip()
+    except OSError:
+        return "default"
+    return mode if mode in MODES else "default"
+
+
+def mode_mtime():
+    try:
+        return os.lstat(mode_path()).st_mtime_ns
+    except OSError:
+        return None
+
+
+def game_state_path():
+    return os.path.join(state_dir(), "game-mode.json")
+
+
+def load_state():
+    """The record of a switch a game made: a dict, {} if it is unreadable, None if there is none.
+    A link is never followed (and counts as none)."""
+    try:
+        raw = read_small(game_state_path(), 4096, follow=False)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        log(f"{game_state_path()} can't be read ({e.strerror}), so it is ignored.")
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_state(st):
+    os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+    write_atomic(game_state_path(), json.dumps(st) + "\n")
+
+
+def drop_state():
+    try:
+        os.unlink(game_state_path())
+    except FileNotFoundError:
+        pass
+
+
+def unload_models():
+    # Only ask a running Ollama service: otherwise anything could be listening on its port.
+    code, _ = run(["systemctl", "is-active", "--quiet", "ollama.service"], 15)
+    if code != 0:
+        return
+    code, out = run(["ollama", "ps"], 30)
+    if code != 0:
+        return
+    for line in out.splitlines()[1:1 + MAX_MODELS]:
+        name = line.split()[0] if line.split() else ""
+        if MODEL_NAME.fullmatch(name):
+            run(["ollama", "stop", name], 15)
+
+
+def power_now():
+    code, out = run(["powerprofilesctl", "get"], 15)
+    out = out.strip()
+    return out if code == 0 and out in PROFILES else None
+
+
+def publish():
+    tool = os.environ.get("FORGE_ACTIVITY_PUBLISH", "/usr/libexec/forge-activity-publish")
+    if os.path.isfile(tool) and os.access(tool, os.X_OK):
+        run([tool], 30)
+
+
+def root_step(mode):
+    """The agent limits for a mode, without a password: one word to the root forge-mode-switch service
+    (/run/forge-mode.sock). It checks that we are an administrator with the active local desktop
+    session. Returns (True, "") when it answered ok, else (False, why)."""
+    path = os.environ.get("FORGE_MODE_SOCKET", "/run/forge-mode.sock")
+    reply = b""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(90)
+            s.connect(path)
+            try:
+                s.sendall(f"{mode}\n".encode())
+            except (BrokenPipeError, ConnectionResetError):
+                pass    # refused before it read anything: its answer is still waiting
+            while b"\n" not in reply and len(reply) < 1024:
+                chunk = s.recv(1024)
+                if not chunk:
+                    break
+                reply += chunk
+    except OSError as e:
+        log(f"The mode switch service could not be reached ({path}: {e.strerror or e}).")
+        return False, "the mode switch service could not be reached"
+    text = reply.decode("utf-8", "replace").strip()
+    if text != "ok":
+        log(f"The mode switch service said: {text[:200] or 'nothing'}")
+        why = text[len("error:"):].strip() if text.startswith("error:") else "no clear answer"
+        return False, "".join(c for c in why[:200] if c.isprintable()) or "no clear answer"
+    return True, ""
+
+
+def tell_once_a_day(summary, body):
+    """A desktop notice, at most once a day (marker file in the state folder)."""
+    marker = os.path.join(state_dir(), "game-limits-notice")
+    try:
+        if time.time() - os.lstat(marker).st_mtime < 86400:
+            return
+    except OSError:
+        pass
+    run(["notify-send", "-a", "Forge", "--", html.escape(summary), html.escape(body)], 15)
+    try:
+        write_atomic(marker, f"{int(time.time())}\n")
+    except OSError:
+        pass
+
+
+def set_mode_file(mode):
+    os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+    write_atomic(mode_path(), mode + "\n", 0o644)
+    stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    fd = os.open(os.path.join(state_dir(), "activity.log"),
+                 os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    with os.fdopen(fd, "a") as f:
+        f.write(f"{stamp} mode={mode}\n")
+    publish()
+
+
+def enter(vals, games):
+    if current_mode() == "gaming":
+        return      # you chose gaming mode yourself: nothing to switch back later
+    st = {"prev": current_mode(), "prev_power": power_now(), "since": int(time.time()),
+          "game": games[0]["kind"] + (f":{games[0]['appid']}" if games[0]["appid"] else "")}
+    save_state(st)      # first, so a crash in the middle still gets switched back
+    if vals["modes.gaming.unload_models"]:
+        unload_models()
+    ok, why = root_step("gaming")
+    st["limits_set"] = ok
+    if not ok:
+        st["limits_error"] = why
+        log("Could not set the agent limits for gaming mode. The rest of the mode was switched.")
+        tell_once_a_day("Gaming mode could not slow down AI agents",
+                        f"The mode switch service said: {why}. AI models were still unloaded and the power "
+                        "profile set. Slowing agents down only works for an administrator using this PC's "
+                        "own screen.")
+    if vals["modes.gaming.power"] in PROFILES:
+        run(["powerprofilesctl", "set", vals["modes.gaming.power"]], 30)
+    set_mode_file("gaming")
+    st["mode_mtime_ns"] = mode_mtime()
+    save_state(st)
+    print(f"A game started ({st['game']}): switched to gaming mode.", flush=True)
+
+
+def leave(st):
+    """Back to the mode from before the game, unless you picked another mode meanwhile."""
+    stamp = st.get("mode_mtime_ns")
+    # No stamp: the switch to gaming never finished (a crash in the middle), so always switch back.
+    if isinstance(stamp, int) and (current_mode() != "gaming" or mode_mtime() != stamp):
+        drop_state()
+        print("The game ended. You changed the mode during it, so it stays as it is.", flush=True)
+        return
+    prev = st.get("prev") if st.get("prev") in BACK_MODES else "default"
+    power = st.get("prev_power") if st.get("prev_power") in PROFILES else None
+    # The limits were never changed when the game started (the service refused): nothing to undo there.
+    never_set = st.get("limits_set") is False
+    if not never_set and not root_step(prev)[0]:
+        # The agents still have the gaming limits: keep saying gaming, and try again on every look
+        # (about every 15 seconds) and at the next login, until it works.
+        tries = st.get("tries") if isinstance(st.get("tries"), int) else 0
+        if tries % 20 == 0:
+            log(f"Switching back to {prev} mode is waiting: the agent limits could not be set yet. "
+                "Forge keeps trying.")
+        st.update(pending=True, tries=tries + 1)
+        save_state(st)
+        return False
+    if power:
+        run(["powerprofilesctl", "set", power], 30)
+    set_mode_file(prev)
+    drop_state()
+    print(f"Switched back to {prev} mode.", flush=True)
+    return True
+
+
+class Watcher:
+    def __init__(self, proc=None):
+        self.proc = proc or PROC
+        self.misses = 0
+
+    def start(self):
+        """The stuck-mode guard: a switch left over from a crash, a kill or a power loss is undone
+        first, unless the game is still running."""
+        restore(force=False, proc=self.proc)
+
+    def tick(self):
+        vals = settings()
+        enabled = bool(vals and vals["gaming.auto_mode"] is True)
+        st = load_state()
+        games = find_games(self.proc) if enabled else []
+        if games:
+            self.misses = 0
+            if st is None:
+                enter(vals, games)
+            return
+        if st is None:
+            self.misses = 0
+            return
+        self.misses += 1
+        if not enabled or self.misses >= EXIT_POLLS:
+            self.misses = 0
+            leave(st)
+
+
+def restore(force=False, proc=None):
+    st = load_state()
+    if st is None:
+        return 0
+    vals = settings()
+    if not force and vals and vals["gaming.auto_mode"] is True and find_games(proc):
+        print("A game is still running: gaming mode stays on until it ends.")
+        return 0
+    leave(st)
+    return 0
+
+
+def cmd_watch(once):
+    def stop(*_):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, stop)
+    w = Watcher()
+    w.start()
+    while True:
+        try:
+            w.tick()
+        except Exception as e:   # one bad look at /proc must never stop the watcher
+            log(f"forge-game: {type(e).__name__}: {e}")
+        if once:
+            return 0
+        time.sleep(POLL_S)
+
+
+def cmd_status(as_json):
+    vals = settings() or {}
+    st = load_state()
+    path = mangohud_file()
+    out = {"auto_mode": vals.get("gaming.auto_mode"), "overlay": vals.get("gaming.overlay"),
+           "overlay_file": path, "overlay_state": overlay_state(path), "mode": current_mode(),
+           "switched_by_game": st is not None, "back_to": (st or {}).get("prev"),
+           "switch_back_pending": bool(st and st.get("pending") is True),
+           "limits_set": (st or {}).get("limits_set"), "limits_error": (st or {}).get("limits_error"),
+           "since": (st or {}).get("since"), "games": find_games(), "settings_ok": bool(vals)}
+    if as_json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return 0
+    print(f"Automatic gaming mode: {'on' if out['auto_mode'] else 'off'}")
+    print(f"Mode now: {out['mode']}" + (f" (a game switched it, back to {out['back_to']} after)"
+                                         if out["switched_by_game"] else ""))
+    if out["limits_set"] is False:
+        print(f"Gaming mode could not slow down AI agents: {out['limits_error']}.")
+    if out["switch_back_pending"]:
+        print(f"Switching back to {out['back_to']} mode is still waiting: the agent limits could not be set "
+              "yet. Forge keeps trying every 15 seconds and at login.")
+    print("Games running: " + (", ".join(g["kind"] + (f" {g['appid']}" if g["appid"] else "") for g in out["games"])
+                               or "none"))
+    print(f"Overlay: {out['overlay']} ({path}: {out['overlay_state']})")
+    return 0
+
+
+def main(argv):
+    if argv == ["overlay", "apply"]:
+        return cmd_overlay_apply()
+    if argv in (["watch"], ["watch", "--once"]):
+        return cmd_watch(once=len(argv) == 2)
+    if argv in (["restore"], ["restore", "--force"]):
+        return restore(force=len(argv) == 2)
+    if argv in (["status"], ["status", "--json"]):
+        return cmd_status(as_json=len(argv) == 2)
+    print(__doc__.strip(), file=sys.stderr)
+    return 0 if argv in (["-h"], ["--help"], ["help"]) else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

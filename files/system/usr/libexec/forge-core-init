@@ -1,12 +1,39 @@
 #!/usr/bin/env bash
-# Creates the Forge Core API token on first start.
-# Readable by the forge user (the API) and the wheel group (admin users, for forge-api).
+# Creates the Forge Core API tokens on first start, and fixes their owners and modes.
+#   core.token   admin token: root and the forge service only (root:forge 0640).
+#                Needed for every change, so admin users must use sudo forge-api.
+#   viewer.token read-only token: admin users can read it (forge:wheel 0640).
+# FORGE_ETC_DIR is only for tests; systemd runs this with the real /etc/forge.
 set -euo pipefail
-TOKEN=/etc/forge/core.token
-mkdir -p /etc/forge
-if [ ! -s "$TOKEN" ]; then
-  umask 077
-  head -c 32 /dev/urandom | base64 | tr -d '/+=\n' > "$TOKEN"
+ETC=${FORGE_ETC_DIR:-/etc/forge}
+mkdir -p "$ETC"
+# Forge Core runs this with UMask=0077, but desktop users must be able to read settings.json here.
+chmod 0755 "$ETC"
+
+# Upgrading from the old single token, which admin users could read: replace it,
+# so a copy taken before the upgrade stops working.
+if [ ! -e "$ETC/viewer.token" ] && [ -e "$ETC/core.token" ]; then
+  rm -f "$ETC/core.token"
 fi
-chown forge:wheel "$TOKEN"
-chmod 0640 "$TOKEN"
+
+make_token() {
+  local file=$1 owner=$2
+  if [ ! -s "$file" ]; then
+    # A new token goes into a new private file that is swapped in with mv, so a program
+    # that opened an old (empty) file at this path can never read the new token.
+    # Global on purpose: the exit trap must still see it if a step below fails.
+    TOKEN_TMP=$(umask 077; mktemp "$file.XXXXXX")
+    # If anything below fails, don't leave a copy of the token behind.
+    trap 'rm -f "$TOKEN_TMP"' EXIT
+    head -c 32 /dev/urandom | base64 | tr -d '/+=\n' > "$TOKEN_TMP"
+    chown "$owner" "$TOKEN_TMP"
+    chmod 0640 "$TOKEN_TMP"
+    mv -f "$TOKEN_TMP" "$file"
+    trap - EXIT
+  fi
+  chown "$owner" "$file"
+  chmod 0640 "$file"
+}
+
+make_token "$ETC/core.token" root:forge
+make_token "$ETC/viewer.token" forge:wheel

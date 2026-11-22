@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Forge Dashboard
+Comment=Health, agents, activity, backups, updates and diagnostics at a glance
+Exec=forge-settings --dashboard
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;
+Keywords=forge;dashboard;home;health;agents;approvals;backup;updates;rollback;doctor;vm;hub;

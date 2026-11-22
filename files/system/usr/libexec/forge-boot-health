@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""forge-boot-health: Forge OS start-up check for automatic rollback (greenboot).
+
+greenboot (shipped by Bazzite) runs /usr/lib/greenboot/check/required.d/60_forge_boot_health.sh
+at every start, which runs "forge-boot-health check". Exit code 3 means "this start is broken";
+greenboot then restarts the PC, and after 4 failed starts of a new system version goes back to
+the previous one. Every other exit code passes, so a bug here can never roll back a good update.
+
+It only fails on the first start(s) of a new system version: greenboot's mark
+greenboot_next_deployment_id names this very deployment (by rpm-ostree checksum or image digest) and
+it is the default boot entry, or (greenboot 0.16.3 and older) greenboot_rollback_trigger=1 while the
+countdown boot_counter is 0 or more. Never a trial: boot_counter -1 (GRUB started the other entry,
+also when both have the same image digest), a start from an older boot entry, or an old trigger
+without a countdown. It only fails for:
+
+1. Login screen: the PC starts to the desktop (graphical.target is the default), and
+   display-manager.service (the login screen) failed, or restarted 3 or more times, within 4 minutes.
+   Still starting after 4 minutes is "not sure" and passes.
+2. NVIDIA driver: the "nvidia" module was loaded on the last good start, with the same NVIDIA cards
+   and Secure Boot state (recorded by "forge-boot-health record", which greenboot runs from green.d
+   after every good start, and again 10 minutes later for a late driver), the PC has
+   an NVIDIA graphics card that is not handed to a virtual machine (vfio-pci), the image has the
+   NVIDIA driver for the running kernel, the driver is not blocked (kernel command line or
+   modprobe.d), and the module is still not loaded after 2 minutes. So a driver that never loads
+   on this PC (for example Secure Boot without the key enrolled) never counts.
+
+It never looks at optional Forge services. The disk unlock (password or USB key) happens before
+greenboot runs, so a slow unlock or a missing USB key can never count as a failure.
+Off when "Go back automatically if an update fails to start" is off in Forge Settings.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.environ.get("FORGE_LIB", "/usr/lib/forge"))
+
+BROKEN = 3
+ROOT = os.environ.get("FORGE_ROOT", "")          # for testing only
+# Test seams, only read when FORGE_ROOT is set (so never in real use).
+TEST_BIN = os.environ.get("FORGE_TEST_BIN", "") if ROOT else ""
+FAST = os.environ.get("FORGE_TEST_FAST") == "1" if ROOT else False
+CRASH = os.environ.get("FORGE_TEST_CRASH") == "1" if ROOT else False
+
+DM_WAIT_S = 1 if FAST else 240
+NVIDIA_WAIT_S = 1 if FAST else 120
+POLL_S = 0.1 if FAST else 3
+DM_MAX_RESTARTS = 3
+GRUBENV = "/boot/grub2/grubenv"
+TRIAL_VARS = ("greenboot_next_deployment_id", "greenboot_rollback_trigger", "boot_counter")
+# The login screen can't be waited for if it only starts after this check (it would always time out).
+AFTER_US = {"multi-user.target", "graphical.target", "greenboot-healthcheck.service", "boot-complete.target",
+            "greenboot-success.target"}
+BLACKLIST = re.compile(r"(?:^|\s)(?:modprobe\.blacklist|rd\.driver\.blacklist|module_blacklist)=(\S*)")
+MODPROBE_DIRS = ("/etc/modprobe.d", "/run/modprobe.d", "/usr/local/lib/modprobe.d", "/usr/lib/modprobe.d")
+NO_OP = {"/bin/false", "/bin/true", "/usr/bin/false", "/usr/bin/true", "false", "true"}
+BASELINE_DIR = "/var/lib/forge-boot-health"
+BASELINE = BASELINE_DIR + "/last-good.json"
+
+
+def path(p):
+    return ROOT + p
+
+
+def query(*cmd, timeout=30):
+    """(exit code, stdout) of a read-only tool, or None if it is missing or hangs."""
+    exe = os.path.join(TEST_BIN, cmd[0]) if TEST_BIN else "/usr/bin/" + cmd[0]
+    try:
+        r = subprocess.run([exe, *cmd[1:]], capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL, env=dict(os.environ, LC_ALL="C"), errors="replace")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.returncode, r.stdout
+
+
+def read_small(p, limit=4096):
+    try:
+        with open(p, "rb") as f:
+            return f.read(limit).decode("ascii", "replace").strip()
+    except OSError:
+        return ""
+
+
+def rollback_on():
+    try:
+        import forgecfg
+        return forgecfg.values().get("updates.auto_rollback") is not False
+    except Exception:   # noqa: BLE001 (settings can never make this check fail)
+        return True
+
+
+def is_trial(env, booted_ids):
+    """The first start(s) of a new version, from GRUB's environment (dict of text) and the ids of the
+    running deployment. greenboot 0.16.4+ marks the new deployment by id. greenboot 0.16.3 and older
+    set greenboot_rollback_trigger=1, which only counts while a countdown runs (boot_counter 0 or
+    more: at 0, greenboot 0.16.6 rolls back by that trigger). boot_counter -1 (the restored old
+    version) and a trigger without a countdown (left behind, nobody clears it) never count."""
+    counter = env.get("boot_counter", "").strip()
+    if counter == "-1":
+        # GRUB itself fell back to the other entry: never a trial start, even when the new deployment
+        # has the same image digest (a redeploy for kernel options), which greenboot can't tell apart.
+        return False
+    nid = env.get("greenboot_next_deployment_id", "").strip()
+    if nid and nid in booted_ids:
+        return True
+    return env.get("greenboot_rollback_trigger", "").strip() == "1" and counter.isdigit()
+
+
+def booted_ids():
+    """The running deployment's rpm-ostree checksum and image digest (greenboot uses one of them),
+    only when it is the default boot entry (the first one that is not waiting for a restart). A new
+    version always starts as the default entry; one started from further down the boot menu is not
+    a trial, whatever the marks say."""
+    got = query("rpm-ostree", "status", "--json", timeout=60)
+    if not got or got[0] != 0:
+        return set()
+    try:
+        deps = json.loads(got[1]).get("deployments")
+    except (ValueError, AttributeError, RecursionError):
+        return set()
+    order = [d for d in deps if isinstance(d, dict) and d.get("staged") is not True] if isinstance(deps, list) else []
+    if not order or order[0].get("booted") is not True:
+        return set()
+    d = order[0]
+    return {v for v in (d.get("checksum"), d.get("container-image-reference-digest"))
+            if isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9:]{1,128}", v)}
+
+
+def trial_start():
+    got = query("grub2-editenv", GRUBENV, "list")
+    if not got or got[0] != 0:
+        return False
+    env = {}
+    for line in got[1].splitlines():
+        k, sep, val = line.partition("=")
+        if sep:
+            env[k] = val
+    if not any(env.get(k) for k in TRIAL_VARS):
+        return False
+    return is_trial(env, booted_ids())
+
+
+def modprobe_blocks_nvidia():
+    """True if a modprobe.d file blacklists nvidia or replaces loading it with true or false."""
+    for d in MODPROBE_DIRS:
+        try:
+            names = sorted(n for n in os.listdir(path(d)) if n.endswith(".conf"))
+        except OSError:
+            continue
+        for n in names:
+            for line in read_small(os.path.join(path(d), n), 65536).splitlines():
+                words = line.split("#", 1)[0].split()
+                if words[:2] == ["blacklist", "nvidia"]:
+                    return True
+                if words[:2] == ["install", "nvidia"] and len(words) == 3 and words[2] in NO_OP:
+                    return True
+    return False
+
+
+def nvidia_was_loaded_before():
+    """("yes" | "no" | "changed", text) from the last good start's record. Only "yes" lets the check
+    fail: the driver was loaded then, with the same NVIDIA cards and the same Secure Boot state."""
+    rec = read_record()
+    if rec is None or rec.get("nvidia_loaded") is not True:
+        return "no", "the NVIDIA driver was not loaded on the last good start either, so it can't tell"
+    if not isinstance(rec.get("gpus"), list) or "secure_boot" not in rec:
+        return "no", "the record of the last good start is from an older Forge OS, so it can't tell"
+    gpus, sb = hardware_now()
+    if rec["gpus"] != gpus or rec["secure_boot"] != sb:
+        return "changed", "the NVIDIA card or Secure Boot changed since the last good start, so it can't tell"
+    if rec.get("late") is True:
+        # Loaded only by the late pass (10 minutes in): it may well load after this check's wait again.
+        return "no", "the NVIDIA driver only loaded late on the last good start, so it can't tell"
+    return "yes", ""
+
+
+def read_record():
+    try:
+        fd = os.open(path(BASELINE), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        data = os.read(fd, 4097)
+    finally:
+        os.close(fd)
+    try:
+        obj = json.loads(data.decode("utf-8")) if len(data) <= 4096 else None
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    return obj if isinstance(obj, dict) and obj.get("format") == 1 else None
+
+
+def record(late=False):
+    """Called by greenboot after a good start (and again 10 minutes later with late=True, for a driver
+    that loads late): remember whether the NVIDIA driver was loaded, with the NVIDIA cards and the
+    Secure Boot state it was loaded with."""
+    folder = path(BASELINE_DIR)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    dfd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if os.fstat(dfd).st_uid != os.geteuid():
+            raise OSError("the record folder has another owner")
+        os.fchmod(dfd, 0o700)
+        gpus, sb = hardware_now()
+        if late:
+            old = read_record()
+            if (old is not None and old.get("nvidia_loaded") is True and old.get("late") is not True
+                    and old.get("gpus") == gpus and old.get("secure_boot") == sb):
+                print("forge-boot-health: the record of this good start already says loaded, kept")
+                return
+        text = json.dumps({"format": 1, "nvidia_loaded": os.path.isdir(path("/sys/module/nvidia")),
+                           "gpus": gpus, "secure_boot": sb, "late": bool(late), "ts": int(time.time())})
+        tmp = f".last-good-{os.urandom(6).hex()}"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(text + "\n")
+            os.replace(tmp, "last-good.json", src_dir_fd=dfd, dst_dir_fd=dfd)
+        except BaseException:
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except OSError:
+                pass
+            raise
+    finally:
+        os.close(dfd)
+    print(f"forge-boot-health: recorded this good start ({text})")
+
+
+def unit_props(unit):
+    got = query("systemctl", "show", unit, "--property=LoadState,ActiveState,SubState,NRestarts,After")
+    if not got or got[0] != 0:
+        return None
+    props = {}
+    for line in got[1].splitlines():
+        k, sep, val = line.partition("=")
+        if sep:
+            props[k] = val.strip()
+    return props
+
+
+def check_login_screen():
+    """("ok" | "skipped" | "not sure" | "BROKEN", text)."""
+    got = query("systemctl", "get-default")
+    if not got or got[1].strip() != "graphical.target":
+        return "skipped", "the PC does not start to the desktop by default"
+    props = unit_props("display-manager.service")
+    if not props or props.get("LoadState") != "loaded":
+        return "skipped", "no login screen service (display-manager.service) found"
+    if AFTER_US & set(props.get("After", "").split()):
+        return "skipped", "the login screen only starts after this check, so it can't be checked here"
+    deadline = time.monotonic() + DM_WAIT_S
+    while True:
+        state, sub = props.get("ActiveState"), props.get("SubState")
+        restarts = props.get("NRestarts", "0")
+        if state == "active" and sub == "running":
+            return "ok", "the login screen is running"
+        if state == "failed":
+            return "BROKEN", "the login screen service (display-manager.service) failed"
+        if restarts.isdigit() and int(restarts) >= DM_MAX_RESTARTS:
+            return "BROKEN", f"the login screen service keeps crashing ({restarts} restarts)"
+        if time.monotonic() >= deadline:
+            return "not sure", f"the login screen is still starting ({state}/{sub}), not failing the start"
+        time.sleep(POLL_S)
+        props = unit_props("display-manager.service") or props
+
+
+def nvidia_gpus():
+    """PCI display devices from NVIDIA, as (slot, driver name or None, "10de:<device>"). Text from /sys
+    is checked."""
+    base = path("/sys/bus/pci/devices")
+    out = []
+    try:
+        slots = sorted(os.listdir(base))
+    except OSError:
+        return out
+    for slot in slots:
+        if not re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]", slot):
+            continue
+        d = os.path.join(base, slot)
+        vendor, cls = read_small(os.path.join(d, "vendor")), read_small(os.path.join(d, "class"))
+        if vendor.lower() != "0x10de" or not re.fullmatch(r"0x03[0-9a-fA-F]{4}", cls):
+            continue
+        try:
+            driver = os.path.basename(os.readlink(os.path.join(d, "driver")))
+        except OSError:
+            driver = None
+        device = read_small(os.path.join(d, "device")).lower()
+        out.append((slot, driver, "10de:" + (device[2:] if re.fullmatch(r"0x[0-9a-f]{4}", device) else "?")))
+    return out
+
+
+SB_VAR = "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+
+
+def secure_boot():
+    """True or False from the firmware's SecureBoot variable, None when it can't be read."""
+    try:
+        with open(path(SB_VAR), "rb") as f:
+            data = f.read(16)
+    except OSError:
+        return None
+    return data[4] == 1 if len(data) >= 5 else None
+
+
+def hardware_now():
+    return sorted(g[2] for g in nvidia_gpus() if g[1] != "vfio-pci"), secure_boot()
+
+
+def check_nvidia():
+    gpus = [g for g in nvidia_gpus() if g[1] != "vfio-pci"]
+    if not gpus:
+        return "skipped", "no NVIDIA graphics card in use by this system"
+    for m in BLACKLIST.finditer(read_small(path("/proc/cmdline"))):
+        if "nvidia" in m.group(1).split(","):
+            return "skipped", "the NVIDIA driver is blocked on the kernel command line on purpose"
+    if modprobe_blocks_nvidia():
+        return "skipped", "the NVIDIA driver is blocked on purpose in modprobe.d"
+    got = query("modinfo", "-n", "nvidia")
+    if not got or got[0] != 0:
+        return "skipped", "no NVIDIA driver in this image (for example forge-os-universal)"
+    before, why = nvidia_was_loaded_before()
+    if before != "yes":
+        return "skipped", why
+    deadline = time.monotonic() + NVIDIA_WAIT_S
+    while not os.path.isdir(path("/sys/module/nvidia")):
+        if time.monotonic() >= deadline:
+            return "BROKEN", (f"the NVIDIA driver did not load for {len(gpus)} NVIDIA card(s) "
+                              f"(driver now: {', '.join(g[1] or 'none' for g in gpus)})")
+        time.sleep(POLL_S)
+    return "ok", "the nvidia module is loaded"
+
+
+def check():
+    if CRASH:
+        raise RuntimeError("test crash")
+    if not rollback_on():
+        print("forge-boot-health: automatic rollback is off in Forge Settings, nothing checked.")
+        return 0
+    if not trial_start():
+        print("forge-boot-health: not the first start of a new system version, nothing to check.")
+        return 0
+    broken = False
+    for name, fn in (("login screen", check_login_screen), ("NVIDIA driver", check_nvidia)):
+        state, text = fn()
+        print(f"forge-boot-health: {name}: {state}: {text}")
+        broken |= state == "BROKEN"
+    return BROKEN if broken else 0
+
+
+def main():
+    if sys.argv[1:] not in (["check"], ["record"], ["record", "--late"]):
+        print("usage: forge-boot-health check|record [--late]", file=sys.stderr)
+        return 2
+    if sys.argv[1] == "record":
+        try:
+            record(late=sys.argv[2:] == ["--late"])
+        except Exception as e:   # noqa: BLE001 (a good start stays good)
+            print(f"forge-boot-health: could not record this start ({e.__class__.__name__})")
+        return 0
+    try:
+        return check()
+    except Exception as e:   # noqa: BLE001 (a bug here must never roll back a good update)
+        print(f"forge-boot-health: not sure ({e.__class__.__name__}), not failing the start.")
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

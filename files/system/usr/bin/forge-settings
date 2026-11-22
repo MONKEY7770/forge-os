@@ -3,24 +3,63 @@
 
 Opens a local page in your browser. It only listens on this PC
 (127.0.0.1) and needs a secret token, so no other device or website
-can use it. It closes itself a couple of minutes after you close the tab.
+can use it. It also checks that every request comes from a program
+running as you, so other users on this PC can't use it either.
+It closes itself a couple of minutes after you close the tab.
 """
+import errno
+import html
+import ipaddress
 import json
 import os
+import re
 import secrets
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.environ.get("FORGE_LIB", "/usr/lib/forge"))
 import forgecfg  # noqa: E402
+import forgedash  # noqa: E402
+import forgeappearance  # noqa: E402
+import forgerelease  # noqa: E402
+import forgei18n  # noqa: E402
+import forgepresets  # noqa: E402
 
 APPLY = os.environ.get("FORGE_APPLY", "/usr/libexec/forge-apply")
 TOKEN = secrets.token_urlsafe(24)
+# One-time key in the launch URL. The page is only served to a request that
+# carries it. The browser gets it through a private page (launch_page()), never
+# on a command line, which any local user could read from /proc/<pid>/cmdline.
+# What stops other users is the owner check in peer_uids().
+LAUNCH_KEY = secrets.token_urlsafe(24)
+LAUNCH_PAGE = None              # that private page's path, removed once the page is served
+# Where the kernel lists open TCP sockets. Tests point this at fake files.
+PROC_NET = "/proc/net"
 last_seen = time.time()
+page_served = False
+page_lock = threading.Lock()
+WELCOME = False                 # --welcome: serve the first-boot welcome page instead
+WELCOME_ONCE = False            # --welcome-once: record that it was shown once it is served
+DASHBOARD = False               # --dashboard: serve the Forge Dashboard (home screen) instead
+DASH = None                     # forgedash.Dashboard, only in dashboard mode
+# Scripts and styles on the dashboard page only run with this per-start nonce (see end_headers).
+NONCE = secrets.token_urlsafe(18)
+DASH_BODY_MAX = 64 * 1024
+# Appearance: a second key only for reading your media files in <img> and <video> tags, which can't send
+# the token header. It is in the page, like the token, and only works for the owner (same checks).
+MEDIA_KEY = secrets.token_urlsafe(24)
+LOOK_BODY_MAX = 64 * 1024
+# Preview scripts for the Appearance page that later parts of Forge OS add: <section id>.js in here.
+PREVIEW_DIR = os.environ.get("FORGE_APPEARANCE_PREVIEWS", "/usr/share/forge/appearance-preview")
+PREVIEW_MAX = 256 * 1024
+doctor_lock = threading.Lock()
+doctor_last = {"at": None, "report": None}
 
 
 def run_apply(args):
@@ -33,20 +72,104 @@ def run_apply(args):
     return r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
-def save(values):
+def save(values, merge=False, switch=None):
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump(values, f)
         tmp = f.name
     os.chmod(tmp, 0o644)
     try:
-        return run_apply(["--import", tmp])
+        # switch: the update channel the user confirmed on the page (forge-apply switches, then saves).
+        return run_apply(["--import", tmp] + (["--merge"] if merge else [])
+                         + (["--switch-channel", switch, "--confirm"] if switch else []))
     finally:
         os.unlink(tmp)
 
 
+def _addr(hexaddr):
+    # /proc prints each 32-bit word in the machine's byte order.
+    raw = bytes.fromhex(hexaddr)
+    if sys.byteorder == "little":
+        raw = b"".join(raw[i:i + 4][::-1] for i in range(0, len(raw), 4))
+    ip = ipaddress.ip_address(raw)
+    return getattr(ip, "ipv4_mapped", None) or ip
+
+
+def peer_sockets(client, server):
+    """Owners of the client sockets for exactly this connection: client (ip, port) to server (ip, port).
+
+    Matching the full addresses matters: another user can bind a different local address with
+    the same port number as the owner's browser.
+    """
+    client = (ipaddress.ip_address(client[0]), int(client[1]))
+    server = (ipaddress.ip_address(server[0]), int(server[1]))
+    client = (getattr(client[0], "ipv4_mapped", None) or client[0], client[1])
+    server = (getattr(server[0], "ipv4_mapped", None) or server[0], server[1])
+    uids = []
+    for name in ("tcp", "tcp6"):
+        try:
+            with open(os.path.join(PROC_NET, name)) as f:
+                lines = f.readlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            try:
+                local, remote, state, uid = parts[1], parts[2], parts[3], int(parts[7])
+                lip, lport = local.split(":")
+                rip, rport = remote.split(":")
+                if state in ("06", "0A"):
+                    continue  # closed (TIME_WAIT) or listening sockets
+                if ((_addr(lip), int(lport, 16)), (_addr(rip), int(rport, 16))) != (client, server):
+                    continue
+            except (IndexError, ValueError):
+                continue
+            uids.append(uid)
+    return uids
+
+
+def peer_uids(client_port, server_port):
+    """Owners of loopback client sockets from client_port to server_port (kept for older callers)."""
+    lo = "127.0.0.1"
+    return set(peer_sockets((lo, client_port), (lo, server_port)))
+
+
+def owner_connection(client_address, server_address):
+    """True only for exactly one loopback connection whose client socket is ours."""
+    try:
+        if not ipaddress.ip_address(client_address[0]).is_loopback:
+            return False
+        uids = peer_sockets(client_address[:2], server_address[:2])
+    except ValueError:
+        return False
+    return uids == [os.getuid()]
+
+
 class Handler(BaseHTTPRequestHandler):
+    # A connection that sends nothing for this long is closed, so nobody can hold threads open.
+    timeout = float(os.environ.get("FORGE_CONN_TIMEOUT_S", "10"))
+
     def log_message(self, *a):
         pass
+
+    def end_headers(self):
+        # Every response, including the server's own error pages: no other web page may show
+        # this one inside a frame (clickjacking).
+        self.send_header("X-Frame-Options", "DENY")
+        if getattr(self, "csp", None):
+            self.send_header("Content-Security-Policy", self.csp)   # a media file: its own, stricter policy
+        elif DASHBOARD:
+            # Stricter for the dashboard: nothing from outside this PC, no inline code without the nonce.
+            self.send_header("Content-Security-Policy",
+                             f"default-src 'none'; script-src 'nonce-{NONCE}'; style-src 'nonce-{NONCE}'; "
+                             "connect-src 'self'; img-src data: blob:; base-uri 'none'; form-action 'none'; "
+                             "frame-ancestors 'none'")
+        else:
+            # The settings and welcome pages: the same, plus your own media files for the Appearance previews.
+            self.send_header("Content-Security-Policy",
+                             f"default-src 'none'; script-src 'nonce-{NONCE}'; style-src 'nonce-{NONCE}'; "
+                             "connect-src 'self'; img-src 'self' data: blob:; media-src 'self'; base-uri 'none'; "
+                             "form-action 'none'; frame-ancestors 'none'")
+        super().end_headers()
 
     def send(self, code, body, ctype="application/json"):
         data = body.encode() if isinstance(body, str) else body
@@ -60,11 +183,59 @@ class Handler(BaseHTTPRequestHandler):
     def authed(self):
         return secrets.compare_digest(self.headers.get("X-Forge-Token", ""), TOKEN)
 
+    def host_ok(self):
+        # Blocks "DNS rebinding": a web page pretending to be 127.0.0.1 under its own name.
+        return self.headers.get("Host", "") == f"127.0.0.1:{self.server.server_address[1]}"
+
+    def peer_ok(self):
+        return owner_connection(self.client_address, self.server.server_address)
+
+    def allowed(self):
+        return self.host_ok() and self.peer_ok()
+
     def do_GET(self):
-        global last_seen
-        last_seen = time.time()
-        if self.path.split("?")[0] == "/":
-            self.send(200, PAGE.replace("__TOKEN__", TOKEN), "text/html; charset=utf-8")
+        global last_seen, page_served
+        if not self.allowed():
+            return self.send(403, "{}")
+        path, _, query = self.path.partition("?")
+        if path != "/" and self.authed():
+            # Only requests that passed the token check keep the page alive: any web page in your
+            # browser can send the others.
+            last_seen = time.time()
+        if path == "/":
+            # The page carries the secret token, so it is handed out once, to the browser
+            # that opened it with the launch key. Anything asking later gets nothing.
+            key = urllib.parse.parse_qs(query).get("k", [""])[0]
+            name = "Forge Dashboard" if DASHBOARD else "Forge Settings"
+            with page_lock:
+                if page_served:
+                    return self.send(403, f"{name} is already open in a browser tab. "
+                                          f"Close it and open {name} again.", "text/plain")
+                if not secrets.compare_digest(key.encode(), LAUNCH_KEY.encode()):
+                    return self.send(403, f"Open {name} from the app menu.", "text/plain")
+                page_served = True  # the launch key is used up now
+                last_seen = time.time()
+                forget_launch_page()
+                if WELCOME_ONCE:
+                    mark_welcome_shown()
+            if DASHBOARD:
+                return self.send(200, dashboard_page(), "text/html; charset=utf-8")
+            if WELCOME:
+                return self.send(200, WELCOME_PAGE.replace("__TOKEN__", TOKEN).replace("__NONCE__", NONCE)
+                                 .replace("<!--__I18N__-->", i18n_block(), 1), "text/html; charset=utf-8")
+            self.send(200, settings_page(), "text/html; charset=utf-8")
+        elif self.path == "/api/ping" and self.authed():
+            self.send(200, "{}")
+        elif path == "/api/i18n" and self.authed():
+            # The text tables for the page, in your language (Thai or English).
+            self.send(200, json.dumps(forgei18n.page_data(forgei18n.language())))
+        elif DASHBOARD:
+            # The dashboard only reads; the settings endpoints below don't exist in this mode.
+            self.dash_get(path)
+        elif path.startswith("/api/appearance") and not WELCOME:
+            self.look_get(path, query)
+        elif path.startswith("/appearance-preview/") and not WELCOME:
+            self.preview_get(path)
         elif self.path == "/api/settings" and self.authed():
             schema = forgecfg.load_schema()
             self.send(200, json.dumps({
@@ -72,25 +243,133 @@ class Handler(BaseHTTPRequestHandler):
                 "values": forgecfg.values(schema),
                 "file": forgecfg.OVERRIDES_PATH,
                 "can_undo": os.path.exists(forgecfg.OVERRIDES_PATH + ".bak"),
+                "forge_version": forgerelease.version_text(forgerelease.read_version()),
             }))
-        elif self.path == "/api/ping" and self.authed():
-            self.send(200, "{}")
+        elif path == "/api/export" and self.authed():
+            # Export button: the same file as forge-config export (portable leaves out this PC's own settings).
+            schema = forgecfg.load_schema()
+            clean, errors = forgecfg.validate(forgecfg.values(schema), schema)
+            if errors:
+                return self.send(200, json.dumps({"error": "\n".join(errors)}))
+            when = time.strftime(forgecfg.TIME_FORMAT, time.gmtime())
+            self.send(200, json.dumps(forgecfg.export_doc(clean, schema, query == "portable=1", forgecfg.this_host(),
+                                                          forgecfg.image_name(), when)))
+        elif self.path == "/api/doctor" and self.authed():
+            report = doctor_report()
+            self.send(200 if report else 500, json.dumps(report or {"error": "The report could not be built. "
+                                                                              "Run forge-doctor for details."}))
         else:
             self.send(404, "{}")
 
+    def send_dash(self, data):
+        """Every dashboard answer goes out through here: text from Forge Core and the tools loses its
+        control and format characters (bidi overrides and the like) in this one place."""
+        self.send(200, json.dumps(forgedash.scrub(data)))
+
+    def dash_get(self, path):
+        if not self.authed():
+            return self.send(404, "{}")
+        if path == "/api/dash/doctor.txt":
+            text = DASH.doctor_text()
+            if text is None:
+                return self.send(500, "The report could not be built. Run forge-doctor in a terminal.", "text/plain")
+            data = forgedash.scrub(text).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="forge-doctor-{time.strftime("%Y%m%d-%H%M%S")}.txt"')
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        reader = {"/api/dash/home": DASH.home, "/api/dash/metrics": DASH.metrics, "/api/dash/history": DASH.history,
+                  "/api/dash/agents": DASH.agents, "/api/dash/timeline": DASH.timeline,
+                  "/api/dash/updates": DASH.updates, "/api/dash/backup": DASH.backup,
+                  "/api/dash/storage": DASH.storage, "/api/dash/sync": DASH.sync, "/api/dash/hub": DASH.hub,
+                  "/api/dash/vms": DASH.vms, "/api/dash/doctor": DASH.doctor_report}.get(path)
+        if reader is None:
+            return self.send(404, "{}")
+        self.send_dash(reader())
+
+    def dash_post(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            return self.send(400, "{}")
+        if not 0 <= length <= DASH_BODY_MAX:
+            return self.send(413, "{}")
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            return self.send(400, "{}")
+        if not isinstance(body, dict):
+            return self.send(400, "{}")
+        if self.path == "/api/dash/action":
+            return self.send_dash(DASH.action(body))
+        if self.path == "/api/dash/approvals":
+            return self.send_dash(DASH.load_approvals())
+        if self.path == "/api/dash/sync-diff":
+            return self.send_dash(DASH.sync_diff(body))
+        if self.path == "/api/dash/logs":
+            return self.send_dash(DASH.logs(body))
+        self.send(404, "{}")
+
     def do_POST(self):
         global last_seen
-        last_seen = time.time()
-        if not self.authed():
+        if not self.allowed() or not self.authed():
             return self.send(403, "{}")
+        last_seen = time.time()
+        if DASHBOARD:
+            return self.dash_post()
+        if self.path == "/api/ui/language":
+            return self.language_post()
+        if self.path.startswith("/api/appearance"):
+            return self.send(404, "{}") if WELCOME else self.look_post()
+        if self.path == "/api/open-dashboard":
+            # The Settings and Welcome pages' "Open Forge Dashboard" button. Nothing from the request is used.
+            try:
+                subprocess.Popen(["forge-settings", "--dashboard"], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            except OSError:
+                return self.send(200, json.dumps({"ok": False}))
+            return self.send(200, json.dumps({"ok": True}))
         body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
-        if self.path == "/api/save":
+        if self.path == "/api/save" and body.get("merge") is True:
+            # Only the given settings change (the welcome page). Checked here first, then
+            # forge-apply checks again against the file as it is when it saves.
+            schema = forgecfg.load_schema()
+            given = body.get("values")
+            keys = {s["key"] for s in schema["settings"]}
+            if not isinstance(given, dict) or not given or not set(given) <= keys:
+                return self.send(200, json.dumps({"ok": False, "output": "Unknown settings."}))
+            _, errors = forgecfg.validate(forgecfg.values(schema, dict(forgecfg.load_overrides(), **given)), schema)
+            if errors:
+                return self.send(200, json.dumps({"ok": False, "output": "\n".join(errors)}))
+            ok, out = save(given, merge=True)
+            self.send(200, json.dumps({"ok": ok, "output": out}))
+        elif self.path == "/api/save":
             schema = forgecfg.load_schema()
             clean, errors = forgecfg.validate(body.get("values", {}), schema)
             if errors:
                 return self.send(200, json.dumps({"ok": False, "output": "\n".join(errors)}))
-            ok, out = save(clean)
+            switch = body.get("switch_channel")
+            if switch is not None and (not isinstance(switch, str) or switch not in forgerelease.CHANNEL_TAGS
+                                       or clean.get("updates.channel") != switch):
+                return self.send(200, json.dumps({"ok": False, "output": "Not saved: the channel to switch to does not "
+                                                                          "match the Update channel setting."}))
+            ok, out = save(clean, switch=switch)
             self.send(200, json.dumps({"ok": ok, "output": out}))
+        elif self.path == "/api/import-check":
+            # Import button: only checks the file. Its settings become unsaved changes on the page,
+            # so you see them first, and Save and apply asks for your password as usual.
+            text = body.get("text")
+            if not isinstance(text, str):
+                return self.send(200, json.dumps({"ok": False, "output": "That is not a settings file."}))
+            settings, _, notes, err = forgecfg.parse_export(text.encode(), forgecfg.load_schema(), allow_plain=True)
+            if err:
+                return self.send(200, json.dumps({"ok": False, "output": "Not imported: " + err}))
+            self.send(200, json.dumps({"ok": True, "values": settings, "notes": notes}))
         elif self.path == "/api/undo":
             bak = forgecfg.OVERRIDES_PATH + ".bak"
             if not os.path.exists(bak):
@@ -101,23 +380,539 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send(404, "{}")
 
+    # Appearance (per user, never root, never forge-apply).
+
+    def look_get(self, path, query):
+        if path.startswith("/api/appearance/media/"):
+            return self.look_media(path.rsplit("/", 1)[1], query)
+        if not self.authed():
+            return self.send(404, "{}")
+        if path == "/api/appearance":
+            schema = forgeappearance.load_schema()
+            media = forgeappearance.media_list()
+            return self.send(200, json.dumps({
+                "schema": schema, "values": forgeappearance.load(schema), "media": media,
+                "backends": {s["id"]: forgeappearance.backend_installed(s["id"]) for s in schema["sections"]},
+                "caps": {"file": forgeappearance.FILE_CAP, "total": forgeappearance.TOTAL_CAP,
+                         "used": sum(m["size"] for m in media)},
+                "file": forgeappearance.config_path(), "media_dir": forgeappearance.media_dir(),
+                "media_problem": forgeappearance.index_problem()}))
+        if path == "/api/appearance/media":
+            return self.send(200, json.dumps(forgeappearance.media_list()))
+        if path == "/api/appearance/presets":
+            schema = forgeappearance.load_schema()
+            configured, message = forgepresets.sync_configured()
+            return self.send(200, json.dumps({"presets": forgepresets.list_presets(schema),
+                                              "sync": {"configured": configured, "message": message,
+                                                       "reduced": configured and forgepresets.sync_reduced()}}))
+        if path == "/api/appearance/presets/export":
+            return self.preset_export(urllib.parse.parse_qs(query).get("id", [""])[0])
+        if path == "/api/appearance/choices":
+            # Lists for text fields with "choices": "backend" (the section's program, run as you, argv "options").
+            sid = urllib.parse.parse_qs(query).get("section", [""])[0]
+            try:
+                state, fields, text = forgeappearance.section_choices(sid, forgeappearance.load_schema())
+            except ValueError:
+                return self.send(200, json.dumps({"ok": False, "fields": {}, "output": "Unknown section."}))
+            return self.send(200, json.dumps({"ok": state in ("ok", "none"), "fields": fields, "output": text}))
+        self.send(404, "{}")
+
+    def look_media(self, mid, query):
+        """One media file, only for the owner with the token or the media key. The type comes from the
+        file's bytes (checked when it was added), never from its name. SVG is never shown inline: it can
+        hold scripts, so it is only offered as a download."""
+        key = urllib.parse.parse_qs(query).get("t", [""])[0]
+        if not (self.authed() or secrets.compare_digest(key.encode(), MEDIA_KEY.encode())):
+            return self.send(404, "{}")
+        path = forgeappearance.media_path(mid)
+        item = forgeappearance.media_index().get(mid) if path else None
+        if item is None:
+            return self.send(404, "{}")
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError:
+            return self.send(404, "{}")
+        with os.fdopen(fd, "rb") as f:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                return self.send(404, "{}")
+            size, start, end = st.st_size, 0, st.st_size - 1
+            rng = self.headers.get("Range", "")
+            partial = False
+            m = re.fullmatch(r"bytes=(\d{0,19})-(\d{0,19})", rng.strip())
+            if m and (m.group(1) or m.group(2)) and size:
+                if m.group(1):
+                    start = int(m.group(1))
+                    end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+                else:
+                    start = max(0, size - int(m.group(2)))
+                if start > end or start >= size:
+                    self.csp = "default-src 'none'; sandbox; frame-ancestors 'none'"
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                partial = True
+            self.csp = "default-src 'none'; sandbox; frame-ancestors 'none'"
+            self.send_response(206 if partial else 200)
+            if item["format"] == "svg":
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition", f'attachment; filename="{item["file"]}"')
+            else:
+                self.send_header("Content-Type", item["mime"])
+                self.send_header("Content-Disposition", f'inline; filename="{item["file"]}"')
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
+            self.send_header("Cache-Control", "private, no-store")
+            self.send_header("Accept-Ranges", "bytes")
+            if partial:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.send_header("Content-Length", str(end - start + 1))
+            self.end_headers()
+            f.seek(start)
+            left = end - start + 1
+            try:
+                while left > 0:
+                    chunk = f.read(min(1024 * 1024, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    def preview_get(self, path):
+        """A preview script from the image, as its own file (the page loads it with the nonce)."""
+        m = re.fullmatch(r"/appearance-preview/([a-z][a-z0-9_]{0,31})\.js", path)
+        code = preview_code(m.group(1)) if m else None
+        if code is None:
+            return self.send(404, "{}")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/javascript; charset=utf-8")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(code)))
+        self.end_headers()
+        self.wfile.write(code)
+
+    def look_reply(self, code, data):
+        self.send(code, json.dumps(data))
+
+    def drain(self, length):
+        """Read and drop a refused upload's body (up to 16 MB), so the browser gets the answer instead of a
+        reset connection. Bigger bodies are not read: the connection just closes."""
+        left = min(length, 16 * 1024 * 1024)
+        try:
+            while left > 0:
+                chunk = self.rfile.read(min(65536, left))
+                if not chunk:
+                    break
+                left -= len(chunk)
+        except OSError:
+            pass
+
+    def look_upload(self, query):
+        global last_seen
+        if "Transfer-Encoding" in self.headers:
+            return self.look_reply(411, {"ok": False, "output": "Send the file with its size (Content-Length)."})
+        raw = self.headers.get("Content-Length")
+        if raw is None or raw == "":
+            return self.look_reply(411, {"ok": False, "output": "Send the file with its size (Content-Length)."})
+        if not re.fullmatch(r"\d{1,19}", raw):
+            return self.look_reply(400, {"ok": False, "output": "Bad file size."})
+        length = int(raw)
+        name = urllib.parse.parse_qs(query).get("name", ["upload"])[0][:1024]
+        if length > forgeappearance.FILE_CAP:
+            self.drain(length)
+            return self.look_reply(413, {"ok": False, "output": "Not added: the file is too large "
+                                         f"(at most {forgeappearance.FILE_CAP // 1024 ** 3} GiB)."})
+
+        def alive(_):
+            global last_seen
+            last_seen = time.time()   # a long upload keeps the page open
+        try:
+            item = forgeappearance.media_add_stream(self.rfile, length, name, progress=alive)
+        except forgeappearance.MediaTooLarge as e:
+            self.drain(length)
+            return self.look_reply(413, {"ok": False, "output": f"Not added: {e}."})
+        except forgeappearance.MediaError as e:
+            return self.look_reply(400, {"ok": False, "output": f"Not added: {e}."})
+        except OSError as e:
+            return self.look_reply(500, {"ok": False, "output": f"Not added: {e.strerror or e}."})
+        last_seen = time.time()
+        self.look_reply(200, {"ok": True, "item": item})
+
+    def look_post(self):
+        path, _, query = self.path.partition("?")
+        if path == "/api/appearance/upload":
+            return self.look_upload(query)
+        if path == "/api/appearance/presets/import":
+            return self.preset_import()
+        raw = self.headers.get("Content-Length", "0")
+        if not re.fullmatch(r"\d{1,19}", raw) or int(raw) > LOOK_BODY_MAX:
+            return self.look_reply(413, {"ok": False, "output": "Request too large."})
+        try:
+            body = json.loads(self.rfile.read(int(raw)) or b"{}")
+        except ValueError:
+            return self.look_reply(400, {"ok": False, "output": "Not JSON."})
+        if not isinstance(body, dict):
+            return self.look_reply(400, {"ok": False, "output": "Not JSON."})
+        schema = forgeappearance.load_schema()
+        if path == "/api/appearance/save":
+            try:
+                # Checked, merged with what is saved and written as one locked step.
+                values, errors = forgeappearance.save_checked(body.get("values"), schema)
+            except (OSError, forgeappearance.MediaError) as e:
+                return self.look_reply(200, {"ok": False, "output": f"Not saved: {e}"})
+            if errors:
+                return self.look_reply(200, {"ok": False, "output": "Not saved:\n" + "\n".join(errors[:20])})
+            return self.look_reply(200, {"ok": True, "values": values})
+        if path == "/api/appearance/apply":
+            ids = [s["id"] for s in schema["sections"]]
+            sid = body.get("section")
+            if sid is not None and sid not in ids:
+                return self.look_reply(200, {"ok": False, "output": "Unknown section."})
+            results = []
+            for one in [sid] if sid else ids:
+                state, text = forgeappearance.apply_section(one, schema)
+                results.append({"section": one, "state": state, "output": text})
+            return self.look_reply(200, {"ok": all(r["state"] != "failed" for r in results), "results": results})
+        if path.startswith("/api/appearance/presets/"):
+            return self.preset_post(path.rsplit("/", 1)[1], body, schema)
+        if path == "/api/appearance/media/remove":
+            ok = forgeappearance.media_remove(body.get("id"))
+            return self.look_reply(200, {"ok": ok, "values": forgeappearance.load(schema),
+                                         "media": forgeappearance.media_list(),
+                                         "media_problem": forgeappearance.index_problem()})
+        self.send(404, "{}")
+
+    # Appearance presets (per user, see forgepresets). Importing only stores a preset: nothing is run.
+
+    def preset_post(self, action, body, schema):
+        pid, fp = body.get("id"), forgepresets
+        try:
+            if action == "save":
+                doc = fp.save_current(body.get("name"), schema)
+                return self.look_reply(200, {"ok": True, "preset": fp.summary(doc, forgeappearance.load(schema))})
+            if action == "rename":
+                doc = fp.rename(pid, body.get("name"))
+                return self.look_reply(200, {"ok": True, "preset": fp.summary(doc)})
+            if action == "delete":
+                return self.look_reply(200, {"ok": fp.delete(pid), "output": None})
+            if action == "apply":
+                system = body.get("system", False)
+                if not isinstance(system, bool):
+                    return self.look_reply(200, {"ok": False, "output": "Not applied: bad request."})
+                r = fp.apply(pid, include_system=system, schema=schema)
+                return self.look_reply(200, r)
+            if action == "sync":
+                r = fp.sync()
+                return self.look_reply(200, dict(r, output=r["message"]))
+        except fp.PresetError as e:
+            return self.look_reply(200, {"ok": False, "output": f"Not done: {e}."})
+        except (OSError, forgeappearance.MediaError) as e:
+            return self.look_reply(200, {"ok": False, "output": f"Not done: {getattr(e, 'strerror', None) or e}."})
+        self.send(404, "{}")
+
+    def preset_export(self, pid):
+        """One preset as a .forgelook file, built in a private temporary file and sent as a download."""
+        try:
+            name = forgepresets.export_name(pid)
+            tmp = forgepresets.scratch_file()
+        except forgepresets.PresetError:
+            return self.send(404, "{}")
+        except OSError:
+            return self.send(500, "{}")
+        with tmp:
+            try:
+                forgepresets.export(pid, tmp)
+            except (forgepresets.PresetError, OSError):
+                return self.send(500, "{}")
+            size = tmp.tell()
+            tmp.seek(0)
+            plain = name if name.isascii() else "forge-preset" + forgepresets.SUFFIX
+            self.csp = "default-src 'none'; sandbox; frame-ancestors 'none'"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", f'attachment; filename="{plain}"; '
+                             f"filename*=UTF-8''{urllib.parse.quote(name)}")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            try:
+                while True:
+                    chunk = tmp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    def preset_import(self):
+        global last_seen
+        raw = self.headers.get("Content-Length")
+        if "Transfer-Encoding" in self.headers or not raw:
+            return self.look_reply(411, {"ok": False, "output": "Send the file with its size (Content-Length)."})
+        if not re.fullmatch(r"\d{1,19}", raw):
+            return self.look_reply(400, {"ok": False, "output": "Bad file size."})
+        length = int(raw)
+        if length > forgepresets.IMPORT_MAX:
+            if length <= 64 * 1024 * 1024:
+                self.drain(length)
+            self.close_connection = True
+            return self.look_reply(413, {"ok": False, "output": "Not imported: the file is too large."})
+        try:
+            tmp = forgepresets.scratch_file()
+        except OSError as e:
+            return self.look_reply(500, {"ok": False, "output": f"Not imported: {e.strerror or e}."})
+        with tmp:
+            left = length
+            try:
+                while left > 0:
+                    chunk = self.rfile.read(min(1024 * 1024, left))
+                    if not chunk:
+                        return self.look_reply(400, {"ok": False, "output": "Not imported: the file arrived incomplete."})
+                    tmp.write(chunk)
+                    left -= len(chunk)
+                    last_seen = time.time()
+                tmp.seek(0)
+                doc = forgepresets.import_file(tmp)
+            except forgepresets.PresetError as e:
+                return self.look_reply(200, {"ok": False, "output": f"Not imported: {e}."})
+            except OSError as e:
+                return self.look_reply(500, {"ok": False, "output": f"Not imported: {e.strerror or e}."})
+        last_seen = time.time()
+        self.look_reply(200, {"ok": True, "preset": forgepresets.summary(doc)})
+
+    def language_post(self):
+        raw = self.headers.get("Content-Length", "0")
+        if not re.fullmatch(r"\d{1,5}", raw) or int(raw) > 4096:
+            return self.send(413, "{}")
+        try:
+            body = json.loads(self.rfile.read(int(raw)) or b"{}")
+            choice = body.get("language") if isinstance(body, dict) else None
+            forgei18n.set_preference(choice)
+        except ValueError:
+            return self.send(200, json.dumps({"ok": False, "output": "Unknown language."}))
+        except OSError as e:
+            return self.send(200, json.dumps({"ok": False, "output": f"Not saved: {e.strerror or e}."}))
+        self.send(200, json.dumps({"ok": True, "i18n": forgei18n.page_data(forgei18n.language())}))
+
+
+IDLE_S = float(os.environ.get("FORGE_IDLE_S", "120"))   # close after this long without our browser
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    max_threads = 16
+    # Room for waiting connections, so a flood from another user can't easily crowd out yours.
+    request_queue_size = 128
+
+    def verify_request(self, request, client_address):
+        # Checked as soon as a connection arrives, before it gets a thread: another user's
+        # connections are closed at once and can't pile up.
+        return owner_connection(client_address, self.server_address)
+
+    def process_request(self, request, client_address):
+        if threading.active_count() > self.max_threads:
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def handle_error(self, request, client_address):
+        pass   # a dropped or timed-out connection is normal here; don't fill the log with tracebacks
+
+
+def doctor_report():
+    """The compatibility report (read-only, no root). One at a time, reused for 30 seconds."""
+    with doctor_lock:
+        at = doctor_last["at"]
+        if at is None or not (0 <= time.monotonic() - at < 30):
+            try:
+                from forgecore import doctor
+                doctor_last.update(report=doctor.build_report(), at=time.monotonic())
+            except Exception:
+                return None
+        return doctor_last["report"]
+
+
+def dashboard_page():
+    path = os.path.join(os.path.dirname(os.path.abspath(forgedash.__file__)), "dashboard.html")
+    with open(path, encoding="utf-8") as f:
+        page = f.read()
+    page = page.replace("__TOKEN__", TOKEN).replace("__NONCE__", NONCE)
+    return page.replace("<!--__I18N__-->", i18n_block(), 1)
+
+
+def i18n_block():
+    """The text tables and the small translation runtime for a page (forgei18n)."""
+    try:
+        return forgei18n.page_block(forgei18n.language(), NONCE)
+    except Exception:
+        return forgei18n.page_block("en", NONCE)
+
+
+def preview_code(sid):
+    """Bytes of PREVIEW_DIR/<sid>.js for a section in the schema, or None (missing, a link, too big)."""
+    try:
+        ids = [s["id"] for s in forgeappearance.load_schema()["sections"]]
+    except Exception:
+        return None
+    if sid not in ids:
+        return None
+    try:
+        fd = os.open(os.path.join(PREVIEW_DIR, sid + ".js"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_size > PREVIEW_MAX:
+            return None
+        return f.read(PREVIEW_MAX)
+
+
+def preview_scripts(schema):
+    """One <script nonce src> per preview file. Loaded as separate files, so nothing in them can change the
+    page's own markup."""
+    return "\n".join(f'<script nonce="{NONCE}" src="/appearance-preview/{s["id"]}.js"></script>'
+                      for s in schema["sections"] if preview_code(s["id"]) is not None)
+
+
+def settings_page():
+    try:
+        schema = forgeappearance.load_schema()
+    except Exception:
+        schema = {"sections": []}
+    page = PAGE.replace("__TOKEN__", TOKEN).replace("__MEDIA_KEY__", MEDIA_KEY).replace("__NONCE__", NONCE)
+    page = page.replace("<!--__I18N__-->", i18n_block(), 1)
+    return page.replace("<!--__PREVIEW_HOOKS__-->", preview_scripts(schema), 1)
+
+
+def welcome_marker():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "forge", "welcome-shown") if os.path.isabs(base) else None
+
+
+def first_welcome():
+    """True if this user has not seen the welcome page yet."""
+    marker = welcome_marker()
+    return marker is not None and not os.path.lexists(marker)
+
+
+def mark_welcome_shown():
+    """Recorded only once the page is actually served, so a browser that failed to open
+    at login doesn't use it up."""
+    marker = welcome_marker()
+    try:
+        os.makedirs(os.path.dirname(marker), mode=0o700, exist_ok=True)
+        os.close(os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600))
+    except (OSError, TypeError):
+        pass
+
+
+def launch_dir():
+    """A 0700 folder of yours in $XDG_RUNTIME_DIR (or ~/.cache) for the private launch page."""
+    base = os.environ.get("XDG_RUNTIME_DIR", "")
+    if not os.path.isabs(base):
+        base = os.path.join(os.path.expanduser("~"), ".cache")
+    d = os.path.join(base, "forge-settings")
+    os.makedirs(base, mode=0o700, exist_ok=True)
+    try:
+        os.mkdir(d, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(d)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise OSError(errno.EPERM, f"{d} is not a private folder of yours")
+    os.chmod(d, 0o700)
+    now = time.time()
+    for name in os.listdir(d):   # left by a run that was killed before it could clean up
+        p = os.path.join(d, name)
+        try:
+            if name.endswith(".html") and now - os.lstat(p).st_mtime > 600:
+                os.unlink(p)
+        except OSError:
+            pass
+    return d
+
+
+def launch_page(url):
+    """Write a 0600 page that sends the browser on to url (with the launch key), and return its path."""
+    path = os.path.join(launch_dir(), f"open-{secrets.token_hex(8)}.html")
+    u = html.escape(url, quote=True)
+    body = ('<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer">'
+            f'<meta http-equiv="refresh" content="0;url={u}"><title>Forge</title></head>'
+            f'<body><script>location.replace({json.dumps(url)});</script>'
+            f'<p><a href="{u}">Open</a></p></body></html>\n')
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as f:
+        os.fchmod(f.fileno(), 0o600)
+        f.write(body)
+    return path
+
+
+def forget_launch_page():
+    global LAUNCH_PAGE
+    page, LAUNCH_PAGE = LAUNCH_PAGE, None
+    if page:
+        try:
+            os.unlink(page)
+        except OSError:
+            pass
+
 
 def watchdog(server):
     while True:
-        time.sleep(15)
-        if time.time() - last_seen > 120:
+        time.sleep(min(15.0, IDLE_S / 4))
+        if time.time() - last_seen > IDLE_S:
             server.shutdown()
             return
 
 
 def main():
-    server = ThreadingHTTPServer(("127.0.0.1", int(os.environ.get("FORGE_PORT", "0"))), Handler)
-    url = f"http://127.0.0.1:{server.server_address[1]}/"
-    print(f"Forge Settings: {url}")
+    global WELCOME, WELCOME_ONCE, DASHBOARD, DASH, LAUNCH_PAGE
+    args = sys.argv[1:]
+    if args not in ([], ["--welcome"], ["--welcome-once"], ["--dashboard"]):
+        print("Usage: forge-settings [--welcome | --welcome-once | --dashboard]", file=sys.stderr)
+        sys.exit(2)
+    if os.geteuid() == 0:
+        sys.exit("forge-settings: don't run this as root. Run it as your normal user; "
+                 "saving asks for your password.")
+    if args == ["--welcome-once"] and not first_welcome():
+        return
+    DASHBOARD = args == ["--dashboard"]
+    if DASHBOARD:
+        DASH = forgedash.Dashboard()
+    WELCOME = bool(args) and not DASHBOARD
+    WELCOME_ONCE = args == ["--welcome-once"]
+    if not WELCOME and not DASHBOARD:
+        try:
+            forgeappearance.media_cleanup()   # what a killed upload left behind
+        except (OSError, forgeappearance.MediaError):
+            pass
+    server = Server(("127.0.0.1", int(os.environ.get("FORGE_PORT", "0"))), Handler)
+    url = f"http://127.0.0.1:{server.server_address[1]}/?k={LAUNCH_KEY}"
     threading.Thread(target=watchdog, args=(server,), daemon=True).start()
-    if not os.environ.get("FORGE_NO_BROWSER"):
-        subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    server.serve_forever()
+    if os.environ.get("FORGE_NO_BROWSER"):
+        print(f"Forge Settings: {url}")   # you asked to open it yourself, so you need the full link
+    else:
+        # The one-time key is not printed (output from menu launches can end up in the system log),
+        # and not put on xdg-open's command line: the browser opens a private page that holds it.
+        name = "Forge Dashboard" if DASHBOARD else "Forge Settings"
+        try:
+            LAUNCH_PAGE = launch_page(url)
+        except OSError as e:
+            server.server_close()
+            sys.exit(f"{name}: could not make a private page to open your browser with ({e.strerror or e}). "
+                     "Set FORGE_NO_BROWSER=1 and run it again to get the link instead.")
+        print(f"{name} is opening in your browser (http://127.0.0.1:{server.server_address[1]}).")
+        subprocess.Popen(["xdg-open", LAUNCH_PAGE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        server.serve_forever()
+    finally:
+        forget_launch_page()
 
 
 PAGE = r"""<!DOCTYPE html>
@@ -125,230 +920,1465 @@ PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Forge Settings</title>
-<style>
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:,">
+<title data-i18n="ui.title">Forge Settings</title>
+<style nonce="__NONCE__">
 :root {
-  --bg: #f6f6f4; --panel: #ffffff; --text: #1c1c1e; --muted: #6b6b70; --line: #e4e4e0;
-  --accent: #d9622b; --accent-soft: #fbe9e0; --ok: #2f8f5b; --bad: #c0392b;
+  --bg: #f6f6f4; --panel: #ffffff; --text: #1c1c1e; --muted: #64646a; --line: #e4e4e0; --rail: #efefec;
+  --accent: #d9622b; --accent-fill: #c2541f; --accent-text: #a9461a; --on-accent: #ffffff; --accent-soft: #fbe9e0;
+  --ok: #2b7d50; --bad: #b8352a; --field: #fbfbfa;
+  --gap: 16px; --radius: 12px;
 }
 @media (prefers-color-scheme: dark) {
-  :root { --bg: #141416; --panel: #1d1d20; --text: #ececee; --muted: #9a9aa2; --line: #2c2c31;
-          --accent: #ff7a3d; --accent-soft: #3a2418; }
+  :root { --bg: #141416; --panel: #1d1d20; --text: #ececee; --muted: #a0a0a8; --line: #2e2e33; --rail: #18181b;
+          --accent: #ff7a3d; --accent-fill: #ff7a3d; --accent-text: #ff7a3d; --on-accent: #1c1c1e; --accent-soft: #3a2418;
+          --ok: #4cbf82; --bad: #ff6b5b; --field: #161618; }
 }
 * { box-sizing: border-box; }
+html, body { height: 100%; }
 body { margin: 0; background: var(--bg); color: var(--text);
        font: 14px/1.45 system-ui, "Noto Sans", "Noto Sans Thai", sans-serif; }
-header { position: sticky; top: 0; z-index: 2; background: var(--bg); border-bottom: 1px solid var(--line);
-         padding: 16px 24px 12px; }
-.top { display: flex; align-items: center; gap: 16px; max-width: 1100px; margin: 0 auto; }
-h1 { font-size: 18px; margin: 0; letter-spacing: .2px; white-space: nowrap; }
-h1 span { color: var(--accent); }
-#search { flex: 1; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px;
-          background: var(--panel); color: var(--text); font: inherit; }
-#search:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
-.tags { display: flex; flex-wrap: wrap; gap: 6px; max-width: 1100px; margin: 10px auto 0; }
-.chip { border: 1px solid var(--line); background: var(--panel); color: var(--muted); border-radius: 999px;
-        padding: 3px 10px; font-size: 12px; cursor: pointer; }
-.chip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
-.wrap { display: grid; grid-template-columns: 200px 1fr; gap: 24px; max-width: 1100px; margin: 0 auto; padding: 20px 24px 120px; }
-nav { position: sticky; top: 120px; align-self: start; display: flex; flex-direction: column; gap: 2px; }
-nav a { color: var(--muted); text-decoration: none; padding: 6px 10px; border-radius: 6px; }
-nav a:hover { background: var(--panel); color: var(--text); }
-section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; margin-bottom: 18px; overflow: hidden; }
-section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted);
-             margin: 0; padding: 14px 18px 10px; }
-.row { display: grid; grid-template-columns: 1fr auto; gap: 16px; align-items: center;
+button, input, select { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+[hidden] { display: none !important; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+.shell { display: grid; grid-template-columns: 248px minmax(0, 1fr); min-height: 100%; }
+.rail { background: var(--rail); border-right: 1px solid var(--line); padding: 22px 14px 18px; display: flex;
+        flex-direction: column; gap: 16px; position: sticky; top: 0; height: 100vh; }
+.brand h1 { font-size: 18px; margin: 0 0 0 10px; letter-spacing: .2px; white-space: nowrap; }
+.brand h1 span { color: var(--accent-text); }
+.find { position: relative; }
+.find input { width: 100%; padding: 8px 30px 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+              background: var(--panel); }
+.find input::placeholder { color: var(--muted); }
+.find kbd { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); font: 11px ui-monospace, monospace;
+            color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; }
+.find input:focus + kbd, .find input:not(:placeholder-shown) + kbd { display: none; }
+.rail nav { display: flex; flex-direction: column; gap: 1px; }
+.rail nav a { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px; color: var(--muted);
+              text-decoration: none; }
+.rail nav a:hover { color: var(--text); background: var(--panel); }
+.rail nav a[aria-current="page"] { background: var(--panel); color: var(--text); font-weight: 600;
+                                   box-shadow: inset 3px 0 0 var(--accent); }
+.rail nav a .n { flex: 1; }
+.rail nav a .cnt { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--muted); font-weight: 400; }
+.rail nav a.hit { color: var(--text); }
+.rail nav a .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+.rail .foot { margin-top: auto; display: flex; flex-direction: column; gap: 6px; }
+
+main { padding: 30px 40px 0; max-width: 1120px; width: 100%; display: flex; flex-direction: column; min-height: 100vh; }
+.content { flex: 1; padding-bottom: 28px; }
+.ph { margin: 0 0 22px; }
+.ph h2 { font-size: 22px; margin: 0; font-weight: 650; letter-spacing: -.1px; }
+.ph h2:focus { outline: none; }
+.ph p { margin: 4px 0 0; color: var(--muted); max-width: 72ch; }
+
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: 18px; }
+.card > h3 { font-size: 15px; margin: 0; padding: 14px 18px 12px; font-weight: 650; }
+.card > h3 small { font-weight: 400; color: var(--muted); font-size: 13px; margin-left: 8px; }
+.card > .sub { color: var(--muted); font-size: 13px; padding: 0 18px 12px; margin-top: -8px; }
+.row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 20px; align-items: center;
        padding: 12px 18px; border-top: 1px solid var(--line); }
-.label { font-weight: 600; display: flex; align-items: center; gap: 8px; }
-.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); display: none; }
-.row.changed .dot { display: inline-block; }
-.help { color: var(--muted); font-size: 13px; margin-top: 2px; }
-.rtags { margin-top: 5px; display: flex; gap: 4px; flex-wrap: wrap; }
-.rtags span { font-size: 11px; color: var(--muted); background: var(--bg); border-radius: 4px; padding: 1px 6px; cursor: pointer; }
-.ctl { display: flex; align-items: center; gap: 8px; }
-.reset { border: none; background: none; color: var(--muted); cursor: pointer; font-size: 12px; visibility: hidden; }
+.row.stack { grid-template-columns: minmax(0, 1fr); }
+.label { font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.label .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); display: none; }
+.row.changed .label .dot { display: inline-block; }
+.help { color: var(--muted); font-size: 13px; margin-top: 2px; max-width: 70ch; }
+.rtags { margin-top: 6px; display: flex; gap: 4px; flex-wrap: wrap; }
+.rtags button { font-size: 11.5px; color: var(--muted); background: var(--bg); border: 0; border-radius: 4px;
+                padding: 1px 6px; cursor: pointer; }
+.rtags button:hover { color: var(--text); }
+.pill { font-size: 11.5px; font-weight: 500; color: var(--muted); border: 1px solid var(--line); border-radius: 999px;
+        padding: 0 7px; }
+.pill.accent { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
+.ctl { display: flex; align-items: center; gap: 10px; justify-content: flex-end; }
+.reset { border: none; background: none; color: var(--muted); cursor: pointer; font-size: 12.5px; visibility: hidden;
+         padding: 4px 6px; border-radius: 6px; }
 .row.custom .reset { visibility: visible; }
 .reset:hover { color: var(--accent); }
-input[type=number], input[type=text], select { padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
-  background: var(--bg); color: var(--text); font: inherit; }
-input[type=number] { width: 90px; }
-input[type=text] { width: 260px; }
-.switch { position: relative; width: 40px; height: 22px; display: inline-block; }
-.switch input { opacity: 0; width: 0; height: 0; }
-.slider { position: absolute; inset: 0; background: var(--line); border-radius: 22px; cursor: pointer; transition: .15s; }
-.slider:before { content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px;
-                 background: #fff; border-radius: 50%; transition: .15s; }
-.switch input:checked + .slider { background: var(--accent); }
-.switch input:checked + .slider:before { transform: translateX(18px); }
-.switch input:focus-visible + .slider { outline: 2px solid var(--accent); outline-offset: 2px; }
-.bar { position: fixed; left: 0; right: 0; bottom: 0; background: var(--panel); border-top: 1px solid var(--line);
-       padding: 12px 24px; display: flex; justify-content: center; }
-.bar .in { max-width: 1100px; width: 100%; display: flex; align-items: center; gap: 12px; }
-.bar .count { flex: 1; color: var(--muted); }
-button.btn { font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line);
-             background: var(--bg); color: var(--text); cursor: pointer; }
-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
-button:disabled { opacity: .45; cursor: default; }
-#out { white-space: pre-wrap; font: 12px/1.4 ui-monospace, monospace; background: var(--bg); border-radius: 8px;
-       padding: 10px 12px; margin: 0 24px 12px; max-width: 1052px; display: none; }
-#out.ok { border-left: 3px solid var(--ok); } #out.bad { border-left: 3px solid var(--bad); }
-.empty { color: var(--muted); padding: 30px; text-align: center; display: none; }
-.file { color: var(--muted); font-size: 12px; }
-code { font-size: 12px; }
-@media (max-width: 760px) { .wrap { grid-template-columns: 1fr; } nav { display: none; }
-  .row { grid-template-columns: 1fr; } input[type=text] { width: 100%; } }
+input[type=number], input[type=text], select { padding: 6px 9px; border: 1px solid var(--line); border-radius: 7px;
+  background: var(--field); min-height: 32px; }
+input[type=number] { width: 96px; font-variant-numeric: tabular-nums; }
+input[type=text] { width: 270px; }
+input[type=text].hex { width: 92px; font: 13px ui-monospace, monospace; }
+input[type=color] { width: 40px; height: 32px; padding: 2px; border: 1px solid var(--line); border-radius: 7px;
+                    background: var(--field); cursor: pointer; }
+input[type=range] { width: 200px; accent-color: var(--accent); }
+.unit { color: var(--muted); font-size: 13px; min-width: 2.5em; font-variant-numeric: tabular-nums; }
+.switch { position: relative; width: 40px; height: 22px; display: inline-block; flex: none; }
+.switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+.switch .knob { position: absolute; inset: 0; background: var(--line); border-radius: 22px; pointer-events: none;
+                transition: background .15s; }
+.switch .knob::before { content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px;
+                        background: #fff; border-radius: 50%; transition: transform .15s; box-shadow: 0 1px 2px rgba(0,0,0,.25); }
+.switch input:checked + .knob { background: var(--accent-fill); }
+.switch input:checked + .knob::before { transform: translateX(18px); }
+.switch input:focus-visible + .knob { outline: 2px solid var(--accent); outline-offset: 2px; }
+.more { width: 100%; text-align: left; background: none; border: 0; border-top: 1px dashed var(--line);
+        padding: 10px 18px; color: var(--muted); cursor: pointer; border-radius: 0 0 var(--radius) var(--radius); }
+.more:hover { color: var(--text); }
+.more::before { content: "+"; display: inline-block; width: 1.2em; font-weight: 600; }
+.more[aria-expanded="true"]::before { content: "\2212"; }
+
+.btn { padding: 7px 13px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel);
+       cursor: pointer; white-space: nowrap; }
+.btn:hover { border-color: var(--muted); }
+.btn.primary { background: var(--accent-fill); border-color: var(--accent-fill); color: var(--on-accent); font-weight: 600; }
+.btn.quiet { background: transparent; border-color: transparent; color: var(--muted); text-align: left; padding-left: 10px; }
+.btn.quiet:hover { color: var(--text); background: var(--panel); }
+.btn.small { padding: 4px 10px; font-size: 13px; }
+.btn.danger { color: var(--bad); }
+.btn:disabled { opacity: .45; cursor: default; }
+.empty { color: var(--muted); padding: 16px 18px 18px; border-top: 1px solid var(--line); }
+.card > .empty:first-child { border-top: 0; }
+.nomatch { color: var(--muted); padding: 40px 0; text-align: center; }
+
+.bar { position: sticky; bottom: 0; background: var(--bg); border-top: 1px solid var(--line); padding: 12px 0 14px;
+       margin: 0 -2px; display: flex; flex-direction: column; gap: 10px; }
+.bar .in { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.bar .count { flex: 1; min-width: 200px; }
+.bar .count b { font-weight: 600; }
+.bar .file { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+.out { white-space: pre-wrap; font: 12.5px/1.45 ui-monospace, monospace; background: var(--panel); border-radius: 8px;
+       padding: 9px 12px; margin: 0; border: 1px solid var(--line); border-left: 3px solid var(--muted);
+       max-height: 30vh; overflow: auto; }
+.out.ok { border-left-color: var(--ok); } .out.bad { border-left-color: var(--bad); }
+.out:empty { display: none; }
+
+/* Appearance */
+.look { margin-bottom: 30px; }
+.look-head { display: flex; align-items: baseline; gap: 10px; margin: 0 0 10px; flex-wrap: wrap; }
+.look-head h3 { font-size: 17px; margin: 0; font-weight: 650; }
+.look-head p { margin: 0; color: var(--muted); flex-basis: 100%; }
+.look-body { display: grid; grid-template-columns: minmax(300px, 400px) minmax(0, 1fr); gap: 18px; align-items: start; }
+.look-body .card { margin: 0; }
+.look-foot { display: flex; gap: 8px; align-items: center; padding: 12px 18px; border-top: 1px solid var(--line); flex-wrap: wrap; }
+.look-foot .note { flex: 1; color: var(--muted); font-size: 13px; min-width: 160px; }
+.look-foot .out { flex-basis: 100%; }
+
+.fa-preview { position: relative; aspect-ratio: 16 / 10; border-radius: 10px; overflow: hidden;
+              border: 1px solid var(--line); background: #1f2b38; isolation: isolate;
+              box-shadow: 0 1px 0 rgba(0,0,0,.04), 0 10px 30px -18px rgba(0,0,0,.45); }
+.fa-wall { position: absolute; inset: 0; z-index: -1;
+           background: linear-gradient(160deg, #47637a 0%, #2a3a4b 55%, #1d2733 100%); }
+.fa-wall img, .fa-wall video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.fa-window { position: absolute; left: 13%; top: 14%; width: 46%; height: 50%; border-radius: 6px;
+             background: rgba(246, 246, 244, .94); box-shadow: 0 6px 18px rgba(0,0,0,.28); overflow: hidden; }
+.fa-window::before { content: ""; display: block; height: 11%; background: rgba(0,0,0,.07); }
+.fa-window i { display: block; height: 5%; margin: 7% 10% 0; border-radius: 3px; background: rgba(0,0,0,.09); }
+.fa-window i:nth-child(2) { width: 55%; } .fa-window i:nth-child(3) { width: 68%; }
+.fa-dock { position: absolute; left: 50%; bottom: 4%; transform: translateX(-50%); display: flex; gap: 6px;
+           padding: 6px 8px; border-radius: 12px; background: rgba(20, 20, 24, .55);
+           backdrop-filter: blur(6px); box-shadow: 0 2px 8px rgba(0,0,0,.25); }
+.fa-dock i { width: 22px; height: 22px; border-radius: 6px; background: rgba(255,255,255,.82); }
+.fa-dock i:nth-child(1) { background: var(--accent); }
+.fa-dock i:nth-child(3) { background: #8fb3d9; } .fa-dock i:nth-child(5) { background: #9fd1b0; }
+.fa-boot { position: absolute; inset: 0; background: #0d0d0f; color: #ececee; display: none; flex-direction: column;
+           align-items: center; justify-content: center; gap: 14px; }
+.fa-boot b { font-size: 20px; font-weight: 650; letter-spacing: .3px; }
+.fa-boot b span { color: #ff7a3d; }
+.fa-boot .fa-progress { width: 28%; height: 3px; border-radius: 3px; background: rgba(255,255,255,.15); overflow: hidden; }
+.fa-boot .fa-progress i { display: block; width: 40%; height: 100%; background: #ececee; border-radius: 3px; }
+.fa-preview[data-section="boot"] .fa-boot { display: flex; }
+.fa-preview[data-section="boot"] .fa-window, .fa-preview[data-section="boot"] .fa-dock { display: none; }
+.cap { color: var(--muted); font-size: 12.5px; margin: 8px 2px 0; }
+
+.media-pick { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 14px; align-items: center; margin-top: 10px; }
+.thumb { position: relative; aspect-ratio: 16 / 10; border-radius: 7px; overflow: hidden; background: var(--bg);
+         border: 1px solid var(--line); display: flex; align-items: center; justify-content: center;
+         color: var(--muted); font-size: 12px; text-align: center; }
+.thumb img, .thumb video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.thumb .k { position: absolute; left: 5px; bottom: 5px; font-size: 10.5px; background: rgba(0,0,0,.6); color: #fff;
+            border-radius: 4px; padding: 0 5px; }
+.mp-name { font-weight: 600; overflow-wrap: anywhere; }
+.mp-name.none { font-weight: 400; color: var(--muted); }
+.mp-acts { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+
+.lib-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 14px;
+            padding: 14px 18px 18px; border-top: 1px solid var(--line); }
+.tile { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.tile .nm { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile .meta { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+.lib-top { display: flex; align-items: center; gap: 14px; padding: 0 18px 14px; flex-wrap: wrap; }
+.meter { flex: 1; min-width: 180px; }
+.meter .track { height: 6px; border-radius: 6px; background: var(--bg); border: 1px solid var(--line); overflow: hidden; }
+.meter .track i { display: block; height: 100%; width: 0; background: var(--accent); }
+.meter .t { font-size: 12.5px; color: var(--muted); margin-top: 4px; font-variant-numeric: tabular-nums; }
+.progress { padding: 0 18px 12px; font-size: 13px; color: var(--muted); }
+.progress:empty, .mp-status:empty { display: none; }
+.card > .error { color: var(--bad); padding: 0 18px 14px; font-size: 13px; overflow-wrap: anywhere; }
+.mp-status { font-size: 13px; color: var(--muted); margin-top: 6px; }
+
+dialog { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); color: var(--text); padding: 0;
+         width: min(720px, calc(100vw - 32px)); }
+dialog::backdrop { background: rgba(0, 0, 0, .4); }
+dialog .in { padding: 20px 22px 18px; }
+dialog h3 { margin: 0 0 4px; font-size: 17px; }
+dialog p { margin: 0 0 12px; color: var(--muted); }
+dialog .lib-grid { padding: 4px 0 4px; border: 0; max-height: 55vh; overflow: auto; }
+dialog .pick { border: 1px solid transparent; background: none; padding: 6px; border-radius: 10px; cursor: pointer; text-align: left; }
+dialog .pick:hover, dialog .pick[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
+dialog .bar2 { display: flex; justify-content: space-between; gap: 8px; margin-top: 14px; }
+
+/* Thai text: taller letters with marks above and below, so a little more line height */
+:lang(th) body { line-height: 1.6; }
+:lang(th) .help, :lang(th) .ph p { line-height: 1.6; }
+
+/* Language switch in the sidebar */
+.lang { display: flex; flex-direction: column; gap: 4px; padding: 0 10px; }
+.lang .k { font-size: 12px; color: var(--muted); }
+.seg { display: flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--panel); }
+.seg button { flex: 1; border: 0; background: none; padding: 5px 4px; cursor: pointer; color: var(--muted); font-size: 12.5px;
+              white-space: nowrap; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent-text); font-weight: 600; }
+
+/* Presets: each saved look as a small picture of it */
+.presets { margin-bottom: 30px; }
+.presets .card { margin: 0; }
+.ps-save { display: flex; gap: 8px; align-items: center; padding: 14px 18px; flex-wrap: wrap; }
+.ps-save input[type=text] { flex: 1; min-width: 200px; width: auto; }
+.ps-tools { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 0 18px 14px; color: var(--muted);
+            font-size: 13px; }
+.ps-tools .sp { flex: 1; min-width: 120px; }
+.ps-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px;
+           padding: 16px 18px 18px; border-top: 1px solid var(--line); }
+.ps { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.ps-mini { position: relative; aspect-ratio: 16 / 10; border-radius: 8px; overflow: hidden; border: 1px solid var(--line);
+           background: linear-gradient(160deg, #47637a 0%, #2a3a4b 55%, #1d2733 100%); }
+.ps-mini img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.ps-mini .w { position: absolute; left: 14%; top: 16%; width: 52%; height: 46%; border-radius: 4px;
+              background: rgba(239, 240, 241, .95); box-shadow: 0 4px 12px rgba(0,0,0,.25); }
+.ps-mini .w.dark { background: rgba(41, 44, 48, .96); }
+.ps-mini .w i { position: absolute; left: 10%; top: 30%; width: 44%; height: 12%; border-radius: 2px; background: var(--accent); }
+.ps-mini .d { position: absolute; left: 50%; bottom: 5%; transform: translateX(-50%); width: 40%; height: 9%;
+              border-radius: 6px; background: rgba(20, 20, 24, .55); }
+.ps-mini .d.floating { width: 34%; bottom: 7%; } .ps-mini .d.animated { width: 30%; height: 11%; border-radius: 8px; }
+.ps-mini .d.default { width: 100%; left: 0; transform: none; bottom: 0; border-radius: 0; height: 9%; background: rgba(30, 32, 36, .9); }
+.ps .nm { font-weight: 600; overflow-wrap: anywhere; }
+.ps .meta { font-size: 12.5px; color: var(--muted); }
+.ps .acts { display: flex; gap: 2px; flex-wrap: wrap; align-items: center; }
+.ps .acts .btn.primary { margin-right: 6px; padding-left: 16px; padding-right: 16px; }
+.ps .acts .btn:not(.primary) { border-color: transparent; background: none; color: var(--muted); padding: 4px 7px; }
+.ps .acts .btn:not(.primary):hover { color: var(--text); background: var(--bg); }
+.ps .acts .btn.danger { color: var(--bad); }
+dialog .opt { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; margin: 10px 0 0; border-radius: 10px;
+              background: var(--accent-soft); }
+dialog .opt input { margin-top: 4px; accent-color: var(--accent-fill); }
+dialog .opt b { display: block; }
+dialog .notes { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: 13px; }
+
+@media (max-width: 1100px) { .look-body { grid-template-columns: minmax(0, 1fr); } .look-body .fa-preview { max-width: 520px; } }
+@media (max-width: 760px) {
+  .shell { grid-template-columns: minmax(0, 1fr); }
+  .rail { position: static; height: auto; padding: 14px; gap: 10px; min-width: 0; }
+  .rail nav { flex-direction: row; overflow-x: auto; }
+  .rail nav a { white-space: nowrap; }
+  main { padding: 20px 16px 0; }
+  .row { grid-template-columns: 1fr; } .ctl { justify-content: flex-start; } input[type=text] { width: 100%; }
+  .row:not(.custom) .reset { display: none; }
+}
+@media (prefers-reduced-motion: reduce) { .switch .knob, .switch .knob::before { transition: none; } }
 </style>
 </head>
 <body>
-<header>
-  <div class="top">
-    <h1>Forge <span>Settings</span></h1>
-    <input id="search" placeholder="Search settings, or type a tag like gaming, privacy, vram" autocomplete="off">
-  </div>
-  <div class="tags" id="tags"></div>
-</header>
-<div class="wrap">
-  <nav id="nav"></nav>
-  <main id="main"><div class="empty" id="empty">No settings match.</div></main>
+<div class="shell">
+  <aside class="rail">
+    <div class="brand"><h1>Forge <span data-i18n="ui.brand">Settings</span></h1></div>
+    <div class="find" role="search">
+      <label class="sr" for="search" data-i18n="ui.search">Search settings</label>
+      <input id="search" type="search" placeholder="Search settings" data-i18n-placeholder="ui.search" autocomplete="off" spellcheck="false">
+      <kbd aria-hidden="true">/</kbd>
+    </div>
+    <nav id="nav" aria-label="Settings sections" data-i18n-aria-label="ui.nav.aria"></nav>
+    <div class="foot">
+      <div class="lang" role="group" aria-labelledby="lang-k">
+        <span class="k" id="lang-k" data-i18n="lang.label">Language</span>
+        <div class="seg" id="lang">
+          <button type="button" data-lang="auto" data-i18n="lang.auto" data-i18n-title="lang.auto.title">Auto</button>
+          <button type="button" data-lang="en" lang="en">English</button>
+          <button type="button" data-lang="th" lang="th">ไทย</button>
+        </div>
+      </div>
+      <button class="btn quiet" id="dash" title="Health, agents, backups and updates at a glance" data-i18n-title="ui.dash.title" data-i18n="ui.dash.open">Open Forge Dashboard</button>
+    </div>
+  </aside>
+  <main>
+    <div class="content" id="content" aria-live="polite"></div>
+    <div class="bar" id="bar">
+      <pre class="out" id="out" role="status"></pre>
+      <div class="in">
+        <div class="count"><span id="count">No unsaved changes.</span><div class="file" id="file"></div></div>
+        <button class="btn" id="export" title="Download your settings as a file, without the ones that belong to this PC only" data-i18n-title="ui.export.title" data-i18n="ui.export">Export settings</button>
+        <button class="btn" id="import" title="Load settings from a file. They show as unsaved changes first." data-i18n-title="ui.import.title" data-i18n="ui.import">Import settings</button>
+        <input type="file" id="importfile" accept=".json,application/json" hidden>
+        <button class="btn" id="undo" title="Restore the settings from before your last save" data-i18n-title="ui.undo.title" data-i18n="ui.undo">Undo last save</button>
+        <button class="btn" id="discard" disabled data-i18n="ui.discard">Discard</button>
+        <button class="btn primary" id="save" disabled data-i18n="ui.save_apply">Save and apply</button>
+      </div>
+    </div>
+  </main>
 </div>
-<div class="bar"><div class="in" style="flex-direction:column;align-items:stretch">
-  <pre id="out"></pre>
-  <div style="display:flex;align-items:center;gap:12px">
-    <span class="count" id="count">No unsaved changes. <span class="file" id="file"></span></span>
-    <button class="btn" id="undo" title="Restore the settings from before your last save">Undo last save</button>
-    <button class="btn" id="discard" disabled>Discard</button>
-    <button class="btn primary" id="save" disabled>Save and apply</button>
-  </div>
-</div></div>
-<script>
-const TOKEN = "__TOKEN__";
-const H = {"X-Forge-Token": TOKEN, "Content-Type": "application/json"};
-let schema, saved, current, activeTags = new Set();
 
+<dialog id="picker" aria-labelledby="pk-title">
+  <div class="in">
+    <h3 id="pk-title" data-i18n="ui.pick.title">Choose from your media library</h3>
+    <p id="pk-sub"></p>
+    <div class="lib-grid" id="pk-grid" role="group" aria-labelledby="pk-title"></div>
+    <div class="progress" id="pk-progress" role="status"></div>
+    <div class="bar2">
+      <button class="btn" id="pk-upload" data-i18n="ui.pick.upload">Upload a file</button>
+      <span><button class="btn" id="pk-cancel" data-i18n="ui.cancel">Cancel</button> <button class="btn primary" id="pk-ok" disabled data-i18n="ui.pick.use">Use this</button></span>
+    </div>
+  </div>
+</dialog>
+<dialog id="ps-dialog" aria-labelledby="ps-d-title">
+  <div class="in">
+    <h3 id="ps-d-title"></h3>
+    <p id="ps-d-body"></p>
+    <label class="opt" id="ps-d-sys" hidden><input type="checkbox" id="ps-d-check">
+      <span><b data-i18n="preset.system.label">Also change the boot splash and login screen</b>
+        <span data-i18n="preset.system.help">They change the whole PC, so applying asks for the admin password.</span></span></label>
+    <ul class="notes" id="ps-d-notes"></ul>
+    <div class="bar2"><span></span>
+      <span><button class="btn" id="ps-d-cancel" data-i18n="ui.cancel">Cancel</button> <button class="btn primary" id="ps-d-ok" data-i18n="preset.apply">Apply</button></span>
+    </div>
+  </div>
+</dialog>
+<input type="file" id="mediafile" multiple hidden>
+<input type="file" id="presetfile" accept=".forgelook,application/zip" hidden>
+
+<!--__I18N__-->
+<script nonce="__NONCE__">
+"use strict";
+const TOKEN = "__TOKEN__";
+const MEDIA_KEY = "__MEDIA_KEY__";
+const H = {"X-Forge-Token": TOKEN, "Content-Type": "application/json"};
 const $ = s => document.querySelector(s);
 const el = (tag, attrs = {}, kids = []) => {
   const e = document.createElement(tag);
-  for (const [k, v] of Object.entries(attrs)) k === "text" ? e.textContent = v : e.setAttribute(k, v);
-  kids.forEach(k => e.append(k)); return e;
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k === "text") e.textContent = v; else e.setAttribute(k, v === true ? "" : v);
+  }
+  kids.forEach(k => k && e.append(k)); return e;
 };
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const fmt = v => v === true ? t("ui.on") : v === false ? t("ui.off") : String(v);
+
+// The six sidebar sections and which settings groups (by id) each holds.
+// A group not listed here shows under System, so nothing ever disappears. Labels: ui.nav.<id>, ui.sec.<id>.help.
+const SECTIONS = [
+  {id: "appearance", groups: []},
+  {id: "system", groups: ["modes", "gaming", "apps", "virt", "storage", "updates"]},
+  {id: "network", groups: ["network", "devices"]},
+  {id: "privacy", groups: ["privacy", "security"]},
+  {id: "ai", groups: ["ai", "agents", "core", "monitor"]},
+  {id: "data", groups: ["sync", "backup"]},
+];
+const secLabel = S => t("ui.nav." + S.id);
+const secHelp = S => t("ui.sec." + S.id + ".help");
+// Labels and help from the two schemas, in your language when the table has them.
+const setLabel = s => tl("set." + s.key + ".label", s.label);
+const setHelp = s => s.help ? tl("set." + s.key + ".help", s.help) : "";
+const groupLabel = g => tl("set.group." + g.id, g.label);
+const optLabel = o => tl("set.opt." + o, o);
+const lookSecLabel = sec => tl("look." + sec.id + ".label", sec.label);
+const lookSecHelp = sec => sec.help ? tl("look." + sec.id + ".help", sec.help) : "";
+const fLabel = (sid, f) => tl("look." + sid + ".f." + f.key + ".label", f.label);
+const fHelp = (sid, f) => f.help ? tl("look." + sid + ".f." + f.key + ".help", f.help) : "";
+const fOpt = (sid, f, o) => tl("look." + sid + ".f." + f.key + ".opt." + o.value, o.label);
+const unitLabel = u => u ? tl("look.unit." + (u === "%" ? "pct" : u), u) : "";
+const sectionOf = gid => (SECTIONS.find(s => s.groups.includes(gid)) || SECTIONS[1]).id;
+
+let schema, saved, current;
+const A = {schema: {sections: []}, saved: {}, current: {}, media: [], backends: {}, caps: {}, choices: {},
+           status: {text: "", where: null}};   // the last upload message, drawn again after every render
+const openAdv = new Set();
+let page = null;
+
+// Search: every word must match the label, help, key or tags (or the name of the card it is in), in English
+// or in your language. "#word" matches one tag exactly.
+function matches(item, q, where, shown) {
+  if (!q) return true;
+  const tags = item.tags || [];
+  const hay = (item.label + " " + (item.help || "") + " " + item.key + " " + tags.join(" ") + " " + (where || "") + " "
+               + (shown || "")).toLowerCase();
+  return q.split(/\s+/).every(w => w.startsWith("#") ? tags.includes(w.slice(1)) : hay.includes(w));
+}
+const query = () => $("#search").value.trim().toLowerCase();
+
+function groupsIn(sid) {
+  const known = SECTIONS.find(s => s.id === sid).groups;
+  const order = known.map(id => schema.groups.find(g => g.id === id)).filter(Boolean);
+  if (sid === "system") schema.groups.forEach(g => { if (!SECTIONS.some(s => s.groups.includes(g.id))) order.push(g); });
+  return order;
+}
+
+// Controls for the system settings (forge-apply, asks for your password)
+
+function control(s) {
+  const v = current[s.key];
+  if (s.type === "toggle") {
+    const input = el("input", {type: "checkbox", role: "switch", "aria-label": setLabel(s)});
+    input.checked = v;
+    input.addEventListener("change", () => set(s.key, input.checked));
+    return el("label", {class: "switch"}, [input, el("span", {class: "knob"})]);
+  }
+  if (s.type === "select") {
+    const input = el("select", {"aria-label": setLabel(s)});
+    s.options.forEach(o => { const op = el("option", {value: o, text: optLabel(o)}); if (o === v) op.selected = true; input.append(op); });
+    input.addEventListener("change", () => set(s.key, input.value));
+    return input;
+  }
+  const input = el("input", {type: s.type === "number" ? "number" : "text", "aria-label": setLabel(s),
+                             min: s.min, max: s.max, spellcheck: "false"});
+  input.value = v;
+  input.addEventListener("input", () => set(s.key, s.type === "number" ? Number(input.value) : input.value));
+  return input;
+}
+
+function tagButtons(tags) {
+  return el("div", {class: "rtags"}, (tags || []).map(tag => {
+    const b = el("button", {type: "button", text: "#" + tag, title: t("ui.tag.title", {tag})});
+    b.addEventListener("click", () => { $("#search").value = "#" + tag; render(); });
+    return b;
+  }));
+}
+
+function settingRow(s) {
+  const changed = !same(current[s.key], saved[s.key]);
+  const custom = !same(current[s.key], s.default);
+  const reset = el("button", {type: "button", class: "reset", title: t("ui.reset.title", {value: s.type === "select" ? optLabel(s.default) : fmt(s.default)}),
+                              text: t("ui.reset")});
+  reset.addEventListener("click", () => set(s.key, s.default, true));
+  const label = el("div", {class: "label"}, [el("span", {class: "dot", title: t("ui.unsaved_dot")}), el("span", {text: setLabel(s)})]);
+  if (s.advanced) label.append(el("span", {class: "pill", text: t("ui.advanced")}));
+  const info = el("div", {}, [label]);
+  if (s.help) info.append(el("div", {class: "help", text: setHelp(s)}));
+  info.append(tagButtons(s.tags));
+  return el("div", {class: "row" + (changed ? " changed" : "") + (custom ? " custom" : ""), "data-key": s.key},
+            [info, el("div", {class: "ctl"}, [reset, control(s)])]);
+}
+
+// Advanced settings stay folded away unless you open them, search for them, or changed them.
+function groupCard(g, items, q) {
+  const card = el("section", {class: "card", id: "g-" + g.id, "aria-labelledby": "h-" + g.id},
+                  [el("h3", {id: "h-" + g.id, text: groupLabel(g)})]);
+  const shownAlways = s => !s.advanced || q || !same(current[s.key], s.default) || !same(current[s.key], saved[s.key]);
+  const folded = items.filter(s => !shownAlways(s));
+  const open = openAdv.has(g.id);
+  items.forEach(s => { if (shownAlways(s) || open) card.append(settingRow(s)); });
+  if (folded.length) {
+    const b = el("button", {type: "button", class: "more", "aria-expanded": String(open),
+                            text: open ? t("ui.adv.hide") : tn("ui.adv.show", folded.length)});
+    b.addEventListener("click", () => { open ? openAdv.delete(g.id) : openAdv.add(g.id); render(); });
+    card.append(b);
+  }
+  return card;
+}
+
+// Appearance (per user, saved right away to your home folder, no password)
+
+const PREVIEW_HOOKS = {};
+// Later parts of Forge OS add /usr/share/forge/appearance-preview/<section>.js, which calls this.
+window.forgeAppearance = Object.freeze({
+  registerPreview(section, fn) { if (typeof fn === "function") (PREVIEW_HOOKS[section] = PREVIEW_HOOKS[section] || []).push(fn); },
+});
+const mediaUrl = id => "/api/appearance/media/" + encodeURIComponent(id) + "?t=" + encodeURIComponent(MEDIA_KEY);
+const mediaItem = id => A.media.find(m => m.id === id);
+const KIND = {"image": "ui.kind.image", "animated-image": "ui.kind.animated", "video": "ui.kind.video"};
+const kindLabel = k => t(KIND[k] || "ui.kind.image");
+const ACCEPT = {image: ["image", "animated-image"], video: ["video"], any: ["image", "animated-image", "video"]};
+const PICK = {
+  image: "image/*,.heic,.heif,.avif,.jxl,.apng,.ico,.tif,.tiff,.bmp,.svg",
+  video: "video/*,.mkv,.webm,.mov,.avi,.wmv,.flv,.mpg,.mpeg,.ogv,.3gp,.ts,.m4v",
+};
+PICK.any = PICK.image + "," + PICK.video;
+// show_if; a field is also hidden when the field it depends on is hidden.
+const looksVisible = (f, vals) => {
+  const sec = A.schema.sections.find(s => s.fields.includes(f));
+  const seen = new Set();
+  while (f && !seen.has(f.key)) {
+    seen.add(f.key);
+    const c = f.show_if; if (!c) return true;
+    const ok = x => same(vals[c.key], x);
+    if (!("equals" in c ? ok(c.equals) : c.in.some(ok))) return false;
+    f = sec ? sec.fields.find(x => x.key === c.key) : null;
+  }
+  return true;
+};
+const lookDirty = sid => !same(A.current[sid], A.saved[sid]);
+
+function size(n) {
+  const u = [t("ui.unit.bytes"), "KB", "MB", "GB"]; let i = 0;
+  while (n >= 1024 && i < 3) { n /= 1024; i++; }
+  return (i ? n.toFixed(n < 10 ? 1 : 0) : n) + " " + u[i];
+}
+
+function thumb(item, label) {
+  const box = el("div", {class: "thumb"});
+  if (!item) { box.textContent = label || t("ui.none"); return box; }
+  const fallback = () => { box.replaceChildren(document.createTextNode(t("ui.file_of", {format: item.format.toUpperCase()}))); };
+  if (item.format === "svg") {
+    box.textContent = t("ui.svg_no_preview");   // SVG can carry scripts, so it is never shown here
+  } else if (item.kind === "video") {
+    const v = el("video", {muted: true, preload: "metadata", playsinline: true, "aria-hidden": "true"});
+    v.muted = true; v.src = mediaUrl(item.id) + "#t=0.5";
+    v.addEventListener("error", fallback);
+    box.append(v);
+  } else {
+    const i = el("img", {alt: "", loading: "lazy", decoding: "async"});
+    i.addEventListener("error", fallback);
+    i.src = mediaUrl(item.id);
+    box.append(i);
+  }
+  box.append(el("span", {class: "k", text: kindLabel(item.kind)}));
+  return box;
+}
+
+function previewEl(sid) {
+  const sec = A.schema.sections.find(s => s.id === sid);
+  return el("div", {class: "fa-preview", "data-section": sid, role: "img", "aria-label": t("ui.preview_of", {name: sec ? lookSecLabel(sec) : sid})}, [
+    el("div", {class: "fa-wall"}),
+    el("div", {class: "fa-window"}, [el("i"), el("i"), el("i")]),
+    el("div", {class: "fa-dock"}, [el("i"), el("i"), el("i"), el("i"), el("i"), el("i")]),
+    el("div", {class: "fa-boot"}, [el("b", {}, [document.createTextNode("Forge "), el("span", {text: "OS"})]),
+                                   el("div", {class: "fa-progress"}, [el("i")])]),
+  ]);
+}
+
+// The wallpaper in every preview comes from the Background section: its first shown media field
+// with a file, otherwise its first shown color field.
+function paintWall(wall) {
+  const bg = A.schema.sections.find(s => s.id === "background");
+  const vals = A.current.background || {};
+  let media = null, color = null;
+  (bg ? bg.fields : []).forEach(f => {
+    if (!looksVisible(f, vals)) return;
+    if (f.type === "media" && !media && vals[f.key] && mediaItem(vals[f.key])) media = mediaItem(vals[f.key]);
+    if (f.type === "color" && !color) color = vals[f.key];
+  });
+  const want = media && media.format !== "svg" ? media.id : "";
+  if (wall.dataset.media !== want) {
+    wall.dataset.media = want;
+    wall.replaceChildren();
+    if (want && media.kind === "video") {
+      const v = el("video", {muted: true, loop: true, playsinline: true, preload: "metadata", "aria-hidden": "true"});
+      v.muted = true;
+      if (!matchMedia("(prefers-reduced-motion: reduce)").matches) v.autoplay = true;
+      v.src = mediaUrl(want);
+      wall.append(v);
+    } else if (want) {
+      wall.append(el("img", {alt: "", src: mediaUrl(want)}));
+    }
+  }
+  wall.style.background = !want && color ? color : "";
+}
+
+function updatePreviews() {
+  document.querySelectorAll(".fa-preview").forEach(p => {
+    const sid = p.dataset.section, sec = A.schema.sections.find(s => s.id === sid);
+    if (!sec) return;
+    paintWall(p.querySelector(".fa-wall"));
+    const vals = A.current[sid] || {};
+    sec.fields.forEach(f => {
+      const v = vals[f.key];
+      p.setAttribute("data-" + f.key.replace(/_/g, "-"), String(v));
+      const css = typeof v === "number" ? v + (["px", "%", "ms", "s", "deg"].includes(f.unit) ? f.unit : "")
+                : typeof v === "boolean" ? (v ? "1" : "0") : f.type === "color" ? v : JSON.stringify(String(v));
+      p.style.setProperty("--fa-" + f.key.replace(/_/g, "-"), css);
+    });
+    const media = {};
+    A.media.forEach(m => { media[m.id] = Object.assign({}, m, {url: m.format === "svg" ? null : mediaUrl(m.id)}); });
+    const ctx = {section: sid, values: Object.assign({}, vals), all: JSON.parse(JSON.stringify(A.current)), media,
+                 fields: sec.fields, wall: p.querySelector(".fa-wall"), window: p.querySelector(".fa-window"),
+                 dock: p.querySelector(".fa-dock"), boot: p.querySelector(".fa-boot")};
+    (PREVIEW_HOOKS[sid] || []).forEach(fn => { try { fn(p, ctx); } catch (e) { console.error("preview " + sid, e); } });
+  });
+}
+
+function lookSet(sid, key, value) {
+  A.current[sid][key] = value;
+  const sec = A.schema.sections.find(s => s.id === sid);
+  if (sec.fields.some(f => f.show_if && f.show_if.key === key)) {
+    // Other fields depend on this one (show_if): draw again, and keep the focus on this control.
+    const had = document.activeElement && document.activeElement.closest(`[data-look="${sid}"][data-key="${key}"]`);
+    renderKeep();
+    if (had) { const c = document.querySelector(`[data-look="${sid}"][data-key="${key}"] select, [data-look="${sid}"][data-key="${key}"] input`); if (c) c.focus(); }
+    return;
+  }
+  document.querySelectorAll(`[data-look="${sid}"]`).forEach(row => {
+    const f = sec.fields.find(x => x.key === row.dataset.key);
+    row.hidden = !looksVisible(f, A.current[sid]);
+    row.classList.toggle("changed", !same(A.current[sid][f.key], A.saved[sid][f.key]));
+    row.classList.toggle("custom", !same(A.current[sid][f.key], f.default));
+  });
+  document.querySelectorAll(`[data-look-save="${sid}"]`).forEach(b => { b.disabled = !lookDirty(sid); });
+  updatePreviews(); updateNav();
+}
+
+function lookControl(sid, f) {
+  const v = A.current[sid][f.key], name = fLabel(sid, f);
+  if (f.type === "toggle") {
+    const input = el("input", {type: "checkbox", role: "switch", "aria-label": name});
+    input.checked = v;
+    input.addEventListener("change", () => lookSet(sid, f.key, input.checked));
+    return el("label", {class: "switch"}, [input, el("span", {class: "knob"})]);
+  }
+  if (f.type === "select") {
+    const input = el("select", {"aria-label": name});
+    f.options.forEach(o => { const op = el("option", {value: o.value, text: fOpt(sid, f, o)}); if (o.value === v) op.selected = true; input.append(op); });
+    input.addEventListener("change", () => lookSet(sid, f.key, input.value));
+    return input;
+  }
+  if (f.type === "number" || f.type === "slider") {
+    const input = el("input", {type: f.type === "slider" ? "range" : "number", "aria-label": name,
+                               min: f.min, max: f.max, step: f.step || 1});
+    input.value = v;
+    const unit = el("span", {class: "unit", text: (f.type === "slider" ? v + " " : "") + unitLabel(f.unit)});
+    input.addEventListener("input", () => {
+      const n = Number(input.value);
+      if (f.type === "slider") unit.textContent = n + " " + unitLabel(f.unit);
+      lookSet(sid, f.key, n);
+    });
+    return el("span", {class: "ctl"}, [input, unit]);
+  }
+  if (f.type === "color") {
+    const pick = el("input", {type: "color", "aria-label": name});
+    const hex = el("input", {type: "text", class: "hex", "aria-label": t("ui.hex_of", {name}), maxlength: "7", spellcheck: "false"});
+    pick.value = hex.value = v;
+    pick.addEventListener("input", () => { hex.value = pick.value; lookSet(sid, f.key, pick.value); });
+    hex.addEventListener("input", () => {
+      if (/^#[0-9a-fA-F]{6}$/.test(hex.value)) { pick.value = hex.value.toLowerCase(); lookSet(sid, f.key, hex.value.toLowerCase()); }
+    });
+    return el("span", {class: "ctl"}, [pick, hex]);
+  }
+  const ch = f.choices === "backend" ? (A.choices[sid] || {})[f.key] : null;
+  if (f.type === "text" && ch && ch.choices.length) {
+    // A list from the section's program (for example your Wallpaper Engine wallpapers). A saved value that is
+    // not in the list any more stays shown, marked, so nothing changes without you choosing it.
+    const input = el("select", {"aria-label": name});
+    input.style.maxWidth = "280px";      // long titles must not squeeze the label
+    const opts = [{value: "", label: t("ui.none_chosen")}].concat(ch.choices);
+    if (v && !ch.choices.some(c => c.value === v)) opts.push({value: v, label: t("ui.not_found_now", {value: v})});
+    opts.forEach(o => { const op = el("option", {value: o.value, text: o.label}); if (o.value === v) op.selected = true; input.append(op); });
+    input.addEventListener("change", () => lookSet(sid, f.key, input.value));
+    return input;
+  }
+  if (f.type === "text") {
+    const input = el("input", {type: "text", "aria-label": name, maxlength: String(f.max_length || 256), spellcheck: "false"});
+    input.value = v;
+    input.addEventListener("input", () => lookSet(sid, f.key, input.value));
+    return input;
+  }
+  // media
+  const item = mediaItem(v);
+  const nameEl = el("div", {class: "mp-name" + (item ? "" : " none"), text: item ? item.name : t("ui.nothing_chosen")});
+  const choose = el("button", {type: "button", class: "btn small", text: t("ui.choose_library")});
+  choose.addEventListener("click", () => openPicker(sid, f));
+  const up = el("button", {type: "button", class: "btn small", text: t("ui.upload")});
+  up.addEventListener("click", () => pickFiles(f.accept, items => {
+    const ok = items.find(i => ACCEPT[f.accept].includes(i.kind));
+    if (ok) { A.current[sid][f.key] = ok.id; renderKeep(); lookSet(sid, f.key, ok.id); }
+  }, sid + "." + f.key));
+  const clear = el("button", {type: "button", class: "btn small", text: t("ui.clear"), disabled: !item});
+  clear.addEventListener("click", () => { lookSet(sid, f.key, ""); renderKeep(); });
+  return el("div", {class: "media-pick"}, [thumb(item, t("ui.nothing_chosen")),
+    el("div", {}, [nameEl, el("div", {class: "help", text: item ? kindLabel(item.kind) + ", " + size(item.size) : ""}),
+                   el("div", {class: "mp-acts"}, [choose, up, clear]),
+                   el("div", {class: "mp-status", role: "status", "data-status": sid + "." + f.key})])]);
+}
+
+function lookRow(sid, f) {
+  const vals = A.current[sid];
+  const defOpt = f.type === "select" ? (f.options.find(o => o.value === f.default) || null) : null;
+  const reset = el("button", {type: "button", class: "reset", text: t("ui.reset"),
+                              title: t("ui.reset.title", {value: defOpt ? fOpt(sid, f, defOpt) : f.default === "" ? t("ui.none") : fmt(f.default)})});
+  reset.addEventListener("click", () => { lookSet(sid, f.key, f.default); renderKeep(); });
+  const label = el("div", {class: "label"}, [el("span", {class: "dot", title: t("ui.unsaved_dot")}), el("span", {text: fLabel(sid, f)})]);
+  if (f.advanced) label.append(el("span", {class: "pill", text: t("ui.advanced")}));
+  const info = el("div", {}, [label]);
+  if (f.help) info.append(el("div", {class: "help", text: fHelp(sid, f)}));
+  const ch = f.choices === "backend" ? (A.choices[sid] || {})[f.key] : null;
+  if (ch && ch.note) info.append(el("div", {class: "help", text: tr(ch.note)}));
+  if (f.tags) info.append(tagButtons(f.tags));
+  const media = f.type === "media";
+  const row = el("div", {class: "row" + (media ? " stack" : "") + (!same(vals[f.key], A.saved[sid][f.key]) ? " changed" : "")
+                         + (!same(vals[f.key], f.default) ? " custom" : ""), "data-look": sid, "data-key": f.key,
+                         hidden: !looksVisible(f, vals)},
+                 media ? [el("div", {class: "ctl"}, [info, reset]), lookControl(sid, f)]
+                       : [info, el("div", {class: "ctl"}, [reset, lookControl(sid, f)])]);
+  if (media) row.firstChild.style.justifyContent = "space-between";
+  return row;
+}
+
+function lookFooter(sid) {
+  const sec = A.schema.sections.find(s => s.id === sid);
+  const out = el("pre", {class: "out", role: "status"});
+  const installed = A.backends[sid];
+  const note = el("div", {class: "note", text: installed ? t("ui.look.note")
+                         : t("ui.look.note_missing", {name: lookSecLabel(sec)})});
+  const save = el("button", {type: "button", class: "btn" + (installed ? "" : " primary"), text: t("ui.save"), "data-look-save": sid,
+                             disabled: !lookDirty(sid)});
+  save.addEventListener("click", () => lookSave(sid, false, out));
+  const kids = [note, save];
+  if (installed) {
+    const apply = el("button", {type: "button", class: "btn primary", text: t("ui.save_apply")});
+    apply.addEventListener("click", () => lookSave(sid, true, out));
+    kids.push(apply);
+  }
+  kids.push(out);
+  return el("div", {class: "look-foot"}, kids);
+}
+
+async function lookSave(sid, apply, out) {
+  out.className = "out"; out.textContent = apply ? t("ui.saving_applying") : t("ui.saving");
+  try {
+    const r = await (await fetch("/api/appearance/save", {method: "POST", headers: H,
+                                 body: JSON.stringify({values: {[sid]: A.current[sid]}})})).json();
+    if (!r.ok) { out.className = "out bad"; out.textContent = tr(r.output); return; }
+    A.saved = JSON.parse(JSON.stringify(r.values));
+    A.current[sid] = JSON.parse(JSON.stringify(r.values[sid]));
+    loadChoices(sid);
+    let text = t("ui.saved");
+    if (apply) {
+      const a = await (await fetch("/api/appearance/apply", {method: "POST", headers: H, body: JSON.stringify({section: sid})})).json();
+      const res = (a.results || [])[0] || {};
+      text = res.state === "applied" ? t("ui.saved_applied") : res.state === "not-installed" ? t("ui.saved_not_installed")
+           : t("ui.saved_apply_failed");
+      if (res.output) text += "\n" + tr(res.output);
+      out.className = "out " + (res.state === "failed" || !a.ok ? "bad" : "ok");
+    } else out.className = "out ok";
+    renderKeep();
+    // The result box was replaced by the new render: show it in the new one.
+    const fresh = document.querySelector(`#look-${sid} .look-foot .out`) || out;
+    fresh.className = out.className; fresh.textContent = text;
+  } catch (e) { out.className = "out bad"; out.textContent = t("ui.closed"); }
+}
+
+function lookSection(sec, fields) {
+  const head = el("div", {class: "look-head"}, [el("h3", {id: "lh-" + sec.id, text: lookSecLabel(sec)})]);
+  if (!A.backends[sec.id]) head.append(el("span", {class: "pill", text: t("ui.look.no_apply")}));
+  if (sec.help) head.append(el("p", {text: lookSecHelp(sec)}));
+  const card = el("div", {class: "card"});
+  const q = query();
+  const always = f => !f.advanced || q || !same(A.current[sec.id][f.key], f.default) || lookDirty(sec.id) && !same(A.current[sec.id][f.key], A.saved[sec.id][f.key]);
+  const advKey = "look-" + sec.id, open = openAdv.has(advKey);
+  const folded = fields.filter(f => !always(f) && looksVisible(f, A.current[sec.id]));
+  if (!sec.fields.length) card.append(el("div", {class: "empty", text: t("ui.look.empty", {name: lookSecLabel(sec)})}));
+  fields.forEach(f => { if (always(f) || open) card.append(lookRow(sec.id, f)); });
+  if (fields.length && card.firstChild) card.firstChild.style.borderTop = "0";
+  if (folded.length) {
+    const b = el("button", {type: "button", class: "more", "aria-expanded": String(open),
+                            text: open ? t("ui.adv.hide") : tn("ui.adv.show", folded.length)});
+    b.addEventListener("click", () => { open ? openAdv.delete(advKey) : openAdv.add(advKey); renderKeep(); });
+    card.append(b);
+  }
+  if (sec.fields.length) card.append(lookFooter(sec.id));
+  const prev = el("div", {}, [previewEl(sec.id), el("p", {class: "cap", text: t("ui.look.preview_cap")})]);
+  return el("section", {class: "look", id: "look-" + sec.id, "aria-labelledby": "lh-" + sec.id},
+            [head, el("div", {class: "look-body"}, [prev, card])]);
+}
+
+function libraryCard() {
+  const used = A.caps.used || 0, total = A.caps.total || 1;
+  const track = el("div", {class: "track"}, [el("i")]);
+  track.firstChild.style.width = Math.min(100, used / total * 100).toFixed(1) + "%";
+  const add = el("button", {type: "button", class: "btn", text: t("ui.lib.add")});
+  add.addEventListener("click", () => pickFiles("any"));
+  const card = el("section", {class: "card", id: "library", "aria-labelledby": "lib-h"}, [
+    el("h3", {id: "lib-h", text: t("ui.lib.title")}),
+    el("div", {class: "sub", text: t("ui.lib.sub", {folder: A.mediaDir || t("ui.lib.home")})}),
+    el("div", {class: "lib-top"}, [el("div", {class: "meter"}, [track,
+      el("div", {class: "t", text: t("ui.lib.used", {used: size(used), total: size(total), file: size(A.caps.file || 0)})})]), add]),
+    el("div", {class: "progress", id: "lib-progress", role: "status"}),
+  ]);
+  if (A.problem) card.append(el("div", {class: "error", role: "alert", text: tr(A.problem.charAt(0).toUpperCase() + A.problem.slice(1) + ".")}));
+  if (!A.media.length) {
+    card.append(el("div", {class: "empty", text: t("ui.lib.empty")}));
+    return card;
+  }
+  const grid = el("div", {class: "lib-grid"});
+  A.media.forEach(m => {
+    const rm = el("button", {type: "button", class: "btn small danger", text: t("ui.remove"), "aria-label": t("ui.remove_name", {name: m.name})});
+    rm.addEventListener("click", () => removeMedia(m));
+    grid.append(el("div", {class: "tile"}, [thumb(m), el("div", {class: "nm", title: m.name, text: m.name}),
+      el("div", {class: "meta"}, [el("span", {text: size(m.size)}), rm])]));
+  });
+  card.append(grid);
+  return card;
+}
+
+async function removeMedia(m) {
+  if (!confirm(t("ui.lib.remove_confirm", {name: m.name}))) return;
+  const r = await (await fetch("/api/appearance/media/remove", {method: "POST", headers: H, body: JSON.stringify({id: m.id})})).json();
+  A.status = {text: r.ok ? t("ui.lib.removed", {name: m.name}) : t("ui.lib.not_removed", {why: r.media_problem ? tr(r.media_problem) : t("ui.lib.gone")}),
+              where: null};
+  A.problem = r.media_problem;
+  if (r.ok) {
+    A.media = r.media;
+    A.caps.used = A.media.reduce((n, x) => n + x.size, 0);
+    // Values that pointed at it were reset on disk; reset them here too, keep other unsaved changes.
+    A.schema.sections.forEach(s => s.fields.forEach(f => {
+      if (f.type === "media" && A.current[s.id][f.key] === m.id) A.current[s.id][f.key] = r.values[s.id][f.key];
+      if (f.type === "media" && A.saved[s.id][f.key] === m.id) A.saved[s.id][f.key] = r.values[s.id][f.key];
+    }));
+  }
+  renderKeep();
+}
+
+// Uploads: streamed to forge-settings, which checks the bytes and copies it into your library.
+let pickCallback = null, pickWhere = null;
+function pickFiles(accept, done, where) {
+  const input = $("#mediafile");
+  input.accept = PICK[accept] || PICK.any;
+  pickCallback = done || null;
+  pickWhere = where || null;
+  input.value = "";
+  input.click();
+}
+$("#mediafile").addEventListener("change", async () => {
+  const files = [...$("#mediafile").files], done = pickCallback, where = pickWhere;
+  pickCallback = pickWhere = null;
+  A.status.where = where;
+  const added = [];
+  for (const f of files) {
+    const item = await uploadOne(f);
+    if (item) added.push(item);
+  }
+  if (added.length) {
+    A.media = await (await fetch("/api/appearance/media", {headers: H})).json();
+    A.caps.used = A.media.reduce((n, x) => n + x.size, 0);
+  }
+  if (done) done(added);
+  if ($("#picker").open) fillPicker(); else renderKeep();
+});
+
+function status(text) {
+  A.status.text = text;
+  drawStatus();
+}
+function drawStatus() {
+  [$("#lib-progress"), $("#pk-progress")].forEach(p => { if (p) p.textContent = A.status.text; });
+  document.querySelectorAll(".mp-status").forEach(p => {
+    p.textContent = p.dataset.status === A.status.where ? A.status.text : "";
+  });
+}
+
+function uploadOne(file) {
+  return new Promise(resolve => {
+    if (A.caps.file && file.size > A.caps.file) { status(t("ui.up.too_big", {name: file.name, size: size(A.caps.file)})); return resolve(null); }
+    const x = new XMLHttpRequest();
+    x.open("POST", "/api/appearance/upload?name=" + encodeURIComponent(file.name));
+    x.setRequestHeader("X-Forge-Token", TOKEN);
+    x.setRequestHeader("Content-Type", "application/octet-stream");
+    x.upload.addEventListener("progress", e => {
+      if (e.lengthComputable) status(t("ui.up.progress", {name: file.name, pct: Math.floor(e.loaded / e.total * 100)}));
+    });
+    x.addEventListener("load", () => {
+      let d = {};
+      try { d = JSON.parse(x.responseText); } catch (e) { d = {output: t("ui.up.odd")}; }
+      status(d.ok ? t("ui.up.added", {name: d.item.name}) : file.name + ": " + (d.output ? tr(d.output) : t("ui.up.not_added")));
+      resolve(d.ok ? d.item : null);
+    });
+    x.addEventListener("error", () => { status(t("ui.up.not_sent", {name: file.name})); resolve(null); });
+    status(t("ui.up.adding", {name: file.name}));
+    x.send(file);
+  });
+}
+
+// The media picker dialog
+let picking = null;
+function openPicker(sid, f) {
+  picking = {sid, f, chosen: A.current[sid][f.key]};
+  A.status = {text: "", where: null};
+  $("#pk-title").textContent = t("ui.pick.choose", {name: fLabel(sid, f)});
+  $("#pk-sub").textContent = f.accept === "video" ? t("ui.pick.videos") : f.accept === "image" ? t("ui.pick.pictures") : t("ui.pick.both");
+  status("");
+  fillPicker();
+  $("#picker").showModal();
+}
+function fillPicker() {
+  const grid = $("#pk-grid");
+  grid.replaceChildren();
+  const items = A.media.filter(m => ACCEPT[picking.f.accept].includes(m.kind));
+  if (!items.length) grid.append(el("div", {class: "nomatch", text: t("ui.pick.empty")}));
+  items.forEach(m => {
+    const b = el("button", {type: "button", class: "pick tile", "aria-pressed": String(m.id === picking.chosen)},
+                 [thumb(m), el("div", {class: "nm", title: m.name, text: m.name}), el("div", {class: "meta", text: size(m.size)})]);
+    b.addEventListener("click", () => { picking.chosen = m.id; fillPicker(); });
+    b.addEventListener("dblclick", () => { picking.chosen = m.id; usePick(); });
+    grid.append(b);
+  });
+  $("#pk-ok").disabled = !picking.chosen || !mediaItem(picking.chosen);
+}
+function usePick() {
+  $("#picker").close();
+  lookSet(picking.sid, picking.f.key, picking.chosen);
+  renderKeep();
+}
+$("#pk-ok").addEventListener("click", usePick);
+$("#pk-cancel").addEventListener("click", () => $("#picker").close());
+$("#pk-upload").addEventListener("click", () => pickFiles(picking.f.accept, items => {
+  const ok = items.find(i => ACCEPT[picking.f.accept].includes(i.kind));
+  if (ok) picking.chosen = ok.id;
+}, picking.sid + "." + picking.f.key));
+
+// Presets: your whole look under a name (forgepresets on the server). Applying runs every section's program.
+
+const P = {list: [], sync: {configured: false, message: null}, out: {text: "", ok: true}, pending: null};
+const when = ts => new Date(ts * 1000).toLocaleDateString(I18N.lang === "th" ? "th-TH" : undefined, {dateStyle: "medium"});
+
+async function loadPresets() {
+  try {
+    const d = await (await fetch("/api/appearance/presets", {headers: H})).json();
+    P.list = d.presets || []; P.sync = d.sync || P.sync;
+  } catch (e) { /* the rest of the page still works */ }
+}
+function presetOut(ok, text) { P.out = {ok, text}; const o = $("#ps-out"); if (o) { o.className = "out " + (ok ? "ok" : "bad"); o.textContent = text; } }
+
+function presetMini(p) {
+  const L = p.look || {};
+  const box = el("div", {class: "ps-mini", "aria-hidden": "true"});
+  if (L.color) box.style.background = L.color;
+  if (L.picture && mediaItem(L.picture) && mediaItem(L.picture).format !== "svg" && mediaItem(L.picture).kind !== "video")
+    box.append(el("img", {alt: "", loading: "lazy", src: mediaUrl(L.picture)}));
+  const w = el("div", {class: "w" + (L.scheme === "dark" ? " dark" : "")}, [el("i")]);
+  if (L.accent) w.firstChild.style.background = L.accent;
+  box.append(w, el("div", {class: "d " + (L.dock || "default")}));
+  return box;
+}
+
+function presetTile(p) {
+  const apply = el("button", {type: "button", class: "btn small primary", text: t("preset.apply")});
+  apply.addEventListener("click", () => askApply(p));
+  const ren = el("button", {type: "button", class: "btn small", text: t("preset.rename"), "aria-label": t("preset.rename_name", {name: p.name})});
+  ren.addEventListener("click", async () => {
+    const name = prompt(t("preset.rename.prompt"), p.name);
+    if (name === null) return;
+    const r = await presetPost("rename", {id: p.id, name});
+    if (r.ok) presetOut(true, t("preset.renamed", {name: r.preset.name}));
+  });
+  const exp = el("button", {type: "button", class: "btn small", text: t("preset.export"), "aria-label": t("preset.export_name", {name: p.name})});
+  exp.addEventListener("click", () => exportPreset(p));
+  const del = el("button", {type: "button", class: "btn small danger", text: t("preset.delete"), "aria-label": t("preset.delete_name", {name: p.name})});
+  del.addEventListener("click", async () => {
+    if (!confirm(t(p.origin === "sync" ? "preset.delete.confirm_synced" : "preset.delete.confirm", {name: p.name}))) return;
+    const r = await presetPost("delete", {id: p.id});
+    if (r.ok) presetOut(true, t("preset.deleted", {name: p.name}));
+  });
+  const meta = t("preset.saved_on", {date: when(p.updated)}) + (p.media_count ? ", " + tn("preset.files", p.media_count) : "");
+  return el("div", {class: "ps", "data-preset": p.id}, [presetMini(p), el("div", {class: "nm", text: p.name}),
+    el("div", {class: "meta", text: meta}), el("div", {class: "acts"}, [apply, ren, exp, del])]);
+}
+
+function presetsCard() {
+  const name = el("input", {type: "text", id: "ps-name", maxlength: "60", spellcheck: "false", "aria-label": t("preset.name.aria"),
+                            placeholder: t("preset.name.placeholder")});
+  const save = el("button", {type: "button", class: "btn primary", text: t("preset.save")});
+  const doSave = async () => {
+    const r = await presetPost("save", {name: name.value});
+    if (r.ok) presetOut(true, t("preset.saved", {name: r.preset.name}));
+  };
+  save.addEventListener("click", doSave);
+  name.addEventListener("keydown", e => { if (e.key === "Enter") doSave(); });
+  const imp = el("button", {type: "button", class: "btn small", text: t("preset.import")});
+  imp.addEventListener("click", () => { $("#presetfile").value = ""; $("#presetfile").click(); });
+  const tools = [el("span", {class: "sp", text: !P.sync.configured ? t("preset.sync.off")
+                             : P.sync.reduced ? t("preset.sync.on") + " " + t("preset.sync.reduced") : t("preset.sync.on")}), imp];
+  if (P.sync.configured) {
+    const sync = el("button", {type: "button", class: "btn small", text: t("preset.sync")});
+    sync.addEventListener("click", syncPresets);
+    tools.push(sync);
+  }
+  const out = el("pre", {class: "out" + (P.out.text ? (P.out.ok ? " ok" : " bad") : ""), id: "ps-out", role: "status", text: P.out.text});
+  const card = el("div", {class: "card"}, [el("div", {class: "ps-save"}, [name, save]), el("div", {class: "ps-tools"}, tools)]);
+  if (P.out.text) card.append(el("div", {class: "ps-tools"}, [out])); else card.append(out);
+  card.append(P.list.length ? el("div", {class: "ps-grid"}, P.list.map(presetTile))
+                            : el("div", {class: "empty", text: t("preset.empty")}));
+  return el("section", {class: "presets", id: "presets", "aria-labelledby": "ps-h"}, [
+    el("div", {class: "look-head"}, [el("h3", {id: "ps-h", text: t("preset.title")}), el("p", {text: t("preset.help")})]), card]);
+}
+
+async function presetPost(action, body) {
+  let r;
+  try {
+    r = await (await fetch("/api/appearance/presets/" + action, {method: "POST", headers: H, body: JSON.stringify(body || {})})).json();
+  } catch (e) { r = {ok: false, output: t("ui.closed")}; }
+  if (!r.ok && action !== "apply") presetOut(false, tr(r.output || t("preset.failed")));
+  await loadPresets();
+  renderKeep();
+  return r;
+}
+
+function askApply(p) {
+  P.pending = p;
+  $("#ps-d-title").textContent = t("preset.apply.title", {name: p.name});
+  $("#ps-d-body").textContent = t("preset.apply.body");
+  $("#ps-d-sys").hidden = !p.system;
+  $("#ps-d-check").checked = false;
+  $("#ps-d-notes").replaceChildren();
+  $("#ps-dialog").showModal();
+}
+$("#ps-d-cancel").addEventListener("click", () => $("#ps-dialog").close());
+$("#ps-d-ok").addEventListener("click", async () => {
+  const p = P.pending, system = !$("#ps-d-sys").hidden && $("#ps-d-check").checked;
+  $("#ps-dialog").close();
+  if (!p) return;
+  presetOut(true, system ? t("preset.applying_admin") : t("preset.applying"));
+  const r = await presetPost("apply", {id: p.id, system});
+  const lines = [];
+  (r.results || []).forEach(x => {
+    const sec = A.schema.sections.find(s => s.id === x.section);
+    const name = sec ? lookSecLabel(sec) : x.section;
+    lines.push(name + ": " + t("preset.state." + (x.state === "applied" ? "applied" : x.state === "not-installed" ? "missing" : "failed"))
+               + (x.output && x.state !== "not-installed" ? "\n  " + tr(x.output).replace(/\n/g, "\n  ") : ""));
+  });
+  (r.notes || []).forEach(n => lines.push(tr(n)));
+  presetOut(!!r.ok, (r.ok ? t("preset.applied", {name: p.name}) : r.results ? t("preset.applied_some", {name: p.name}) : tr(r.output || t("preset.failed")))
+            + (lines.length ? "\n" + lines.join("\n") : ""));
+  if (r.values) {
+    const done = r.values;
+    A.schema.sections.forEach(s => { A.saved[s.id] = JSON.parse(JSON.stringify(done[s.id])); A.current[s.id] = JSON.parse(JSON.stringify(done[s.id])); });
+    A.schema.sections.forEach(s => loadChoices(s.id));
+    renderKeep();
+  }
+});
+
+async function exportPreset(p) {
+  presetOut(true, t("preset.exporting", {name: p.name}));
+  try {
+    const r = await fetch("/api/appearance/presets/export?id=" + encodeURIComponent(p.id), {headers: {"X-Forge-Token": TOKEN}});
+    if (!r.ok) throw new Error();
+    const m = /filename="([^"]+)"/.exec(r.headers.get("Content-Disposition") || "");
+    const a = el("a", {href: URL.createObjectURL(await r.blob()), download: m ? m[1] : "preset.forgelook"});
+    document.body.append(a); a.click(); a.remove();
+    presetOut(true, t("preset.exported", {name: p.name}));
+  } catch (e) { presetOut(false, t("preset.export_failed")); }
+}
+
+$("#presetfile").addEventListener("change", () => {
+  const file = $("#presetfile").files[0];
+  if (!file) return;
+  const x = new XMLHttpRequest();
+  x.open("POST", "/api/appearance/presets/import");
+  x.setRequestHeader("X-Forge-Token", TOKEN);
+  x.setRequestHeader("Content-Type", "application/octet-stream");
+  x.upload.addEventListener("progress", e => {
+    if (e.lengthComputable) presetOut(true, t("preset.importing_pct", {name: file.name, pct: Math.floor(e.loaded / e.total * 100)}));
+  });
+  x.addEventListener("load", async () => {
+    let d = {};
+    try { d = JSON.parse(x.responseText); } catch (e) { d = {ok: false, output: t("ui.up.odd")}; }
+    presetOut(!!d.ok, d.ok ? t("preset.imported", {name: d.preset.name}) : tr(d.output || t("preset.failed")));
+    await loadPresets();
+    A.media = await (await fetch("/api/appearance/media", {headers: H})).json();
+    A.caps.used = A.media.reduce((n, m) => n + m.size, 0);
+    renderKeep();
+  });
+  x.addEventListener("error", () => presetOut(false, t("preset.import_not_sent", {name: file.name})));
+  presetOut(true, t("preset.importing", {name: file.name}));
+  x.send(file);
+});
+
+async function syncPresets() {
+  presetOut(true, t("preset.syncing"));
+  let r;
+  try { r = await (await fetch("/api/appearance/presets/sync", {method: "POST", headers: H, body: "{}"})).json(); }
+  catch (e) { r = {ok: false, output: t("ui.closed")}; }
+  const text = r.ok ? t("preset.synced", {sent: r.sent, received: r.received}) + (r.reduced ? "\n" + t("preset.sync.reduced") : "") + (r.skipped && r.skipped.length ? "\n" + r.skipped.map(tr).join("\n") : "")
+             : tr(r.output || t("preset.failed"));
+  presetOut(!!r.ok, text);
+  await loadPresets();
+  if (r.received) A.media = await (await fetch("/api/appearance/media", {headers: H})).json();
+  renderKeep();
+}
+
+// Pages
+
+function appearancePage() {
+  const box = [presetsCard()];
+  A.schema.sections.forEach(sec => box.push(lookSection(sec, sec.fields)));
+  if (!A.schema.sections.length) box.push(el("div", {class: "card"}, [el("div", {class: "empty", text: t("ui.look.none")})]));
+  box.push(libraryCard());
+  return box;
+}
+
+function header(title, text) {
+  return el("div", {class: "ph"}, [el("h2", {id: "page-title", tabindex: "-1", text: title}), el("p", {text: text})]);
+}
+
+function resultsPage(q) {
+  const out = [];
+  let n = 0;
+  A.schema.sections.forEach(sec => {
+    const fields = sec.fields.filter(f => matches(f, q, sec.label + " " + lookSecLabel(sec), fLabel(sec.id, f) + " " + fHelp(sec.id, f)));
+    if (!fields.length) return;
+    n += fields.length;
+    out.push(lookSection(sec, fields));
+  });
+  SECTIONS.forEach(S => groupsIn(S.id).forEach(g => {
+    const items = schema.settings.filter(s => s.group === g.id && matches(s, q, g.label + " " + groupLabel(g), setLabel(s) + " " + setHelp(s)));
+    if (!items.length) return;
+    n += items.length;
+    const card = groupCard(g, items, q);
+    card.firstChild.append(el("small", {text: secLabel(S)}));
+    out.push(card);
+  }));
+  const head = header(t("ui.search.title"), n ? tn("ui.search.found", n, {q: $("#search").value.trim()}) : t("ui.search.none"));
+  return [head, ...out];
+}
+
+function counts(q) {
+  const c = {};
+  SECTIONS.forEach(S => {
+    c[S.id] = S.id === "appearance" ? A.schema.sections.reduce((n, s) => n + s.fields.filter(f => matches(f, q, s.label + " " + lookSecLabel(s), fLabel(s.id, f) + " " + fHelp(s.id, f))).length, 0)
+      : groupsIn(S.id).reduce((n, g) => n + schema.settings.filter(s => s.group === g.id && matches(s, q, g.label + " " + groupLabel(g), setLabel(s) + " " + setHelp(s))).length, 0);
+  });
+  return c;
+}
+
+function updateNav() {
+  const q = query(), c = counts(q), nav = $("#nav");
+  nav.replaceChildren();
+  SECTIONS.forEach(S => {
+    const dirty = S.id === "appearance" ? A.schema.sections.some(s => lookDirty(s.id))
+      : groupsIn(S.id).some(g => schema.settings.some(s => s.group === g.id && !same(current[s.key], saved[s.key])));
+    const a = el("a", {href: "#" + S.id, class: q && c[S.id] ? "hit" : null,
+                       "aria-current": !q && page === S.id ? "page" : null},
+                 [el("span", {class: "n", text: secLabel(S)})]);
+    if (q) a.append(el("span", {class: "cnt", text: String(c[S.id]), "aria-label": tn("ui.nav.matches", c[S.id])}));
+    else if (dirty) a.append(el("span", {class: "dot", title: t("ui.nav.unsaved")}));
+    a.addEventListener("click", e => {
+      if (!query()) return;
+      $("#search").value = "";
+      if (location.hash === "#" + S.id) {          // no hashchange will come: show the page now
+        e.preventDefault(); go();
+        const h = $("#page-title"); if (h) h.focus();
+      }
+    });
+    nav.append(a);
+  });
+}
+
+function render(keepScroll) {
+  if (!schema) return;
+  const q = query(), y = window.scrollY;
+  const content = $("#content");
+  let kids;
+  if (q) kids = resultsPage(q);
+  else if (page === "appearance") kids = [header(secLabel(SECTIONS[0]), secHelp(SECTIONS[0])), ...appearancePage()];
+  else {
+    const S = SECTIONS.find(s => s.id === page);
+    kids = [header(secLabel(S), secHelp(S)), ...groupsIn(page).map(g => groupCard(g, schema.settings.filter(s => s.group === g.id), ""))];
+  }
+  content.replaceChildren(...kids);
+  updateNav(); updatePreviews(); updateBar(); drawStatus();
+  if (keepScroll) window.scrollTo(0, y);
+}
+const renderKeep = () => render(true);
+
+function go() {
+  const want = (location.hash || "").slice(1);
+  const hasLook = A.schema.sections.some(s => s.fields.length);
+  page = SECTIONS.some(s => s.id === want) ? want : hasLook ? "appearance" : "system";
+  render();
+  window.scrollTo(0, 0);
+}
+window.addEventListener("hashchange", () => { go(); const h = $("#page-title"); if (h) h.focus(); });
+
+// System settings: unsaved changes, save, undo, import and export (unchanged behaviour)
+
+function set(key, value, rerender) {
+  current[key] = value;
+  if (rerender) return renderKeep();
+  const s = schema.settings.find(x => x.key === key);
+  document.querySelectorAll(`.row[data-key="${CSS.escape(key)}"]:not([data-look])`).forEach(r => {
+    r.classList.toggle("changed", !same(value, saved[key]));
+    r.classList.toggle("custom", !same(value, s.default));
+  });
+  updateBar(); updateNav();
+}
+
+function changes() { return Object.keys(current).filter(k => !same(current[k], saved[k])); }
+
+function updateBar() {
+  const n = changes().length;
+  $("#save").disabled = $("#discard").disabled = n === 0;
+  $("#count").replaceChildren(n ? el("b", {text: tn("ui.bar.changes", n)}) : document.createTextNode(t("ui.bar.none")));
+  // Appearance saves on its own, so the bar only shows there when system settings wait to be saved.
+  $("#bar").hidden = page === "appearance" && !query() && n === 0 && !$("#out").textContent;
+}
+
+function show(ok, text) {
+  const o = $("#out"); o.className = "out " + (ok ? "ok" : "bad");
+  o.textContent = (ok ? t("ui.saved_applied") : t("ui.not_applied")) + "\n" + (text ? tr(text) : "");
+}
+function note(ok, text) { const o = $("#out"); o.className = "out " + (ok ? "ok" : "bad"); o.textContent = text; updateBar(); }
 
 async function load() {
   const r = await fetch("/api/settings", {headers: H});
   const d = await r.json();
   schema = d.schema; saved = {...d.values}; current = {...d.values};
-  $("#file").textContent = "Your settings file: " + d.file;
+  $("#file").textContent = t("ui.bar.file", {path: d.file}) + (d.forge_version ? ". Forge OS " + tr(d.forge_version) : "");
   $("#undo").disabled = !d.can_undo;
-  render();
 }
 
-function control(s) {
-  const v = current[s.key];
-  let input;
-  if (s.type === "toggle") {
-    input = el("input", {type: "checkbox", "aria-label": s.label});
-    input.checked = v;
-    input.onchange = () => set(s.key, input.checked);
-    return el("label", {class: "switch"}, [input, el("span", {class: "slider"})]);
-  }
-  if (s.type === "select") {
-    input = el("select", {"aria-label": s.label});
-    s.options.forEach(o => { const op = el("option", {value: o, text: o}); if (o === v) op.selected = true; input.append(op); });
-    input.onchange = () => set(s.key, input.value);
-    return input;
-  }
-  input = el("input", {type: s.type === "number" ? "number" : "text", "aria-label": s.label});
-  if (s.min !== undefined) input.min = s.min;
-  if (s.max !== undefined) input.max = s.max;
-  input.value = v;
-  input.oninput = () => set(s.key, s.type === "number" ? Number(input.value) : input.value);
-  return input;
+async function loadLook() {
+  try {
+    const d = await (await fetch("/api/appearance", {headers: H})).json();
+    A.schema = d.schema; A.saved = d.values; A.current = JSON.parse(JSON.stringify(d.values));
+    A.media = d.media; A.backends = d.backends; A.caps = d.caps; A.mediaDir = d.media_dir; A.problem = d.media_problem;
+    A.schema.sections.forEach(s => loadChoices(s.id));
+    await loadPresets();
+  } catch (e) { /* the system settings still work without it */ }
 }
 
-function render() {
-  const main = $("#main"), nav = $("#nav");
-  main.querySelectorAll("section").forEach(x => x.remove()); nav.innerHTML = "";
-  const tags = [...new Set(schema.settings.flatMap(s => s.tags))].sort();
-  const tagBox = $("#tags"); tagBox.innerHTML = "";
-  tags.forEach(t => {
-    const c = el("button", {class: "chip" + (activeTags.has(t) ? " on" : ""), text: t});
-    c.onclick = () => { activeTags.has(t) ? activeTags.delete(t) : activeTags.add(t); render(); };
-    tagBox.append(c);
-  });
-  const q = $("#search").value.trim().toLowerCase();
-  let shown = 0;
-  schema.groups.forEach(g => {
-    const items = schema.settings.filter(s => s.group === g.id).filter(s => {
-      const hay = (s.label + " " + s.help + " " + s.key + " " + s.tags.join(" ")).toLowerCase();
-      return (!q || hay.includes(q)) && [...activeTags].every(t => s.tags.includes(t));
-    });
-    if (!items.length) return;
-    shown += items.length;
-    const sec = el("section", {id: "g-" + g.id}, [el("h2", {text: g.label})]);
-    items.forEach(s => {
-      const changed = JSON.stringify(current[s.key]) !== JSON.stringify(saved[s.key]);
-      const custom = JSON.stringify(current[s.key]) !== JSON.stringify(s.default);
-      const reset = el("button", {class: "reset", title: "Back to default: " + fmt(s.default), text: "Reset"});
-      reset.onclick = () => set(s.key, s.default, true);
-      const rtags = el("div", {class: "rtags"}, s.tags.map(t => {
-        const sp = el("span", {text: "#" + t}); sp.onclick = () => { activeTags.add(t); render(); }; return sp; }));
-      const info = el("div", {}, [el("div", {class: "label"}, [el("span", {class: "dot"}), el("span", {text: s.label})])]);
-      if (s.help) info.append(el("div", {class: "help", text: s.help}));
-      info.append(rtags);
-      sec.append(el("div", {class: "row" + (changed ? " changed" : "") + (custom ? " custom" : "")},
-                    [info, el("div", {class: "ctl"}, [reset, control(s)])]));
-    });
-    main.append(sec);
-    nav.append(el("a", {href: "#g-" + g.id, text: g.label}));
-  });
-  $("#empty").style.display = shown ? "none" : "block";
-  updateBar();
-}
-
-const fmt = v => v === true ? "on" : v === false ? "off" : String(v);
-
-function set(key, value, rerender) {
-  current[key] = value;
-  if (rerender) return render();
-  const s = schema.settings.find(x => x.key === key);
-  // update just this row's markers so typing isn't interrupted
-  document.querySelectorAll(".row").forEach(r => {
-    if (r.querySelector("[aria-label]")?.getAttribute("aria-label") === s.label) {
-      r.classList.toggle("changed", JSON.stringify(value) !== JSON.stringify(saved[key]));
-      r.classList.toggle("custom", JSON.stringify(value) !== JSON.stringify(s.default));
-    }
-  });
-  updateBar();
-}
-
-function changes() { return Object.keys(current).filter(k => JSON.stringify(current[k]) !== JSON.stringify(saved[k])); }
-
-function updateBar() {
-  const n = changes().length;
-  $("#save").disabled = $("#discard").disabled = n === 0;
-  $("#count").firstChild.textContent = n ? n + " unsaved change" + (n > 1 ? "s" : "") + ". " : "No unsaved changes. ";
-}
-
-function show(ok, text) {
-  const o = $("#out"); o.style.display = "block"; o.className = ok ? "ok" : "bad";
-  o.textContent = (ok ? "Saved and applied.\n" : "Not applied.\n") + (text || "");
+// Lists for text fields with "choices": "backend". Until they arrive (or without one) the field is a text box.
+async function loadChoices(sid) {
+  const sec = A.schema.sections.find(s => s.id === sid);
+  if (!sec || !A.backends[sid] || !sec.fields.some(f => f.choices === "backend")) return;
+  try {
+    const d = await (await fetch("/api/appearance/choices?section=" + encodeURIComponent(sid), {headers: H})).json();
+    if (d.ok) { A.choices[sid] = d.fields; if (page === "appearance" || query()) renderKeep(); }
+  } catch (e) { /* keep the text box */ }
 }
 
 async function post(path, body) {
-  $("#save").disabled = true; $("#save").textContent = "Applying...";
+  $("#save").disabled = true; $("#save").textContent = t("ui.applying");
   try {
     const r = await fetch(path, {method: "POST", headers: H, body: JSON.stringify(body || {})});
-    const d = await r.json(); show(d.ok, d.output); if (d.ok) await load(); else updateBar();
+    const d = await r.json(); show(d.ok, d.output); if (d.ok) { await load(); renderKeep(); } else updateBar();
   } catch (e) { show(false, String(e)); }
-  $("#save").textContent = "Save and apply";
+  $("#save").textContent = t("ui.save_apply");
 }
 
-$("#save").onclick = () => post("/api/save", {values: current});
-$("#undo").onclick = () => post("/api/undo");
-$("#discard").onclick = () => { current = {...saved}; render(); };
-$("#search").oninput = render;
+// Changing the update channel switches the system image (forge-apply does it, as root). Never without a yes here.
+function channelConfirmed() {
+  const ch = current["updates.channel"];
+  if (ch === saved["updates.channel"]) return null;
+  const back = ch === "testing" ? "stable" : "testing";
+  const ok = window.confirm(t("ui.channel.ask", {channel: optLabel(ch)}) + "\n\n" +
+    (ch === "testing" ? t("ui.channel.testing") + "\n\n" : "") + t("ui.channel.download") + "\n\n" +
+    t("ui.channel.back", {channel: optLabel(back)}));
+  return ok ? ch : false;
+}
+$("#save").addEventListener("click", () => {
+  const sw = channelConfirmed();
+  if (sw === false) return note(false, t("ui.channel.cancelled"));
+  post("/api/save", sw ? {values: current, switch_channel: sw} : {values: current});
+});
+$("#undo").addEventListener("click", () => post("/api/undo"));
+$("#discard").addEventListener("click", () => { current = {...saved}; renderKeep(); });
+$("#export").addEventListener("click", async () => {
+  const d = await (await fetch("/api/export?portable=1", {headers: H})).json();
+  if (d.error) return note(false, t("ui.not_exported") + "\n" + tr(d.error));
+  const a = el("a", {href: URL.createObjectURL(new Blob([JSON.stringify(d, null, 2)], {type: "application/json"})),
+                     download: "forge-settings-" + d.from_host + ".json"});
+  document.body.append(a); a.click(); a.remove();
+});
+$("#import").addEventListener("click", () => $("#importfile").click());
+$("#importfile").addEventListener("change", async () => {
+  const f = $("#importfile").files[0]; $("#importfile").value = "";
+  if (!f) return;
+  const r = await fetch("/api/import-check", {method: "POST", headers: H, body: JSON.stringify({text: await f.text()})});
+  const d = await r.json();
+  if (!d.ok) return note(false, tr(d.output));
+  Object.assign(current, d.values); renderKeep();
+  note(true, tn("ui.import.loaded", changes().length, {name: f.name}) + (d.notes.length ? "\n" + d.notes.map(tr).join("\n") : ""));
+});
+$("#search").addEventListener("input", () => render());
+$("#search").addEventListener("keydown", e => { if (e.key === "Escape") { $("#search").value = ""; render(); } });
+document.addEventListener("keydown", e => {
+  if (e.key === "/" && !/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName) && !$("#picker").open && !$("#ps-dialog").open) {
+    e.preventDefault(); $("#search").focus();
+  }
+});
+$("#dash").addEventListener("click", async () => {
+  const r = await fetch("/api/open-dashboard", {method: "POST", headers: H, body: "{}"}).catch(() => null);
+  $("#dash").textContent = r && r.ok && (await r.json()).ok ? t("ui.dash.opening") : t("ui.dash.failed");
+});
+
+// The language switch: saved per user (no password). The page changes at once, unsaved changes stay.
+function drawLang() {
+  document.querySelectorAll("#lang button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.lang === I18N.pref)));
+}
+document.querySelectorAll("#lang button").forEach(b => b.addEventListener("click", async () => {
+  try {
+    const d = await (await fetch("/api/ui/language", {method: "POST", headers: H, body: JSON.stringify({language: b.dataset.lang})})).json();
+    if (!d.ok) return;
+    setI18n(d.i18n); applyStatic(); drawLang(); renderKeep();
+  } catch (e) { /* keep the current language */ }
+}));
+applyStatic(); drawLang();
 setInterval(() => fetch("/api/ping", {headers: H}), 30000);
-window.onbeforeunload = e => { if (changes().length) e.preventDefault(); };
-load();
+window.addEventListener("beforeunload", e => {
+  if (changes().length || A.schema.sections.some(s => lookDirty(s.id))) e.preventDefault();
+});
+Promise.all([load(), loadLook()]).then(go);
+</script>
+<!--__PREVIEW_HOOKS__-->
+</body>
+</html>
+"""
+
+WELCOME_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title data-i18n="welcome.title">Welcome to Forge OS</title>
+<style nonce="__NONCE__">
+:root {
+  --bg: #f6f6f4; --panel: #ffffff; --text: #1c1c1e; --muted: #6b6b70; --line: #e4e4e0;
+  --accent: #d9622b; --ok: #2f8f5b; --bad: #c0392b;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #141416; --panel: #1d1d20; --text: #ececee; --muted: #9a9aa2; --line: #2c2c31; --accent: #ff7a3d; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+       font: 14px/1.5 system-ui, "Noto Sans", "Noto Sans Thai", sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 32px 24px 64px; }
+h1 { font-size: 24px; margin: 0 0 4px; }
+h1 span { color: var(--accent); }
+.lead { color: var(--muted); margin: 0 0 24px; }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; margin-bottom: 16px; }
+h2 { font-size: 16px; margin: 0 0 6px; }
+p { margin: 6px 0; }
+.muted { color: var(--muted); font-size: 13px; }
+code { font: 13px ui-monospace, monospace; background: var(--bg); border: 1px solid var(--line);
+       border-radius: 6px; padding: 2px 6px; }
+.cmd { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+.cmd code { flex: 1; padding: 8px 10px; }
+label.opt { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; border-top: 1px solid var(--line); }
+label.opt:first-of-type { border-top: 0; }
+button { font: inherit; padding: 7px 12px; border-radius: 8px; border: 1px solid var(--line);
+         background: var(--bg); color: var(--text); cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+button:disabled { opacity: .45; cursor: default; }
+.rep h3 { font-size: 14px; margin: 12px 0 2px; }
+.rep ul { margin: 0; padding-left: 20px; }
+.ok { color: var(--ok); } .warn { color: var(--bad); } .info, .unknown { color: var(--muted); }
+#out { white-space: pre-wrap; font: 12px/1.4 ui-monospace, monospace; display: none; margin-top: 8px; }
+:lang(th) body { line-height: 1.65; }
+</style>
+</head>
+<body>
+<main>
+<h1><span data-i18n="welcome.h1">Welcome to</span> <span>Forge OS</span></h1>
+<p class="lead" data-i18n="welcome.lead">A few things to check and set up. Everything here can be changed later in Forge Settings (in the app menu).</p>
+
+<section>
+  <h2 data-i18n="welcome.fit.title">1. How well this PC fits</h2>
+  <p class="muted" data-i18n="welcome.fit.help">Checks the image, graphics, AI, security, virtual machines and storage. Nothing is changed.</p>
+  <div id="report" class="rep" data-i18n="welcome.checking">Checking...</div>
+</section>
+
+<section>
+  <h2 data-i18n="welcome.loc.title">2. Location</h2>
+  <p class="muted" data-i18n="welcome.loc.help">Used for the time zone and for apps that ask. Saving asks for your password.</p>
+  <label class="opt"><input type="checkbox" data-key="location.services">
+    <span><b data-i18n="welcome.loc.services">Location services</b><br><span class="muted" data-i18n="welcome.loc.services.help">Apps can ask where you are (city level).</span></span></label>
+  <label class="opt"><input type="checkbox" data-key="location.auto_timezone">
+    <span><b data-i18n="welcome.loc.tz">Set the time zone automatically</b><br><span class="muted" data-i18n="welcome.loc.tz.help">Follows your location when you travel.</span></span></label>
+  <label class="opt"><input type="checkbox" data-key="location.wifi_lookup">
+    <span><b data-i18n="welcome.loc.wifi">Precise location from nearby Wi-Fi</b><br><span class="muted" data-i18n="welcome.loc.wifi.help">Street level instead of city level, by sending nearby Wi-Fi network IDs to beaconDB.</span></span></label>
+  <button class="primary" id="save" disabled data-i18n="ui.save">Save</button>
+  <div id="out"></div>
+</section>
+
+<section>
+  <h2 data-i18n="welcome.usb.title">3. Unlock the disk with a USB stick (optional)</h2>
+  <p class="muted" data-i18n="welcome.usb.help">Only if you installed with disk encryption. Your password always keeps working.</p>
+  <p><span data-i18n="welcome.usb.name">Name the stick's drive</span> <code>FORGEKEY</code><span data-i18n="welcome.usb.run">, plug it in, then run this in a terminal:</span></p>
+  <div class="cmd"><code>sudo forge-usbkey create home</code><button data-copy="sudo forge-usbkey create home" data-i18n="welcome.copy">Copy</button></div>
+  <p class="muted"><span data-i18n="welcome.usb.then">Then restart with the stick plugged in.</span> <code>sudo forge-usbkey list</code> <span data-i18n="welcome.usb.list">shows your keys.</span></p>
+</section>
+
+<section>
+  <h2 data-i18n="welcome.ts.title">4. Remote access with Tailscale (optional)</h2>
+  <p data-i18n="welcome.ts.help">Reach this PC from your phone or other computers. Run this, then open the sign-in link it shows:</p>
+  <div class="cmd"><code>sudo tailscale up</code><button data-copy="sudo tailscale up" data-i18n="welcome.copy">Copy</button></div>
+</section>
+
+<section>
+  <h2 data-i18n="welcome.home.title">Your home screen</h2>
+  <p class="muted" data-i18n="welcome.home.help">Forge Dashboard shows health, agents, backups and updates at a glance. It is "Forge Dashboard" in the app menu.</p>
+  <button id="dash" data-i18n="ui.dash.open">Open Forge Dashboard</button>
+</section>
+
+<p class="muted" data-i18n="welcome.again">Show this page again any time: "Forge Welcome" in the app menu. You can close this tab now.</p>
+</main>
+<!--__I18N__-->
+<script nonce="__NONCE__">
+const TOKEN = "__TOKEN__";
+const H = {"X-Forge-Token": TOKEN, "Content-Type": "application/json"};
+const $ = q => document.querySelector(q);
+function el(tag, text, cls) { const e = document.createElement(tag); if (text) e.textContent = text; if (cls) e.className = cls; return e; }
+applyStatic();
+const MARK = {ok: "dash.mark.ok", warn: "dash.mark.warn", info: "dash.mark.info", unknown: "dash.mark.unknown"};
+
+async function report() {
+  const box = $("#report");
+  try {
+    const r = await fetch("/api/doctor", {headers: H});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "failed");
+    box.textContent = "";
+    for (const s of d.sections) {
+      const h = el("h3", tr(s.name) + ": ");
+      h.appendChild(el("span", MARK[s.status] ? t(MARK[s.status]) : s.status, s.status));
+      box.appendChild(h);
+      const ul = el("ul");
+      for (const item of s.items) ul.appendChild(el("li", tr(item)));
+      box.appendChild(ul);
+    }
+  } catch (e) {
+    box.textContent = t("welcome.report_failed");
+  }
+}
+
+let values = null;
+async function load() {
+  const r = await fetch("/api/settings", {headers: H});
+  values = (await r.json()).values;
+  document.querySelectorAll("[data-key]").forEach(c => { c.checked = !!values[c.dataset.key]; });
+  $("#save").disabled = false;
+}
+
+$("#save").onclick = async () => {
+  // Only these settings are sent, as a merge, so a change made elsewhere meanwhile is kept.
+  const next = {};
+  document.querySelectorAll("[data-key]").forEach(c => { next[c.dataset.key] = c.checked; });
+  $("#save").disabled = true; $("#save").textContent = t("ui.saving");
+  const out = $("#out"); out.style.display = "block";
+  try {
+    const r = await fetch("/api/save", {method: "POST", headers: H, body: JSON.stringify({values: next, merge: true})});
+    const d = await r.json();
+    out.textContent = (d.ok ? t("ui.saved") : t("ui.not_saved")) + "\n" + (d.output ? tr(d.output) : "");
+  } catch (e) {
+    out.textContent = t("welcome.closed");
+  }
+  $("#save").disabled = false; $("#save").textContent = t("ui.save");
+};
+
+document.querySelectorAll("[data-copy]").forEach(b => b.onclick = async () => {
+  try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = t("welcome.copied"); }
+  catch (e) { b.textContent = t("welcome.select_copy"); }
+});
+
+$("#dash").onclick = async () => {
+  const r = await fetch("/api/open-dashboard", {method: "POST", headers: H, body: "{}"}).catch(() => null);
+  $("#dash").textContent = r && r.ok && (await r.json()).ok ? t("ui.dash.opening") : t("ui.dash.failed");
+};
+
+setInterval(() => fetch("/api/ping", {headers: H}), 30000);
+report(); load();
 </script>
 </body>
 </html>

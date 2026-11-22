@@ -1,0 +1,15 @@
+[Unit]
+Description=Forge OS: gaming mode while a game runs (only if turned on in Forge Settings, Gaming)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/forge-game watch
+# Any stop (logout, a crash, turned off) switches back from a gaming mode a game started.
+ExecStopPost=/usr/bin/forge-game restore --force
+Restart=on-failure
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,267 @@
+# Forge OS security process and risk register
+
+No process can promise zero bugs. What this file promises is that every security-relevant change goes through the same checks, every finding is written down, and nothing is called "working" without evidence.
+
+## The process (every change)
+
+1. **Threat notes first.** Before writing code: who could attack this (an AI agent, a web page, another local user, a hostile USB stick, someone on the network), and what must never happen.
+2. **Tests for every rule.** Each security rule gets an automated test, and each fixed finding gets a regression test so it can't come back.
+3. **Independent review.** A separate reviewer that did not write the code tries to break it, and reports CONFIRMED (reproduced) or PLAUSIBLE (reasoned) findings.
+4. **Fixes are re-reviewed.** Fixes are checked again by a reviewer that did not make them. (Until 2026-11-19 this step was missing: Phase 2 and 3 fixes were only checked by their own tests.)
+5. **Every finding is logged below**, including false alarms and anything deliberately not fixed.
+6. **Honest status labels:**
+   - **Verified on hardware:** tested on a real Forge OS install.
+   - **Tested (real tool):** tested against the real program here (for example real `cryptsetup` on a disk image).
+   - **Tested (simulated):** tested with fakes standing in for hardware or services.
+   - **Untested.**
+7. **Automated checks on GitHub** (written 11-19, first run still to come): unit tests, Python security linting (bandit), shell checks (shellcheck) and secret scanning (detect-secrets) run before every build, and the Bazzite base images' signatures are checked. Images are only built and published when all of that passes; afterwards the published images' signatures are checked again. Not added yet: gitleaks, CodeQL.
+
+## Findings log
+
+| Date | Area | Finding | Severity | Status |
+|---|---|---|---|---|
+| 11-19 | forge-apply | A setting value with a line break could inject a root command into a systemd file | Critical | Fixed, regression test |
+| 11-19 | forge-apply | Model folder could be `/` or `/etc`, then chowned by root | Critical | Fixed (allowlisted folders), regression test |
+| 11-19 | Forge Core | Decimal or infinite numbers crashed the API | Medium | Fixed, regression test |
+| 11-19 | Forge Core | Self-restart could cut off its own settings change | Medium | Fixed (delayed restart outside the service) |
+| 11-19 | forge-api | Token could be sent to another program squatting the port | Medium | Fixed (checks the port owner) |
+| 11-19 | Forge Core | Settings apply had no lock and no timeout handling | Low | Fixed |
+| 11-19 | sudo rule | Extra arguments accepted | Low | Fixed (exact arguments only) |
+| 11-19 | Policy | Approval requests hid which setting would change | High | Fixed, re-verified by independent review 11-19 |
+| 11-19 | Agents | Web fetch could be tricked into reaching local services (DNS rebinding), no size cap | High | Fixed: address pinning and size cap re-verified; time cap fixed later (R3) |
+| 11-19 | Agents | No cap on tool calls per step, notices file unbounded | Medium | Fixed, re-verified by independent review 11-19 |
+| 11-19 | Storage | Databases never cleaned up | Medium | Fixed (daily cleanup), re-verified by independent review 11-19 |
+| 11-19 | Forge Core | Agent data readable by other local users | Medium | Fixed (private folder), re-verified by independent review 11-19 |
+| 11-19 | Agents | Extra cloud providers skipped the cloud approval | Medium | Fixed, re-verified by independent review 11-19 |
+| 11-19 | Policy | Approvals expired early or stayed pending after a run ended | Low | Fixed, re-verified by independent review 11-19 |
+| 11-19 | forge-health | Agent text could add links to notifications | Low | Fixed (escaped), re-verified by independent review 11-19 |
+| 11-19 | Gateway | Ollama "-cloud" models bypassed the cloud permission | Medium | Fixed, re-verified by independent review 11-19 |
+| 11-19 | Policy, Gateway | Broken config files failed open or crashed | Medium | Fixed, re-verified by independent review 11-19 |
+| 11-19 | Agents | Model folder setting path (reported again) | n/a | False alarm: already fixed by the allowlist |
+| 11-19 | forge-settings | Settings page handed its token to anyone on the PC, DNS rebinding possible | Medium | DNS rebinding fixed and re-verified. Local token theft fixed later (R4) |
+| 11-19 | forge-hwcheck | USB sticks counted as disks, so a plugged key stick looked like new hardware | Low | Fixed (R10) |
+
+### R1 to R15: second independent review (11-19), fixed and re-reviewed
+
+Every fix followed: reproduce with a test that fails, fix, test passes, then a reviewer who did not write the fix tries to reproduce the original problem. Reviews ran in rounds; when a reviewer found a gap, it was fixed and reviewed again.
+
+| ID | Sev. | Area | Original problem | What changed | Independent review | Test level |
+|---|---|---|---|---|---|---|
+| R1 | High | forge-usbkey | An interrupted add could leave a working key slot with no record, invisible to list and revoke | Rebuilt over 8 review rounds: the password is read and checked by the tool first and passed on stdin; a pending record (with the header change counter) is written before the key is added and swapped for the final record after; interrupted adds are finished before any other write; unclear records are never revoked automatically; revoke refuses any slot the typed password opens; key checks only read cryptsetup's "no match" answer as no; the password slot can't be adopted; one name can't cover two sticks; a lock stops two runs at once; unreadable, unplugged or detached-header disks block adds and stop revoke/remove from reporting success; LUKS1 and swap lines are ignored | Rounds 1 to 7 each found new gaps (one of them High: an unreadable disk treated as not encrypted), all fixed with tests shown failing first. Round 7: every goal held under single faults and kills at every cryptsetup call. Round 8: those last fixes VERIFIED, no regressions in 400+ fault runs, two new Low items (below). Status: FIXED and independently verified, with the Low residuals listed below | Tested (real tool): real cryptsetup on LUKS2 images, faults, kills and read errors injected |
+| R2 | Med | forge-apply | Model folder could be swapped for a symlink so root chowns any file | Folder made and chowned through file descriptors, no symlinks followed, existing folders never chowned | VERIFIED: 20,000 to 30,000 race attempts per mode, nothing outside the folder chowned | Tested (real tool), users simulated |
+| R3 | Med | Agent web fetch | Slow server could stall an agent for hours | One deadline for every step; round 2 (reviewer found DNS outside it): lookup runs under the same deadline | VERIFIED twice: every stage stops on time, 400 stuck lookups did not crash | Tested (simulated servers, no real DNS here) |
+| R4 | Med | forge-settings | Another local user could get the page and token first | Owner check, one-time launch key, refuses root; round 2 (reviewer bypassed the owner check with the same port from another address): exact address match, loopback only, exactly one socket | Round 1 PARTIAL (bypass confirmed), round 2 VERIFIED live with two users | Tested (real tool), IPv6 not tested |
+| R5 | Med | Forge Core | One admin token readable by every program you run | Two tokens: admin (root and forge only), viewer (read-only, no secrets, audit or policy) | VERIFIED: 16 path spellings, method overrides, file modes | Tested (real tool) |
+| R6 | Med | forge-usbkey | Stick found by name only; unsafe mounts | Stick must be a real USB disk (lsblk), exactly one match, private nosuid/nodev/noexec mount; round 2: mount inside a root-only folder with root-only file modes | VERIFIED (hostile lsblk data); mount modes checked by reading code only | Tested (simulated lsblk), no real USB |
+| R7 | Low | forge-apply | A FIFO, symlink or huge file in the import folder could hang or mislead root | File descriptor open, no symlinks, no FIFOs, regular files only, 1 MB cap, lock timeout | VERIFIED: symlink, FIFO, device, 2 MB, path tricks | Tested (real tool) |
+| R8 | Low | Agent web fetch | IPv6 forms with a private IPv4 inside were allowed | NAT64 and fec0 refused; round 2 (reviewer found SIIT ::ffff:0:x): refused too | VERIFIED twice, every encoding listed in the review | Tested (unit) |
+| R9 | Low | Forge Core | Cleanup only after 24 hours of uptime | Runs 60 s after start, then daily, errors can't stop it | VERIFIED | Tested (unit) |
+| R10 | Low | forge-hwcheck, forge-health | USB sticks counted as hardware; names not escaped | USB and removable disks skipped, names escaped; round 2 (reviewer found SD cards and Thunderbolt drives): skipped too, internal eMMC still counted | VERIFIED twice | Tested (simulated sysfs) |
+| R11 | Low | forge-health | Text starting with "-" read as an option | "--" before the text | VERIFIED | Tested (fake notify-send) |
+| R12 | Low | Policy | Some secret names not hidden; long writes cut off in approvals | More names and URL secrets hidden; approvals keep 200 KB with a checksum | VERIFIED | Tested (unit) |
+| R13 | Low | Gateway | Local alias of a cloud model counted as local | Ollama asked about every model, unknown means cloud | VERIFIED | Tested (mocked Ollama) |
+| R14 | Low | Supply chain | Ollama unverified; actions on tags | Ollama v0.40.16 pinned with its sha256; every action pinned to a commit (round 2: the signing job's blue-build action too) | VERIFIED: checksum and commits checked independently | Tested (real files) |
+| R15 | Low | forge-usbkey | Failed record removal ignored | Reported, plus a cleanup command | VERIFIED | Tested (real tool) |
+
+### Residual risks left by these fixes
+
+- **R1, interrupted add plus a manual password (Low):** if forge-usbkey is killed, or the power fails, while it is adding a key (a few seconds), and the very next change to the disk is a password you add by hand that lands in the same slot, the tool later treats that slot as the USB key. Revoking it with a different password then removes that hand-added password. It can never be the last way in. A fix exists (give our key slot a recognisable setting) but has trade-offs on low-memory machines: your decision.
+- **R1, two passwords (Low):** with two password slots, a stick whose forge_key is password #2 can be adopted as a USB key, so revoking it removes password #2. Password #1 keeps working.
+- **R1, renamed devices (Low, plausible):** a crypttab line using a kernel name (like /dev/sdb1) that now points at a different readable non-LUKS disk is skipped. Lines using UUID= (the default) are not affected.
+- **R1, detached headers and LUKS1:** volumes with header= block adds and stop revoke from reporting success (safe, but those volumes can't use USB keys). LUKS1 volumes can't use USB keys.
+- **R3:** a stuck name lookup leaves one background thread until the system resolver gives up.
+- **R8:** an ISP's own NAT64 prefix can't be recognised by address alone.
+- **R10:** NVMe drives seen through the multipath subsystem, "SDcombo" cards and SD Express cards may still count as hardware.
+- **R12:** some secret names are still shown (pwd, session, jwt, bearer, ssh_key, mnemonic, connection_string, free text like password=...); agent results in the audit log are not redacted.
+- **R13:** an alias re-pointed to a cloud model during a run is noticed only on the next run (5 minute cache).
+- **R14, supply chain (mostly done 11-19):** the claude-desktop and tailscale repo files are now part of the image, and their signing keys are checked against pinned fingerprints before use (the tailscale fingerprint is not fully confirmed yet: the first CI run shows it). Base images stay on a moving tag but are only used when Universal Blue's signature checks out. The BlueBuild tool is one exact release with its signature checked. The Secure Boot key URL points at one commit (its sha256 is noted, but the ISO action does not check it). Still open: Flatpaks are unpinned, and the claude-desktop repo is a third party you chose to keep.
+
+### New findings from the reviews (open, not fixed: need approval)
+
+| Sev. | Area | Finding | Status |
+|---|---|---|---|
+| Low | forge-apply | Deleting the new model folder at the right moment aborts the rest of the apply | Fixed, regression test |
+| Low | forge-core-init | Token written before its permissions are tightened if an empty file already exists | Fixed (new private temp file, then moved), regression test |
+| Low | forge-apply | /etc/crypttab rewritten in place, not atomically; trailing comments dropped | Fixed (atomic, keeps owner, labels, comments and odd bytes), regression tests |
+| Low | forge-api | Forge Core restarting between the port check and connect could hand the admin token to a squatter | Fixed (owner of the connected socket checked before sending), regression test |
+| Low | forge-apply | Model folder on a user FUSE mount could hang applies (needs user_allow_other) | Fixed (FUSE refused; the step runs in a child with a 20 s limit), regression tests |
+| Low | forge-settings | Rejected requests from other users keep the page alive | Fixed (other users' connections are now closed on arrival), regression tests |
+| Low | forge-settings | No anti-framing headers | Fixed, on every response, regression tests |
+| Info | forge-settings | Launch URL printed to stdout (may reach the journal) | Fixed (only printed when you ask to open it yourself) |
+| Info | forge-usbkey | Test-only environment variables still read in production (sudo clears them) | Open |
+| Low | forge-usbkey | A disk changed from LUKS2 to LUKS1 by restoring a LUKS1 header backup is skipped even though a LUKS2 backup header survives (needs an admin mistake plus manual header repair; cryptsetup can't open it as is) | Fixed (backup headers are checked too), regression test |
+| Low | forge-usbkey | A crypttab line with header= (detached header) permanently blocks adds and makes revoke always exit 1, with a wrong "connect it" message | Message fixed and adds work, regression test; detached-header volumes still can't use USB keys (fails safe) |
+| Info | forge-usbkey | A stick key added by hand to a LUKS1 disk still works after "every USB key is revoked" (LUKS1 is not managed, and the tool says so) | By design, noted |
+| Info | Forge Core | Viewer token can read agent run transcripts | By design, noted |
+| Info | Tests | test_core fails if test_core_hardening is imported first (settings read at import) | Open, test hygiene |
+
+### Latest review rounds (11-19): fixed
+
+All found by the independent reviewer in the newest code; each has a test shown failing on the old version.
+
+- forge-apply and forge-config: undo order depended on the clock (snapshots now numbered); odd `--undo` and `--import` arguments; broken, linked or FIFO snapshot files; very long text values; `forge-config set` sent every setting instead of only the changed one; crypttab with non-UTF-8 bytes; a hanging model folder step.
+- forge-settings: another local user could open many idle connections and use up the page's threads. Their connections are now closed as they arrive, and the total is capped.
+
+The independent re-review of those fixes confirmed they hold (other users' connections: 0 of 60 kept; six concurrent `forge-config set` runs all saved; the round 3 code fails the new tests). It found these, all fixed with a test shown failing first unless marked:
+
+| Sev. | Area | Finding | Status |
+|---|---|---|---|
+| Medium | forge-apply | `forge-config set` with one bad value in the settings file wiped every other setting, and the snapshot could not bring them back | Fixed: the save is refused and the file left as it is; snapshots keep the old values as they were |
+| Medium | forge-core-init, forge-apply | Under Forge Core's strict umask, /etc/forge (and any config file forge-apply creates) could become owner-only, so users and services silently got defaults | Fixed: the folder is set to 0755 at every start, forge-apply uses the normal umask, settings.json stays readable |
+| Low | forge-apply | A crypttab comment containing an unusual line break (U+2028 and others) was split, and its tail got the USB key | Fixed: split only where systemd splits |
+| Low | forge-hwcheck, metrics, power switch | A wireless mouse or controller battery made a desktop count as a laptop (and "hardware changed" on every plug) | Fixed: device batteries ignored |
+| Low | doctor | An unreadable /etc/crypttab was reported as "not encrypted" | Fixed: "not sure" |
+| Low | forge-doctor | Two `--save` runs in the same second crashed | Fixed |
+| Low | metrics | Two collectors upgrading one old database at once: one failed to start | Fixed: one write transaction |
+| Low | forge-settings | Another user can still flood the connection queue and slow the owner's page | Mitigated (larger queue); a slowdown, never access |
+| Low | forge-apply | Snapshot counter overflow after ten billion saves | Fixed: renumbered |
+| Low | forge-apply | A malformed history line crashed `--history` | Fixed |
+| Low | forge-health | A new check alone still said "settings were re-applied" | Fixed. Its other half (sysfs text not escaped) was a false alarm: the notify helper already escapes |
+| Not sure | forge-power-switch | With Ollama stopped, another user could listen on its port and feed many model names to the root switch | Hardened anyway: only asks a running Ollama service, at most 8 models, 5 minute limit |
+
+Also found while fixing these: two test files used a fixed folder path from the development machine, so they would have failed on GitHub (and the reviewer's copy of those two tests checked the live code instead of the frozen copy). Fixed, with a test that stops it coming back.
+
+The next independent re-review confirmed all of those fixes hold, and reviewed the new features below. It found:
+
+| Sev. | Area | Finding | Status |
+|---|---|---|---|
+| Medium | forge-apply | The normal umask (from the fix above) made the apply lock file readable, so any user could hold it and block every settings apply | Fixed: owner-only lock, repaired if an old one is found |
+| Medium | forge-virt | An administrator removed from wheel kept the VM rights Forge gave them | Fixed: taken back on the next run; people Forge didn't add are never touched |
+| Low | forge-virt | libvirtd enabled but failed to start was not recorded, so turning VMs off left it enabled | Fixed |
+| Low | forge-hwcheck | The notice said settings were re-applied even when the re-apply failed | Fixed: written after the re-apply, from its result |
+| Low | doctor | A crypttab with only comments showed "Disk encryption: on" | Fixed |
+| Low | forge-apply | Config files an older version made owner-only stayed that way | Fixed: every generated file is set to 0644 |
+| Low | forge-apply | The crypttab backup was briefly readable by everyone while being copied | Fixed: created owner-only from the start |
+| Low | forge-apply | A deeply nested history line still crashed `--history` | Fixed |
+| Info | forge-doctor | `--save` into an unwritable home crashed | Fixed |
+| Info | doctor | Devices in 5-digit PCI domains (Intel VMD) were missed in IOMMU groups, so a GPU could be called "ready" wrongly | Fixed |
+| Info | forge-virt | A file where its swtpm folder goes crashed it | Fixed |
+| Info | forge-virt | With a broken settings file, forge-virt changes nothing while forge-apply falls back to defaults (VMs off) | By design: never tear down on a broken file |
+| Info | welcome page | Save sent every setting, so a change made meanwhile elsewhere was reverted | Fixed: sends only its three settings, as a merge. The main Settings page still saves the whole list (it shows them all) |
+| Info | welcome page | If the browser failed to open at first login, the page never showed again | Fixed: recorded only once the page is served |
+| Not sure | forge-virt | Turning VMs off during a long install could be lost (systemd joins the second start into the running one) | Fixed anyway: the run re-reads the setting and follows it; it also has its own lock |
+
+Still "not sure", needs a real Bazzite PC: whether `NoNewPrivileges=yes` lets usermod, groupadd and restorecon change SELinux domains in forge-virt; whether `usermod -aG libvirt` works when the libvirt group only exists in /usr/lib/group (Bazzite's own recipe has the same question). (The power switch's worst case, 12 calls with a 60 s limit each, was longer than its unit limit: fixed with a 15 s limit per model and an 8 minute unit limit.)
+
+The re-review of that round confirmed every fix (no High or Medium findings) and found these, all fixed with a test shown failing first:
+
+| Sev. | Area | Finding | Status |
+|---|---|---|---|
+| Low | forge-apply, forge-virt | settings.json was saved in place; a reader catching it half-written sees "all defaults", which could turn the VM setup off | Fixed: written to a new file and swapped in |
+| Low | forge-virt | If the wheel group couldn't be read, everyone Forge added lost VM rights | Fixed: nobody is removed then |
+| Low | forge-hwcheck | If the re-apply could not start, or hwcheck was stopped during it, no notice was written at all | Fixed: a notice is written first, then updated if the re-apply worked |
+| Info | forge-apply | Unchanged drop-ins made owner-only by an older version were not repaired | Fixed |
+| Info | forge-doctor | A write error during `--save` crashed and left a partial file | Fixed |
+
+Noted, by design: a user Forge added keeps VM rights only while in wheel, even if an admin later wanted them to keep it; a setting changed more than three times during one long forge-virt run is followed on the next apply; two logins at the same moment could both show the welcome page.
+
+The re-review of those five confirmed all of them, and found only Low and Info items, all fixed with a test shown failing first: the hardware notice now says "pending" during its re-apply (forge-health waits up to 15 minutes for it) and is written in one step; temp files from a killed settings save are cleaned up at the next save; a full disk now gives "Not saved" with the old settings untouched and no extra undo point (old undo points are only removed after a save works); settings.json.bak is readable like the settings.
+
+Not sure, needs a real Bazzite PC: the new settings file gets the folder's SELinux label instead of keeping the old file's (expected to be the same, etc_t).
+
+The re-review of those confirmed them, and found one Medium that was already there before: on a completely full disk the snapshot step failed with a traceback, and a size-limited write could leave a cut-off snapshot that broke undo. Fixed with a test shown failing first: snapshots are written whole before they get their name, every save step fails with a clean "Not saved" and leaves the settings, the one-step undo copy and the undo points as they were; a history that can't be written after a save is a note, not a crash; the undo copy is never made through a link (a linked settings file is now refused); a pending notice from a clock that was ahead is shown at once. One Info item stays: a pending notice that only finishes after 15 minutes is shown twice. (The check for leftover temp file names now needs an exact match.)
+
+The re-review of those confirmed every fix with a real full disk and size limits (no High or Medium findings). Of its four Low or Info items, two were fixed with a test shown failing first: the "takes effect after a restart" note is no longer lost when the history can't be written, and snapshot temp files left by a power loss are cleaned up. These two small fixes have not had their own independent re-review. Accepted: a full disk can leave an empty seq.tmp (reused next time), and a failed save uses up a snapshot number (harmless gaps). Not sure: the settings undo copy is not fsynced before its rename; a symlinked settings file can still be read but no longer saved (by design).
+
+### New features (11-19): threat notes
+
+- **forge-virt** (root, started by forge-apply): only acts on the "Virtual machines" setting, which only an administrator can change. Every name it passes to a command comes from a fixed list or a strict pattern, its record is root-only and never followed through a link, and turning it off undoes only what it recorded. It gives the libvirt group to administrators (wheel), which is close to root access: they already have sudo.
+- **GET /api/doctor** (Forge Core): admin token only (it describes the PC's security setup), read-only, one report at a time, reused for 30 seconds, errors without details.
+- **Welcome page**: served by forge-settings with the same owner check, one-time key and token as the settings page. The report shown in it comes from /sys and other system files, so the page only inserts it as plain text.
+- **forge-power-switch** (root, from a udev rule): reads only validated settings and the charger state; model names are checked against a strict pattern before `ollama stop`.
+
+### Second build round (11-19, evening): new features and their reviews
+
+Built by eight parallel builders, then the Forge Dashboard, each with failing-first tests: shared drive with Windows, encrypted home backups (restic), activity timeline and update status, `forge-doctor --fix`, settings sync between PCs, the ISO boot test, a read-only Windows pre-install checker, the creative MCP hub connection (the hub itself is never changed) and the Forge Dashboard. Four independent reviews followed (privileged parts, user tools with untrusted data, CI and supply chain, the dashboard), then re-reviews of every fix. No High findings in any round.
+
+| Sev. | Area | Finding | Status |
+|---|---|---|---|
+| Medium | forge-backup | Another user could make a restore write into your home (a folder they made, or a link planted while restic starts) | Fixed: the target must be a new 0700 folder; every parent is checked without following links; FUSE filesystems are refused |
+| Medium | forge-hub | The hub dashboard's token was on xdg-open's command line, readable by every user | Fixed: a 0600 redirect page in a private runtime folder |
+| Medium | forge-shared-drive | A drive with no UUID skipped the "remember my drive" check | Fixed: UUID and PARTUUID are remembered; a missing id counts as a different drive |
+| Medium | ISO boot test | Any colourful screen passed, even an ISO with no kernel | Fixed: a test copy that differs only in its kernel console lines (every other file checked by sha256) must show the kernel and the installer starting on serial |
+| Low (my merge slip) | finalize.sh | A lost line continuation would have run forge-apply as root during the image build | Fixed, with a test that every tool is in one chmod command |
+| Low | timeline | Decoy file names and flooding could hide other users' activity; text was cut before redaction | Fixed: exact uid names owned by that uid, caps per user and source, future times clamped, redaction before cutting |
+| Low | policy | An early cut for speed could split a secret so part of it showed | Fixed: the partial word at the early cut is dropped |
+| Low | forge-doctor-fix | Fixes were recorded as done by "root"; a test seam worked in production | Fixed: the real user is passed on; the seam needs a test marker |
+| Low | updates API | One slow refresh made every caller wait | Fixed: callers get the last result while one refresh runs |
+| Low | polkit rule | Lookalike labels (for example with a long s) could match the shared drive rule | Fixed: ASCII labels only |
+| Low | settings sync | Decoy files could hide a PC; a new export date alone notified again; odd characters in the folder setting | Fixed (decoys: partly, anyone who can write the folder can still delete a PC's file; a "too many files" notice warns) |
+| Low | dashboard | Huge tool output used lots of memory; rollback could run twice; any web page could keep it alive; sync showed only a count before applying; bidi characters in dialogs; doctor runs not limited; launch key on the command line; long VM names | Fixed |
+| Low | CI | Free-text Fedora version reached a privileged shell; guest output could fake workflow messages; workflow tests matched text | Fixed: a fixed choice, stop-commands wrapping, YAML-based tests (17 of 17 mutations caught) |
+| Low | Windows checker | Hardware names with control characters could fake lines in the terminal | Fixed: every probe string cleaned |
+
+Accepted and open:
+- One administrator can still put up to 100 of their own entries at the top of the timeline (only wheel members can write the activity folder).
+- The drive "pin" stops mistakes and casual swaps, not someone who copies your drive's ids on purpose.
+- Settings sync: a file swapped in the milliseconds between the dashboard's check and the apply is not caught (the apply still validates every value and asks for the password).
+- `forge-hub setup` runs the clone's own build scripts (it is your own repo).
+- Not sure until real hardware: polkit and udisks prompts, the Flatpak browser opening the redirect pages in the runtime folder, anaconda's exact serial lines in Fedora 45, whether the ISO action writes a CHECKSUM file.
+
+Two more re-review rounds checked those fixes. They found:
+
+| Sev. | Area | Finding | Status |
+|---|---|---|---|
+| High | ISO boot test | A crafted ISO with no kernel could still pass: its GRUB config printed itself (with the secret test mark) using GRUB's own "cat" command | Fixed: a GRUB config that uses commands able to print files or build commands (cat, hexdump, source, configfile, eval and others) is refused, also when split with quotes; shown failing against the crafted ISOs in real QEMU, while a good ISO still passes with Secure Boot off and on |
+| Medium | policy | The text kept back near the early cut (1 KB) was smaller than the longest secret pattern (4 KB), so part of a long quoted secret could show | Fixed: 8 KB kept back, the scan grows until that holds; tested with the reviewer's cases |
+| Medium (my regression) | policy | My first fix for the split-secret edge cut 512 characters early and could split a token there | Replaced by the approach above |
+| Medium | ISO boot test | GRUB text (menu titles, echo) could print the installer's start lines | Fixed: a fresh random mark goes only on the kernel lines, and only the kernel's own "Command line:" line with that mark counts, before any installer line |
+| Low | dashboard | A tool started through pkexec that could not be stopped crashed the request, and could allow a second rollback | Fixed |
+| Low | dashboard | Rollback dialog wording could be wrong when the running version is the default but not the newest | Fixed: it names a version only when certain |
+| Low | CI tests | Workflow tests could be fooled (job or step "if: false", "\|\| true", extra flags, a second download after the hash check, shell overrides) | Fixed: workflows are parsed as YAML and each gate's exact command is required; 40 of 40 boot-test mutations and 8 of 8 gate mutations are caught |
+| Low | ISO boot test | File names with line breaks were skipped by the file comparison; odd line endings; Ctrl+C left gigabytes behind | Fixed |
+| Low | Windows checker | Some invisible characters outside the basic plane survived cleaning | Fixed |
+| Low | CI | The secret scan baseline had old line numbers, so the first push would have failed the gate | Fixed; note: any edit that moves a flagged line needs the baseline refreshed (run the same command CI runs, then commit the file) |
+
+Limit of the ISO boot test, by design: it catches broken ISOs. It can never prove that an ISO is honest, because a deliberately crafted ISO could boot a tiny real kernel that prints the installer's start lines. What protects against a tampered ISO is the signed image and the locked-down build pipeline, not this test.
+
+### Third build round (11-20 to 11-22): customization, release safety, gaming, Thai
+
+Built by parallel builders with failing-first tests, each part reviewed independently, every fix re-reviewed (up to four rounds), then merged and tested together: Settings cleanup (6 sections, search) with a per-user Appearance framework; background (picture, slideshow, video, Wallpaper Engine, colours, crash guard); dock styles (stock panel, floating clean, animated with Krema); custom bootup (boot splash, login screen, desktop splash, lock screen); Theme section; appearance presets with export, import and sync; Thai for Settings and the Dashboard; automatic rollback checks (greenboot); stable and testing update channels; version numbers, changelog and SBOM; a CI screenshot test; MangoHud overlay; automatic game mode; a monthly backup restore test; a Dashboard log viewer.
+
+| Sev. | Area | Finding | Status |
+|---|---|---|---|
+| High (from a fix) | Appearance media library | A damaged or missing index made the new cleanup delete every picture and video, even when only opening Settings | Fixed: nothing is ever deleted; unknown files go to a quarantine folder; a damaged index makes the library read-only until it is repaired or rebuilt from the files |
+| High | Automatic rollback | The NVIDIA check failed on every update where the driver never loads (for example Secure Boot without the key enrolled), so every update rolled back and the PC rebooted while in use | Fixed: it only fails when the driver loaded on the last good start with the same card and Secure Boot state |
+| Medium | Game mode | A password-free polkit rule to switch modes also let any program of the user cancel queued system jobs (polkit never sees the job mode) | Fixed: rule removed; a small hardened root service takes one of five words from the admin at the PC (SO_PEERCRED plus the active seat0 session) |
+| Medium | Automatic rollback | Leftover greenboot marks counted as a new update, turning rollback off left a GRUB countdown running, and Windows boots during a countdown could end with GRUB starting the failed entry | Fixed and checked with a simulation of greenboot 0.16.4 and 0.16.6, GRUB and Windows boots |
+| Medium | Update channels | Going back from the boot menu left updates on testing; the version label could be empty, and a bad one reached latest before the check | Fixed: decisions use the default deployment; Forge has its own label; latest and testing move only after the signature and label are checked by digest |
+| Medium | Presets | Applying a preset could ask for the admin password without the tick box; a sync folder writer could replace an existing preset | Fixed: without the box boot runs in a user-only mode; synced changes arrive as copies; owner and mode checks (reduced on drives without permissions) |
+| Medium | Background | Changing the wallpaper during crash recovery could leave the desktop stopped; packed Wallpaper Engine scenes were never listed | Fixed |
+| Medium | Dock | Pins made in Krema were lost; old backups re-applied to panels; one non-ASCII pin dropped the list; a timeout could leave the panel stopped | Fixed |
+| Medium | Bootup | "Off" could silently fail after a slow admin step; an error part way left root changes unrecorded | Fixed: off follows the system state; every part is recorded as soon as it starts |
+| Medium | Appearance framework | The 2 minute backend limit was not enforced; helpers could be killed or block apply; upload errors were invisible | Fixed: deadline on the process, output through a bounded pipe |
+| Medium (existing code) | USB key unlock | A second change to its settings never reached the boot image until the next update (rpm-ostree answers "No changes." for an already tracked file) | Fixed: --force-sync |
+| Low | many | Redaction gaps (password="x", pw=, psk=, curl -u, mysql -p, sshpass -p, full-width separators, other languages), restore test leftovers and a missing time limit, slow-upload and lock issues, i18n slowdown on long lines, Thai marks lost in file names, GTK apps not told about cursor and font changes, clock-skewed pins, CI runs of the same commit mixing images, and others | Fixed, each with a regression test |
+
+Accepted and open:
+- The animated dock (Krema) and Wallpaper Engine are switched off until their exact package versions and repository keys are pinned (their COPR repositories could not be checked from here).
+- Any program running as the administrator at the PC can switch between the five configured modes (the same power `forge-mode` has). The mode service needs CAP_SYS_ADMIN to manage units; its only input is one word.
+- A program of the same user named like a game can start game mode.
+- Redaction cannot catch secrets written as free text ("the password was x").
+- Test hooks (FORGE_* environment variables) are honoured in user tools; only your own environment can set them.
+- Not seen on a real screen yet: wallpapers, dock styles, boot splash and unlock box, login and lock screens, themes, game mode, greenboot on a real update, and the new CI jobs.
+
+### Scanners (11-19)
+
+- bandit: production code has no High findings. Medium patterns were checked by hand: SQL built only from fixed column names (not injectable), urlopen only on 127.0.0.1 or the system's OLLAMA_HOST, "0.0.0.0" is a comparison, not a bind. Accepted.
+- shellcheck: every shell script clean at warning level.
+- detect-secrets (all files): 26 hits, all false positives (public Universal Blue enrollment password, public Ollama checksum, environment variable names, a folder path, fake test values and ids, a key header with no key in it). An earlier run reported 0 because it scanned nothing outside git; that result was wrong and was replaced.
+- Unit tests: 1707, all passing (11-22, full merged branch; 1 skipped needs a tool not installed here), with the real-tool tests run (restic 0.16.4, PowerShell 7, QEMU with OVMF for the boot test). Workflows pass actionlint (with its shellcheck checks).
+- gitleaks: not available in this environment.
+
+### Could not verify here (needs real hardware)
+
+USB unlock at boot (initramfs drivers, udev, real lsblk output), the stick mount on a real FAT or exFAT stick, interactive password prompts, Ctrl-C at a real terminal, OOM kills under real argon2 memory, real TPM2 or FIDO2 enrollments next to USB keys, real DNS, IPv6, Thunderbolt and SD card readers, sudo and polkit prompts.
+
+## Known open risks (not fixed yet)
+
+- **Nothing has been verified on real hardware yet.** Everything above is tested with real tools or simulations only.
+- **The GitHub checks have never run yet.** They are written and tested here only as files; the first push shows whether package names, the Fedora 45 container and the pinned key fingerprints are right.
+- **Cloud API keys are stored as plain text** in `/var/lib/forge/secrets.json` (owner-only). Their protection is the disk encryption and file permissions.
+- **Viewer token readable by every program you run.** It can read status, runs and agents, but not secrets, the audit log, policy, approval details or the doctor report, and it can't change anything. Changes need `sudo forge-api`.
+- **Your single USB stick (H:) holds both the disk unlock key and the cosign signing key.** Losing it exposes both. Better: keep the signing key somewhere else, and add a second unlock stick with `forge-usbkey`.
+- **A policy rule can enable command running**, but no command tool exists yet, so it does nothing today.
+- **Gateway rate limits reset when Forge Core restarts.**
+- **Unverified on real systems:** the iwd Wi-Fi backend honouring random MAC addresses, KDE reading `/etc/xdg/kded6rc`, Claude Desktop surviving the atomic `/opt` layout, the ISO workflow, virtual machine setup from a background service, the welcome page autostart, charger mode switching, the shared drive and backup triggers (udisks, polkit, udev), the Forge Dashboard's password prompts, the hub inside Flatpak and Wine apps, the ISO boot test on GitHub.
+- **Test noise:** one agent test thread writes to its database after the test removes it. Harmless, but it should be cleaned up.

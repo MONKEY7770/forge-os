@@ -692,5 +692,72 @@ class RouterTest(Base):
         self.assertNotIn("run_command", names)
 
 
+class RunHistoryRedactionTest(Base):
+    def test_stored_steps_and_result_hide_secrets(self):
+        self.agent()
+        r = self.runner([tool_call("notify", {"message": "password=hunter2SECRET API_KEY=sk-ABCDEF123456"}),
+                         answer("done, token=TOKSECRET9")])
+        rid = r.start_run("helper", "t")
+        self.assertTrue(wait_for(lambda: r.get_run(rid)["status"] in ("done", "failed")))
+        raw = json.dumps(r.get_run(rid))
+        for secret in ("hunter2SECRET", "sk-ABCDEF123456", "TOKSECRET9"):
+            self.assertNotIn(secret, raw)
+        # The model itself still got the real text (redaction is only for what is stored).
+        sent = json.dumps(self.chat.calls[-1][0])
+        self.assertIn("hunter2SECRET", sent)
+
+
+class RunHistoryRedactionRound2Test(Base):
+    def run_one(self, task, args, tool="write_file"):
+        self.agent()
+        r = self.runner([tool_call(tool, args), answer("ok")])
+        rid = r.start_run("helper", task)
+        self.assertTrue(wait_for(lambda: r.get_run(rid)["status"] in ("done", "failed")))
+        return r, json.dumps(r.get_run(rid))
+
+    def test_task_is_stored_redacted(self):
+        _, raw = self.run_one('use password: "hunter2 hunter2" and sk-abcdefghijklmnop1234', {"path": "a", "content": "x"})
+        self.assertNotIn("hunter2", raw)
+        self.assertNotIn("sk-abcdefghijklmnop1234", raw)
+
+    def test_quoted_values_inside_tool_args_are_hidden(self):
+        _, raw = self.run_one("t", {"path": "a.py", "content": 'db_password = "Sup3rSecretValue"\n'})
+        self.assertNotIn("Sup3rSecretValue", raw)
+
+    def test_a_cut_summary_cannot_reveal_a_secret(self):
+        _, raw = self.run_one("t", {"path": "a", "content": '{"password": "correct horse battery staple ' + "x" * 300})
+        self.assertNotIn("correct horse", raw)
+
+    def test_non_standard_numbers_in_tool_args_are_refused(self):
+        self.agent()
+        bad = {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "notify", "arguments": '{"message": NaN}'}}]}}]}
+        r = self.runner([bad, answer("ok")])
+        rid = r.start_run("helper", "t")
+        self.assertTrue(wait_for(lambda: r.get_run(rid)["status"] in ("done", "failed")))
+        self.assertEqual(self.policy.checks, [], "a NaN argument reached the policy")
+        json.dumps(r.get_run(rid), allow_nan=False)
+
+    def test_deeply_nested_tool_args_do_not_fail_the_run(self):
+        self.agent()
+        bad = {"choices": [{"message": {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "notify",
+                                                           "arguments": "[" * 100000 + "]" * 100000}}]}}]}
+        r = self.runner([bad, answer("ok")])
+        rid = r.start_run("helper", "t")
+        self.assertTrue(wait_for(lambda: r.get_run(rid)["status"] in ("done", "failed")))
+        self.assertEqual(r.get_run(rid)["status"], "done")
+
+    def test_scheduler_cleanup_waits_for_a_trusted_clock(self):
+        r = self.runner([answer("ok")])
+        pruned = []
+        r.prune = lambda *a, **k: pruned.append(1)
+        r.start_scheduler(every_s=0.05, prune_ok=lambda: False)
+        time.sleep(0.3)
+        r.stop_scheduler()
+        self.assertEqual(pruned, [])
+
 if __name__ == "__main__":
     unittest.main()
+
+

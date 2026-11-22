@@ -1,0 +1,4 @@
+# Forge OS: when a drive with a filesystem name is plugged in, ask each logged-in user's
+# systemd to start forge-backup.service. Nothing runs as root. The service itself checks
+# that automatic backups are on, that this is the backup drive, and that a backup is due.
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_USAGE}=="filesystem", ENV{ID_FS_LABEL}=="?*", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="forge-backup.service"

@@ -3,3 +3,7 @@ cosign.private
 /Containerfile
 *.iso
 *.iso-CHECKSUM
+__pycache__/
+*.pyc
+# Written by CI (forge_release.py) just before each image build; never committed.
+files/system/usr/share/forge/version.json

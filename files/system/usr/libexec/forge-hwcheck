@@ -10,10 +10,17 @@ If anything changed since the last boot, it:
 
 Memory limits are shares of total RAM, so they grow or shrink with your RAM
 on their own. This check makes sure everything else is re-applied too.
+
+It also records details (GPU vendor, driver and VRAM, CPU AI features, battery
+health, network, Bluetooth and audio adapters) for forge-doctor and the dashboard.
+Details change often (battery health) and are never counted as a hardware change.
+And it checks that the image fits the hardware (NVIDIA image for an NVIDIA GPU)
+and that settings fit the system; each new finding is shown to you once.
 """
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -22,6 +29,9 @@ STATE = os.environ.get("FORGE_HW_STATE", "/var/lib/forge-hw")
 SYS = os.environ.get("FORGE_SYS", "")          # for testing only
 APPLY = os.environ.get("FORGE_HW_APPLY", "/usr/libexec/forge-apply")
 LAPTOP_CHASSIS = {"8", "9", "10", "11", "14", "30", "31", "32"}
+GPU_VENDORS = {"0x10de": "NVIDIA", "0x1002": "AMD", "0x8086": "Intel"}
+AI_FLAGS = ("avx2", "avx512f", "avx512_vnni", "avx_vnni", "amx_tile", "amx_bf16", "amx_int8", "fma", "f16c")
+FINGERPRINT = ("type", "virtualization", "cpu", "ram_gb", "gpus", "disks", "battery")
 
 
 def read(p, default=""):
@@ -65,11 +75,59 @@ def gpus():
     return sorted(out)
 
 
+def on_usb(blk):
+    """True if the disk sits on a USB bus (its /sys/block link goes through a usbN folder)."""
+    real = os.path.realpath(blk)
+    if SYS:
+        real = real[len(os.path.realpath(SYS)):]
+    return any(re.fullmatch(r"usb\d+", part) for part in real.split(os.sep))
+
+
+def external_pci(blk):
+    """True if the disk sits behind a PCIe port the kernel marks as removable (Thunderbolt / USB4)."""
+    real = os.path.realpath(blk)
+    top = os.path.realpath(SYS) if SYS else ""
+    folder = os.path.dirname(real)
+    while len(folder) > len(top) + len("/sys/devices"):
+        try:
+            with open(os.path.join(folder, "removable")) as f:
+                if f.read().strip() == "removable":
+                    return True
+        except OSError:
+            pass
+        folder = os.path.dirname(folder)
+    return False
+
+
+def external_multipath(blk):
+    """NVMe multipath disks live under the virtual nvme-subsystem. They count as external when
+    every controller behind them sits behind a removable PCIe port (Thunderbolt / USB4)."""
+    real = os.path.realpath(blk)
+    if "/nvme-subsystem/" not in real:
+        return False
+    sub = real
+    while sub != "/" and not os.path.basename(sub).startswith("nvme-subsys"):
+        sub = os.path.dirname(sub)
+    if sub == "/":
+        return False
+    ctrls = [os.path.join(sub, c) for c in os.listdir(sub)
+             if re.fullmatch(r"nvme\d+", c) and os.path.islink(os.path.join(sub, c))]
+    return bool(ctrls) and all(external_pci(os.path.join(c, "x")) for c in ctrls)
+
+
 def disks():
     out = []
     for blk in sorted(glob.glob(SYS + "/sys/block/*")):
         name = os.path.basename(blk)
         if name.startswith(("loop", "zram", "dm-", "sr", "ram", "md")):
+            continue
+        # USB sticks (like the FORGEKEY unlock stick), card readers and other
+        # removable disks come and go, so they are not part of the hardware.
+        if read(f"/sys/block/{name}/removable", "0") == "1" or on_usb(blk):
+            continue
+        # SD cards report removable 0 (the kernel does that on purpose), and drives in
+        # Thunderbolt / USB4 enclosures look like internal PCIe. Internal eMMC (type MMC) still counts.
+        if read(f"/sys/block/{name}/device/type").startswith("SD") or external_pci(blk) or external_multipath(blk):
             continue
         sectors = read(f"/sys/block/{name}/size", "0")
         size_gb = round(int(sectors or 0) * 512 / 1e9)
@@ -80,6 +138,127 @@ def disks():
     return out
 
 
+def num(text, default=None):
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return default
+
+
+def gpu_details():
+    out = []
+    for card in sorted(glob.glob(SYS + "/sys/class/drm/card[0-9]")):
+        dev = os.path.join(card, "device")
+        rel = dev[len(SYS):]
+        vendor_id = read(rel + "/vendor")
+        if not vendor_id:
+            continue
+        driver = os.path.basename(os.path.realpath(dev + "/driver")) if os.path.exists(dev + "/driver") else ""
+        vram = num(read(rel + "/mem_info_vram_total"))
+        vram_mb = vram // (1024 * 1024) if vram else None
+        if vram_mb is None and vendor_id == "0x10de":
+            try:
+                r = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                                   capture_output=True, text=True, timeout=10)
+                vram_mb = num(r.stdout.strip().splitlines()[0]) if r.returncode == 0 and r.stdout.strip() else None
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        out.append({"vendor": GPU_VENDORS.get(vendor_id, vendor_id), "driver": driver, "vram_mb": vram_mb})
+    return out
+
+
+def cpu_ai():
+    flags = set()
+    for line in read("/proc/cpuinfo").splitlines():
+        if line.startswith("flags"):
+            flags = set(line.split(":", 1)[1].split())
+            break
+    return [f for f in AI_FLAGS if f in flags]
+
+
+def pc_battery(rel):
+    # A wireless mouse or game controller is also a "Battery", with scope "Device".
+    return read(rel + "/type") == "Battery" and read(rel + "/scope") != "Device"
+
+
+def battery_details():
+    out = []
+    for b in sorted(glob.glob(SYS + "/sys/class/power_supply/*")):
+        rel = b[len(SYS):]
+        if not pc_battery(rel):
+            continue
+        full = num(read(rel + "/energy_full")) or num(read(rel + "/charge_full"))
+        design = num(read(rel + "/energy_full_design")) or num(read(rel + "/charge_full_design"))
+        out.append({"name": os.path.basename(b), "charge_pct": num(read(rel + "/capacity")),
+                    "status": read(rel + "/status"),
+                    "health_pct": round(full * 100 / design) if full and design else None,
+                    "cycles": num(read(rel + "/cycle_count"))})
+    return out
+
+
+def network():
+    out = []
+    for n in sorted(glob.glob(SYS + "/sys/class/net/*")):
+        if not os.path.exists(n + "/device"):
+            continue   # loopback, bridges, VPN tunnels: not hardware
+        wifi = os.path.exists(n + "/wireless") or os.path.exists(n + "/phy80211")
+        out.append({"name": os.path.basename(n), "kind": "wifi" if wifi else "ethernet"})
+    return out
+
+
+def audio():
+    cards = []
+    for line in read("/proc/asound/cards").splitlines():
+        m = re.match(r"\s*\d+\s+\[[^\]]*\]:\s*.+? - (.+)", line)   # "<driver> - <card name>"
+        if m:
+            cards.append(m.group(1).strip())
+    return cards
+
+
+def details():
+    return {"gpus": gpu_details(), "cpu_ai": cpu_ai(),
+            "npu": bool(glob.glob(SYS + "/sys/class/accel/accel*")),
+            "battery": battery_details(), "network": network(),
+            "bluetooth": [os.path.basename(h) for h in sorted(glob.glob(SYS + "/sys/class/bluetooth/hci*"))],
+            "audio": audio()}
+
+
+def image_is_nvidia():
+    """True or False for the running image, or None if it can't be told."""
+    try:
+        info = json.loads(read("/usr/share/ublue-os/image-info.json") or "null")
+    except ValueError:
+        info = None
+    if isinstance(info, dict):
+        names = " ".join(str(info.get(k, "")) for k in ("image-name", "image-flavor", "base-image-name")).lower()
+        if names.strip():
+            return "nvidia" in names
+    if glob.glob(SYS + "/usr/lib/modules/*/extra/nvidia*/nvidia*.ko*"):
+        return True
+    return None
+
+
+def checks(det):
+    """Things that don't fit: image vs GPU, and settings vs system."""
+    out = []
+    has_nvidia = any(g["vendor"] == "NVIDIA" for g in det["gpus"])
+    nv_image = image_is_nvidia()
+    if has_nvidia and nv_image is False:
+        out.append("This PC has an NVIDIA GPU, but runs the universal image. For the NVIDIA driver, switch to "
+                   "the NVIDIA image: rpm-ostree rebase ostree-image-signed:docker://ghcr.io/monkey7770/forge-os:latest")
+    if nv_image is True and det["gpus"] and not has_nvidia:
+        out.append("This PC has no NVIDIA GPU, but runs the NVIDIA image. The universal image fits better: "
+                   "rpm-ostree rebase ostree-image-signed:docker://ghcr.io/monkey7770/forge-os-universal:latest")
+    try:
+        settings = json.loads(read("/etc/forge/settings.json") or "{}")
+    except ValueError:
+        settings = {}
+    if isinstance(settings, dict) and settings.get("security.usb_unlock") is True \
+            and not os.path.exists(SYS + "/etc/crypttab"):
+        out.append("USB key unlock is on, but this system has no encrypted disk, so it does nothing.")
+    return out
+
+
 def profile():
     virt = "none"
     try:
@@ -87,13 +266,13 @@ def profile():
                               timeout=5).stdout.strip() or "none"
     except (OSError, subprocess.TimeoutExpired):
         pass
-    battery = any(read(p[len(SYS):] + "/type") == "Battery"
-                  for p in glob.glob(SYS + "/sys/class/power_supply/*"))
+    battery = any(pc_battery(p[len(SYS):]) for p in glob.glob(SYS + "/sys/class/power_supply/*"))
     chassis = read("/sys/class/dmi/id/chassis_type")
     kind = "virtual machine" if virt != "none" else (
         "laptop" if battery or chassis in LAPTOP_CHASSIS else "desktop")
+    det = details()
     return {"type": kind, "virtualization": virt, "cpu": cpu(), "ram_gb": ram_gb(),
-            "gpus": gpus(), "disks": disks(), "battery": battery}
+            "gpus": gpus(), "disks": disks(), "battery": battery, "details": det, "checks": checks(det)}
 
 
 LABELS = {"type": "Device type", "virtualization": "Virtualization", "cpu": "CPU",
@@ -121,24 +300,43 @@ def main():
 
     if before is None:
         print("First hardware profile recorded.")
-        return 0
-    changes = [describe(k, before.get(k), now[k]) for k in now if before.get(k) != now[k]]
-    if not changes:
+        before = {k: now[k] for k in FINGERPRINT}   # nothing to compare yet, but checks still count
+    # Only the fingerprint counts as a hardware change; details change all the time.
+    changes = [describe(k, before.get(k), now[k]) for k in FINGERPRINT if before.get(k) != now[k]]
+    new_checks = [c for c in now["checks"] if c not in (before.get("checks") or [])]
+    if not changes and not new_checks:
         return 0
 
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     with open(os.path.join(STATE, "hardware-changes.log"), "a") as f:
         for c in changes:
             f.write(f"{stamp} {c}\n")
+    print("\n".join(changes + new_checks))
     notice = os.path.join(STATE, "hardware-notice.json")
-    with open(notice, "w") as f:
-        json.dump({"ts": int(time.time()), "changes": changes}, f)
-    os.chmod(notice, 0o644)
-    print("\n".join(changes))
 
-    # Re-apply every setting so services and limits match the new hardware.
-    r = subprocess.run([APPLY], capture_output=True, text=True)
-    print(r.stdout.strip())
+    def write_notice(reapplied, pending):
+        # Swapped in whole, so forge-health never reads half a notice.
+        tmp = os.path.join(STATE, ".hardware-notice.tmp")
+        with open(tmp, "w") as f:
+            json.dump({"ts": int(time.time()), "changes": changes + new_checks, "reapplied": reapplied,
+                       "pending": pending}, f)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, notice)
+
+    # First as pending, so the change is still reported if this stops during the apply.
+    write_notice(False, bool(changes))
+    if changes:
+        # Re-apply every setting so services and limits match the new hardware.
+        try:
+            r = subprocess.run([APPLY], capture_output=True, text=True)
+        except OSError as e:
+            write_notice(False, False)
+            print(f"Re-applying settings failed: {e}", file=sys.stderr)
+            return 1
+        print(r.stdout.strip())
+        write_notice(r.returncode == 0, False)
+        if r.returncode != 0:
+            print(f"Re-applying settings failed: {r.stderr.strip()[:300]}", file=sys.stderr)
     return 0
 
 

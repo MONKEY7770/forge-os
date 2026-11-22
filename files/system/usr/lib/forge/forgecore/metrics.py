@@ -24,6 +24,9 @@ METRICS = [  # (name, unit, description)
     ("vram_used_mb", "MB", "VRAM in use"),
     ("vram_total_mb", "MB", "Total VRAM"),
     ("gpu_power_w", "W", "GPU power draw"),
+    ("cpu_temp_c", "C", "CPU temperature"),
+    ("battery_pct", "%", "Battery charge (laptops)"),
+    ("on_ac", "", "1 on the charger, 0 on battery (laptops)"),
 ]
 
 NAMES = [m[0] for m in METRICS]
@@ -37,6 +40,62 @@ PRUNE_EVERY_S = 3600
 
 def _proc(name):
     return os.path.join(os.environ.get("FORGE_PROC", "/proc"), name)
+
+
+def _sys(*parts):
+    return os.path.join(os.environ.get("FORGE_SYSFS", "/sys"), *parts)
+
+
+def _read_text(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+# Sensors that report the CPU package temperature (AMD, Intel, ARM boards).
+CPU_SENSORS = ("k10temp", "zenpower", "coretemp", "cpu_thermal", "acpitz")
+
+
+def _read_cpu_temp():
+    """CPU temperature in C from the first CPU sensor, or None."""
+    found = {}
+    try:
+        names = sorted(os.listdir(_sys("class", "hwmon")))
+    except OSError:
+        return None
+    for h in names:
+        name = _read_text(_sys("class", "hwmon", h, "name"))
+        if name in CPU_SENSORS and name not in found:
+            found[name] = _num(_read_text(_sys("class", "hwmon", h, "temp1_input")))
+    for name in CPU_SENSORS:
+        if found.get(name) is not None:
+            return found[name] / 1000.0
+    return None
+
+
+def _read_power():
+    """(battery %, on charger 1/0). None for each when there is no battery or no charger."""
+    pcts, ac = [], None
+    try:
+        supplies = sorted(os.listdir(_sys("class", "power_supply")))
+    except OSError:
+        return None, None
+    for p in supplies:
+        kind = _read_text(_sys("class", "power_supply", p, "type"))
+        if kind == "Battery" and _read_text(_sys("class", "power_supply", p, "scope")) != "Device":
+            # (scope "Device" is a wireless mouse or controller, not the PC's battery)
+            v = _num(_read_text(_sys("class", "power_supply", p, "capacity")))
+            if v is not None:
+                pcts.append(v)
+        elif kind == "Mains":
+            online = _read_text(_sys("class", "power_supply", p, "online"))
+            if online in ("0", "1"):
+                ac = max(ac or 0, int(online))
+    if not pcts:
+        return None, None   # a desktop: no battery, so charger state means nothing
+    return round(sum(pcts) / len(pcts)), ac
 
 
 def _num(text):
@@ -148,6 +207,16 @@ class Collector:
             rcols = ", ".join(f"{n}_avg REAL, {n}_max REAL" for n in NAMES)
             self._db.execute(f"CREATE TABLE IF NOT EXISTS rollup_5m (ts INTEGER PRIMARY KEY, {rcols})")
             self._db.commit()
+            # Databases from an older Forge OS lack newer metrics: add their columns. Checked and
+            # changed in one write transaction, so a second process waits instead of adding them twice.
+            self._db.execute("BEGIN IMMEDIATE")
+            for table, wanted in (("samples", NAMES),
+                                  ("rollup_5m", [f"{n}_{k}" for n in NAMES for k in ("avg", "max")])):
+                have = {r[1] for r in self._db.execute(f"PRAGMA table_info({table})")}
+                for col in wanted:
+                    if col not in have:
+                        self._db.execute(f"ALTER TABLE {table} ADD COLUMN {col} REAL")
+            self._db.commit()
 
     # Sampling
 
@@ -187,6 +256,15 @@ class Collector:
 
         s["disk_root_pct"] = _rnd(_read_disk_root_pct())
         s.update(_read_gpu())
+        try:
+            temp = _read_cpu_temp()
+        except Exception:
+            temp = None
+        s["cpu_temp_c"] = _rnd(temp, 1)
+        try:
+            s["battery_pct"], s["on_ac"] = _read_power()
+        except Exception:
+            s["battery_pct"], s["on_ac"] = None, None
         # Keep a fixed key order: ts first, then METRICS order.
         return {"ts": s["ts"], **{n: s.get(n) for n in NAMES}}
 

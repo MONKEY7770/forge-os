@@ -6,14 +6,26 @@
   forge-config get KEY         print one value
   forge-config set KEY VALUE   change a setting and apply it
   forge-config reset [KEY]     back to default (one setting, or all)
-  forge-config undo            restore the settings from before the last save
+  forge-config undo [N]        go back to the settings as they were N changes ago (default 1)
+  forge-config history         show recent changes: what changed, from what to what, and who
   forge-config file            print where your settings file is
+  forge-config export FILE [--portable]
+                               save your settings to FILE (- prints them). --portable leaves out
+                               settings that belong to this PC only (USB key, model folder, power...)
+  forge-config import FILE [--merge] [--dry-run]
+                               load settings from FILE (asks for your password, keeps a snapshot).
+                               Without --merge, shareable settings not in FILE go back to default;
+                               this PC's own settings stay unless FILE has them. --dry-run only
+                               shows what would change.
 """
 import json
 import os
+import re
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, "/usr/lib/forge")
 import forgecfg  # noqa: E402
@@ -25,17 +37,120 @@ def fmt(v):
     return "on" if v is True else "off" if v is False else str(v)
 
 
-def save(new_values):
+def run_apply(*args):
+    cmd = [APPLY, *args]
+    if os.geteuid() != 0:
+        cmd = ["pkexec"] + cmd
+    return subprocess.run(cmd).returncode
+
+
+def save(new_values, merge=False):
+    """Hand the values to forge-apply. With merge, only these settings change; forge-apply reads
+    the rest while it holds its lock, so two saves at the same time can't undo each other."""
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump(new_values, f)
         tmp = f.name
     os.chmod(tmp, 0o644)
-    cmd = [APPLY, "--import", tmp]
+    cmd = [APPLY, "--import", tmp] + (["--merge"] if merge else [])
     if os.geteuid() != 0:
         cmd = ["pkexec"] + cmd
     r = subprocess.run(cmd)
     os.unlink(tmp)
     return r.returncode
+
+
+def read_file(p):
+    """Read an import file: no links, no FIFOs or devices, size capped. Returns (bytes, error)."""
+    try:
+        fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as e:
+        return None, f"cannot open {p} safely ({e.strerror})"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None, f"{p} is not a regular file"
+        chunks, size = [], 0
+        while size <= forgecfg.EXPORT_MAX:
+            chunk = os.read(fd, forgecfg.EXPORT_MAX + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        return b"".join(chunks), None
+    except OSError as e:
+        return None, f"cannot read {p} ({e.strerror})"
+    finally:
+        os.close(fd)
+
+
+def export_settings(args, schema):
+    portable = "--portable" in args
+    rest = [x for x in args if x != "--portable"]
+    if len(rest) != 1 or (rest[0].startswith("-") and rest[0] != "-"):
+        print("Use: forge-config export FILE [--portable]", file=sys.stderr)
+        return 2
+    clean, errors = forgecfg.validate(forgecfg.values(schema), schema)
+    if errors:
+        print("Not exported: your settings file has problems:\n" + "\n".join(errors), file=sys.stderr)
+        return 1
+    when = time.strftime(forgecfg.TIME_FORMAT, time.gmtime())
+    doc = forgecfg.export_doc(clean, schema, portable, forgecfg.this_host(), forgecfg.image_name(), when)
+    text = json.dumps(doc, indent=2, sort_keys=True) + "\n"
+    if rest[0] == "-":
+        sys.stdout.write(text)
+        return 0
+    try:
+        fd = os.open(rest[0], os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+    except OSError as e:
+        print(f"Not exported: cannot write {rest[0]} ({e.strerror})", file=sys.stderr)
+        return 1
+    note = " (settings that belong to this PC were left out)" if portable else ""
+    print(f"Exported {len(doc['settings'])} settings to {rest[0]}{note}")
+    return 0
+
+
+def import_settings(args, schema):
+    merge, dry = "--merge" in args, "--dry-run" in args
+    rest = [x for x in args if x not in ("--merge", "--dry-run")]
+    if len(rest) != 1 or rest[0].startswith("-"):
+        print("Use: forge-config import FILE [--merge] [--dry-run]", file=sys.stderr)
+        return 2
+    data, err = read_file(rest[0])
+    if err is None:
+        settings, header, notes, err = forgecfg.parse_export(data, schema, allow_plain=True)
+    if err:
+        print("Not imported: " + err, file=sys.stderr)
+        return 2
+    for n in notes:
+        print("Note: " + n)
+    defs = forgecfg.settings_by_key(schema)
+    payload = dict(settings)
+    if not merge:
+        # The file replaces your shareable settings. Settings that belong to this PC (left out of
+        # portable exports) stay as they are, unless the file has them.
+        machine = forgecfg.machine_keys(schema)
+        for k, s in defs.items():
+            if k not in payload and k not in machine:
+                payload[k] = s["default"]
+    current = forgecfg.values(schema)
+    _, errors = forgecfg.validate(forgecfg.values(schema, dict(forgecfg.load_overrides(), **payload)), schema)
+    if errors:
+        print("Not imported:\n" + "\n".join(errors), file=sys.stderr)
+        return 2
+    if header:
+        print(f"From {header['from_host']} ({header['image']}), exported {header['exported_at']}")
+    changes = [k for k in sorted(payload) if payload[k] != current.get(k)]
+    if not changes:
+        print("Nothing to change: these settings are already the same here.")
+        return 0
+    for k in changes:
+        print(f"  {k}: {fmt(current.get(k))} -> {fmt(payload[k])}")
+    if dry:
+        print(f"Dry run: {len(changes)} setting(s) would change. Nothing was saved.")
+        return 0
+    # Always a merge for forge-apply: it reads this PC's other settings under its own lock.
+    return save(payload, merge=True)
 
 
 def main():
@@ -71,27 +186,30 @@ def main():
             print(f"Unknown setting: {a[1]}", file=sys.stderr)
             return 1
         try:
-            vals[a[1]] = forgecfg.coerce(defs[a[1]], a[2])
+            value = forgecfg.coerce(defs[a[1]], a[2])
         except ValueError as e:
             print(e, file=sys.stderr)
             return 1
-        return save(vals)
+        return save({a[1]: value}, merge=True)
     if cmd == "reset":
         if len(a) == 2:
             if a[1] not in defs:
                 print(f"Unknown setting: {a[1]}", file=sys.stderr)
                 return 1
-            vals[a[1]] = defs[a[1]]["default"]
-        else:
-            vals = {k: s["default"] for k, s in defs.items()}
-        return save(vals)
+            return save({a[1]: defs[a[1]]["default"]}, merge=True)
+        return save({k: s["default"] for k, s in defs.items()})
     if cmd == "undo":
-        bak = forgecfg.OVERRIDES_PATH + ".bak"
-        if not os.path.exists(bak):
-            print("Nothing to undo.")
-            return 0
-        with open(bak) as f:
-            return save(forgecfg.values(schema, json.load(f)))
+        steps = a[1] if len(a) > 1 else "1"
+        if not re.fullmatch(r"[1-9][0-9]{0,3}", steps):
+            print("Say how many changes to go back, for example: forge-config undo 2", file=sys.stderr)
+            return 2
+        return run_apply("--undo", steps)
+    if cmd == "history":
+        return run_apply("--history")
+    if cmd == "export":
+        return export_settings(a[1:], schema)
+    if cmd == "import":
+        return import_settings(a[1:], schema)
     if cmd == "file":
         print(forgecfg.OVERRIDES_PATH)
         return 0

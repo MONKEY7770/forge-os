@@ -1,0 +1,12 @@
+[Unit]
+Description=Forge OS: mode switch requests from forge-game (administrators at the PC only)
+
+[Socket]
+ListenStream=/run/forge-mode.sock
+SocketUser=root
+SocketGroup=wheel
+SocketMode=0660
+Accept=no
+
+[Install]
+WantedBy=sockets.target

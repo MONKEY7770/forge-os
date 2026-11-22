@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""forge-screenshot-probe: runs inside the screenshot test VM only (never in the real image).
+
+Talks to the runner's forge_screenshot.py over the virtio serial port org.forgeos.probe:
+  -> "FORGE-PROBE started"
+  -> "FORGE-PROBE desktop-ready"        when the test account's plasmashell runs
+  <- "open-settings"                    the runner took the desktop screenshot
+  -> "FORGE-PROBE settings-started"     forge-settings runs for the test account
+     or "FORGE-PROBE settings-failed <why>"
+"""
+import os
+import select
+import stat
+import subprocess
+import sys
+import time
+
+PORT = "/dev/virtio-ports/org.forgeos.probe"
+USER, UID = "forgetest", 1500
+
+
+def running(proc_root, uid, name):
+    """True if a process called name runs as uid (from /proc/<pid>/comm and status)."""
+    try:
+        pids = [p for p in os.listdir(proc_root) if p.isdigit()]
+    except OSError:
+        return False
+    for pid in pids:
+        try:
+            with open(os.path.join(proc_root, pid, "comm")) as f:
+                if f.read().strip() != name:
+                    continue
+            with open(os.path.join(proc_root, pid, "status")) as f:
+                for line in f:
+                    if line.startswith("Uid:") and line.split()[1] == str(uid):
+                        return True
+        except (OSError, IndexError):
+            continue
+    return False
+
+
+def session_env(run_root, uid):
+    """The test account's desktop session: runtime folder, Wayland socket and session bus."""
+    run = os.path.join(run_root, str(uid))
+    try:
+        names = sorted(os.listdir(run))
+    except OSError:
+        return None
+    for n in names:
+        if n.startswith("wayland-") and not n.endswith(".lock"):
+            try:
+                if stat.S_ISSOCK(os.lstat(os.path.join(run, n)).st_mode):
+                    return {"XDG_RUNTIME_DIR": run, "WAYLAND_DISPLAY": n,
+                            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={run}/bus", "XDG_SESSION_TYPE": "wayland"}
+            except OSError:
+                continue
+    return None
+
+
+def settings_argv(user, env):
+    return ["/usr/sbin/runuser", "-u", user, "--", "/usr/bin/env",
+            *[f"{k}={v}" for k, v in sorted(env.items())], "/usr/bin/forge-settings"]
+
+
+def launch(argv):
+    subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def say(fd, text):
+    os.write(fd, f"FORGE-PROBE {text}\n".encode())
+
+
+def read_command(fd, timeout):
+    """One line from the runner, or "" after timeout."""
+    buf, deadline = b"", time.monotonic() + timeout
+    while b"\n" not in buf and len(buf) < 256:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return ""
+        ready, _, _ = select.select([fd], [], [], left)
+        if ready:
+            chunk = os.read(fd, 256)
+            if not chunk:
+                return ""
+            buf += chunk
+    return buf.split(b"\n", 1)[0].decode("ascii", "replace").strip()
+
+
+def serve(fd, running_fn=running, env_fn=session_env, launch_fn=launch, poll=5.0, settle=10.0, wait_cmd=1800.0,
+          desktop_wait=3600.0):
+    say(fd, "started")
+    deadline = time.monotonic() + desktop_wait
+    while not running_fn("/proc", UID, "plasmashell"):
+        if time.monotonic() > deadline:
+            return
+        time.sleep(poll)
+    say(fd, "desktop-ready")
+    if read_command(fd, wait_cmd) != "open-settings":
+        return
+    env = env_fn("/run/user", UID)
+    if env is None:
+        say(fd, "settings-failed no Wayland session for the test account")
+        return
+    try:
+        launch_fn(settings_argv(USER, env))
+    except OSError as e:
+        say(fd, f"settings-failed could not start forge-settings ({e.__class__.__name__})")
+        return
+    time.sleep(settle)
+    if running_fn("/proc", UID, "forge-settings"):
+        say(fd, "settings-started")
+    else:
+        say(fd, "settings-failed forge-settings is not running")
+
+
+def main():
+    deadline = time.monotonic() + 600
+    while not os.path.exists(PORT):
+        if time.monotonic() > deadline:
+            return 1
+        time.sleep(2)
+    fd = os.open(PORT, os.O_RDWR | os.O_CLOEXEC)
+    try:
+        serve(fd)
+    finally:
+        os.close(fd)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

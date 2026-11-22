@@ -5,7 +5,7 @@ After=network.target ollama.service
 [Service]
 User=forge
 Group=forge
-# Runs as root once before start, to create the API token if it's missing.
+# Runs as root once before start, to create the admin and viewer tokens and fix their modes.
 ExecStartPre=+/usr/libexec/forge-core-init
 ExecStart=/usr/bin/python3 /usr/lib/forge/forgecore/app.py
 StateDirectory=forge

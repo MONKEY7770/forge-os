@@ -1,0 +1,1360 @@
+#!/usr/bin/env python3
+"""forge-backup: encrypted backups of your home folder to a USB or second drive (restic).
+
+  forge-backup init                     set up the backup drive and its password
+  forge-backup run [--auto]             back up now (--auto: only if turned on and due)
+  forge-backup status [--json]          last backup, size, number of backups
+  forge-backup list                     show every backup
+  forge-backup restore SNAPSHOT [PATH] --target DIR
+                                        copy a backup (or one file or folder in it) into a
+                                        new folder (Forge makes it, owner-only, in a folder
+                                        only you can change); never over your home folder
+  forge-backup check                    check the backup for damage
+  forge-backup restore-test [--auto]    restore a few random files from the newest backup into a
+                                        private temporary folder, compare them, check part of
+                                        the data, clean up (--auto: about monthly, if due)
+
+The drive is found by its name (label, set in Forge Settings, FORGEBACKUP by default).
+The backup is in forge-backup/<this PC's name> on the drive.
+The password is passed to restic only as a file (RESTIC_PASSWORD_FILE), never on a
+command line or in the environment.
+"""
+import errno
+import fcntl
+import getpass
+import html
+import json
+import os
+import random
+import re
+import selectors
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+sys.path.insert(0, os.environ.get("FORGE_LIB", "/usr/lib/forge"))
+import forgecfg  # noqa: E402
+
+BYLABEL = os.environ.get("FORGE_BACKUP_BYLABEL", "/dev/disk/by-label")
+MOUNTINFO = os.environ.get("FORGE_BACKUP_MOUNTINFO", "/proc/self/mountinfo")
+STATUS_VERSION = 1
+MIN_FREE_BYTES = 100 * 1024 * 1024   # below this the drive counts as full before we even start
+OVERDUE_FACTOR = 3                   # notify when no backup worked for 3 times the interval
+NOTIFY_EVERY_S = 86400               # the "no backup" reminder at most once a day
+SNAPSHOT_RE = re.compile(r"latest|[0-9a-f]{8,64}")
+LABEL_RE = re.compile(r"[A-Za-z0-9_-]{1,11}")
+KEYS = ("backup.enabled", "backup.drive_label", "backup.every_hours", "backup.keep_daily",
+        "backup.keep_weekly", "backup.keep_monthly", "backup.exclude_big", "ai.models_dir")
+
+# Results written to status.json (documented in the README and NOTES.md).
+OK, WARN, FAILED = "ok", "ok_with_warnings", "failed"
+DRIVE_MISSING, DRIVE_FULL, WRONG_PW, NOT_SET_UP = "drive_missing", "drive_full", "wrong_password", "not_set_up"
+
+
+class Fail(Exception):
+    """A problem with a plain message for the user, and the result to record."""
+
+    def __init__(self, result, message):
+        super().__init__(message)
+        self.result = result
+        self.message = message
+
+
+# Paths ---------------------------------------------------------------------------------
+
+def home():
+    h = os.path.realpath(os.path.expanduser("~"))
+    if not os.path.isabs(h) or h == "/" or not os.path.isdir(h):
+        raise SystemExit("forge-backup: your home folder could not be found")
+    return h
+
+
+def data_dir():
+    return os.path.join(home(), ".local/share/forge-backup")
+
+
+def state_dir():
+    return os.path.join(home(), ".local/state/forge-backup")
+
+
+def password_file():
+    return os.path.join(data_dir(), "password")
+
+
+def private_dir(d):
+    """Create d (and parents) owner-only. Refuses a link or someone else's folder."""
+    os.makedirs(os.path.dirname(d), exist_ok=True)
+    try:
+        os.mkdir(d, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(d)
+    if not os.path.isdir(d) or os.path.islink(d) or st.st_uid != os.getuid():
+        raise SystemExit(f"forge-backup: {d} is not a normal folder of yours, refusing to use it")
+    if st.st_mode & 0o077:
+        os.chmod(d, 0o700)
+    return d
+
+
+def write_private(path, text):
+    """Replace path in one step with an owner-only file (never follows a link)."""
+    tmp = f"{path}.tmp{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_json(path, default):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd) as f:
+            data = json.load(f)
+        return data if isinstance(data, type(default)) else default
+    except (OSError, ValueError):
+        return default
+
+
+# Settings ------------------------------------------------------------------------------
+
+def settings():
+    """The backup settings, each one checked again (a broken value falls back to its default)."""
+    schema = forgecfg.load_schema()
+    defs = forgecfg.settings_by_key(schema)
+    vals = forgecfg.values(schema)
+    out = {}
+    for k in KEYS:
+        try:
+            out[k] = forgecfg.coerce(defs[k], vals[k])
+        except (ValueError, KeyError):
+            out[k] = defs[k]["default"]
+    return out
+
+
+def host_name():
+    """Folder name for this PC on the drive, saved at init so a renamed PC keeps its backup."""
+    saved = read_json(os.path.join(data_dir(), "config.json"), {}).get("host")
+    if isinstance(saved, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,63}", saved) and saved not in (".", ".."):
+        return saved
+    name = re.sub(r"[^A-Za-z0-9._-]", "-", socket.gethostname())[:63].strip(".")
+    return name or "pc"
+
+
+# The drive -----------------------------------------------------------------------------
+
+def _unescape(text):
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), text)
+
+
+def find_mount(dev):
+    """Where the device is mounted, or None. Reads mountinfo (untrusted text, parsed strictly)."""
+    try:
+        with open(MOUNTINFO) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        left, sep, right = line.partition(" - ")
+        if not sep:
+            continue
+        lf, rf = left.split(" "), right.split(" ")
+        if len(lf) < 5 or len(rf) < 2:
+            continue
+        src = _unescape(rf[1])
+        if src.startswith("/") and os.path.realpath(src) == dev:
+            mnt = _unescape(lf[4])
+            if os.path.isdir(mnt):
+                return mnt
+    return None
+
+
+def find_device(label):
+    if not LABEL_RE.fullmatch(label):
+        return None
+    link = os.path.join(BYLABEL, label)
+    if not os.path.lexists(link):
+        return None
+    return os.path.realpath(link)
+
+
+class Drive:
+    """The backup drive: mounted on enter (with udisksctl if needed), unmounted after if we mounted it."""
+
+    def __init__(self, label):
+        self.label = label
+        self.dev = None
+        self.mount = None
+        self.we_mounted = False
+
+    def __enter__(self):
+        self.dev = find_device(self.label)
+        if not self.dev:
+            raise Fail(DRIVE_MISSING, f"The backup drive {self.label} is not plugged in. "
+                                      "Plug it in and try again.")
+        self.mount = find_mount(self.dev)
+        if not self.mount and shutil.which("udisksctl"):
+            r = subprocess.run(["udisksctl", "mount", "-b", self.dev, "--no-user-interaction"],
+                               capture_output=True, text=True, timeout=120)
+            self.mount = find_mount(self.dev)   # also covers the desktop mounting it at the same moment
+            self.we_mounted = r.returncode == 0 and self.mount is not None
+        if not self.mount:
+            raise Fail(DRIVE_MISSING, f"The backup drive {self.label} is plugged in but could not be "
+                                      "opened. Open it once in the file manager, then try again.")
+        return self
+
+    def __exit__(self, *exc):
+        if self.we_mounted:
+            subprocess.run(["udisksctl", "unmount", "-b", self.dev, "--no-user-interaction"],
+                           capture_output=True, text=True, timeout=120)
+        return False
+
+    def free_bytes(self):
+        try:
+            st = os.statvfs(self.mount)
+            return st.f_bavail * st.f_frsize
+        except OSError:
+            return None
+
+    def repo(self, create=False):
+        """mount/forge-backup/<host>. No part of it may be a link (a planted link could point anywhere)."""
+        top = os.path.join(self.mount, "forge-backup")
+        repo = os.path.join(top, host_name())
+        for d in (top, repo):
+            if create and not os.path.lexists(d):
+                os.mkdir(d, 0o700)
+            if os.path.islink(d) or (os.path.lexists(d) and not os.path.isdir(d)):
+                raise Fail(FAILED, f"{d} on the backup drive is not a normal folder. Not using it.")
+        return repo
+
+
+# restic --------------------------------------------------------------------------------
+
+def restic_env(pwfile, base=None):
+    """The environment for restic: no inherited RESTIC_* values, only the password FILE path."""
+    env = {k: v for k, v in (os.environ if base is None else base).items() if not k.startswith("RESTIC_")}
+    env["RESTIC_PASSWORD_FILE"] = pwfile
+    return env
+
+
+def restic(args, pwfile=None, timeout=None):
+    """Run restic with an argv list. Returns (returncode, stdout, stderr)."""
+    if not shutil.which("restic"):
+        raise Fail(FAILED, "restic is not installed, so backups cannot run.")
+    p = subprocess.run(["restic", *args], env=restic_env(pwfile or password_file()),
+                       capture_output=True, text=True, timeout=timeout)
+    return p.returncode, p.stdout, p.stderr
+
+
+def glob_escape(path):
+    return re.sub(r"([\[\]*?\\])", r"\\\1", path)
+
+
+def exclude_patterns(h, s):
+    """restic --exclude patterns. Without a leading / a pattern matches at any depth."""
+    e = glob_escape(h)
+    out = [e + "/.local/share/forge-backup"]   # the saved password: never useful inside the backup
+    if not s.get("backup.exclude_big"):
+        return out
+    out += [
+        e + "/.cache", e + "/.local/share/Trash", e + "/.var/app/*/cache",
+        # Steam games (any library folder). steamapps/compatdata is kept: Proton game saves live there.
+        "steamapps/common", "steamapps/downloading", "steamapps/shadercache", "steamapps/temp",
+        "steamapps/workshop",
+        e + "/.ollama/models",
+        # Virtual machine disks
+        "*.qcow2", "*.vdi", "*.vmdk", "*.vhd", "*.vhdx",
+        e + "/.local/share/libvirt/images", e + "/.local/share/gnome-boxes/images",
+        e + "/.var/app/org.gnome.Boxes/data/gnome-boxes/images",
+    ]
+    models = str(s.get("ai.models_dir") or "").rstrip("/")
+    if models.startswith(h + "/") and re.fullmatch(r"/[A-Za-z0-9._/-]+", models) and "/../" not in models + "/":
+        out.append(glob_escape(models))
+    return out
+
+
+def backup_argv(repo, h, s):
+    argv = ["-r", repo, "backup", "--json", "--quiet", "--one-file-system", "--exclude-caches",
+            "--tag", "forge-backup"]
+    for p in exclude_patterns(h, s):
+        argv.append("--exclude=" + p)
+    return argv + ["--", h]
+
+
+def forget_argv(repo, s):
+    return ["-r", repo, "forget", "--prune", "--tag", "forge-backup",
+            "--keep-daily", str(s["backup.keep_daily"]),
+            "--keep-weekly", str(s["backup.keep_weekly"]),
+            "--keep-monthly", str(s["backup.keep_monthly"])]
+
+
+def explain(rc, out, err, drive):
+    """Turn a restic failure into one plain sentence, and the result to record."""
+    text = (out + "\n" + err).lower()
+    if "no space left on device" in text or "disk quota exceeded" in text:
+        return Fail(DRIVE_FULL, f"The backup drive {drive.label} is full. Free some space on it, keep fewer "
+                                "backups (Forge Settings, Backups), or use a bigger drive.")
+    if rc == 12 or "wrong password" in text:
+        return Fail(WRONG_PW, f"The saved backup password does not open the backup on {drive.label}. To fix "
+                              "it, delete ~/.local/share/forge-backup/password, then run forge-backup init "
+                              "and type the password of this backup.")
+    if rc == 11 or "repository is already locked" in text:
+        return Fail(FAILED, "The backup on the drive is in use by another program. Try again later.")
+    last = [x for x in err.strip().splitlines() if x.strip()][-1:] or [f"restic exit code {rc}"]
+    return Fail(FAILED, f"The backup failed: {last[0][:300]}")
+
+
+def repo_size(repo):
+    total = 0
+    for d, _, files in os.walk(repo):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(d, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def snapshots(repo):
+    rc, out, err = restic(["-r", repo, "snapshots", "--json"], timeout=600)
+    if rc != 0:
+        return None, (rc, out, err)
+    try:
+        data = json.loads(out or "[]")
+    except ValueError:
+        return None, (rc, out, err)
+    return (data if isinstance(data, list) else []), None
+
+
+# Status and notifications --------------------------------------------------------------
+
+def status_path():
+    return os.path.join(state_dir(), "status.json")
+
+
+def load_status():
+    return read_json(status_path(), {})
+
+
+def save_status(st):
+    private_dir(state_dir())
+    st["version"] = STATUS_VERSION
+    write_private(status_path(), json.dumps(st, indent=2, sort_keys=True) + "\n")
+    publish_activity()
+
+
+def publish_activity():
+    """Best effort: copy the result to the system-wide activity timeline (Forge Dashboard).
+    A failure here never affects the backup."""
+    tool = os.environ.get("FORGE_ACTIVITY_PUBLISH", "/usr/libexec/forge-activity-publish")
+    if os.path.isfile(tool) and os.access(tool, os.X_OK):
+        try:
+            subprocess.run([tool], capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def notify(summary, body):
+    if not shutil.which("notify-send"):
+        return
+    subprocess.run(["notify-send", "-u", "critical", "-a", "Forge Backup", "--",
+                    html.escape(summary), html.escape(body)], capture_output=True, timeout=30)
+
+
+def remind_if_overdue(st, s, now):
+    """At most once a day: tell the user when no backup has worked for 3 times the interval."""
+    since = st.get("last_success") or st.get("set_up_at")
+    if not isinstance(since, (int, float)):
+        return
+    limit = OVERDUE_FACTOR * s["backup.every_hours"] * 3600
+    if now - since < limit:
+        return
+    marker = os.path.join(state_dir(), "reminded")
+    try:
+        if now - os.lstat(marker).st_mtime < NOTIFY_EVERY_S:
+            return
+    except OSError:
+        pass
+    days = int((now - since) // 86400)
+    when = f"{days} days" if days >= 1 else f"{int((now - since) // 3600)} hours"
+    notify("No backup for " + when,
+           f"Plug in your backup drive {s['backup.drive_label']} so Forge can back up your home folder.")
+    private_dir(state_dir())
+    write_private(marker, f"{int(now)}\n")
+
+
+# Commands ------------------------------------------------------------------------------
+
+def take_lock():
+    private_dir(state_dir())
+    fd = os.open(os.path.join(state_dir(), "lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        os.close(fd)
+        if e.errno in (errno.EAGAIN, errno.EACCES):
+            return None
+        raise
+    return fd
+
+
+def is_set_up():
+    return os.path.isfile(password_file()) and not os.path.islink(password_file())
+
+
+def cmd_run(auto):
+    s = settings()
+    now = time.time()
+    if auto and not s["backup.enabled"]:
+        return 0
+    if not is_set_up():
+        if auto:
+            return 0
+        print("Backups are not set up yet. Plug in your backup drive and run: forge-backup init")
+        return 1
+    lock = take_lock()
+    if lock is None:
+        if auto:
+            return 0
+        print("A backup is already running. Try again when it is done.")
+        return 75
+    st = load_status()
+    last = st.get("last_success")
+    if auto and isinstance(last, (int, float)) and 0 <= now - last < s["backup.every_hours"] * 3600:
+        return 0
+    st.update(last_run=int(now), drive_label=s["backup.drive_label"], every_hours=s["backup.every_hours"])
+    try:
+        with Drive(s["backup.drive_label"]) as drive:
+            st["drive_free_bytes"] = drive.free_bytes()
+            repo = drive.repo()
+            if not os.path.isfile(os.path.join(repo, "config")):
+                raise Fail(NOT_SET_UP, f"The drive {drive.label} has no Forge backup for this PC yet. "
+                                       "Run: forge-backup init")
+            if st["drive_free_bytes"] is not None and st["drive_free_bytes"] < MIN_FREE_BYTES:
+                raise Fail(DRIVE_FULL, f"The backup drive {drive.label} is full. Free some space on it, keep "
+                                       "fewer backups (Forge Settings, Backups), or use a bigger drive.")
+            print(f"Backing up {home()} to {drive.label}...", flush=True)
+            # Only stale locks (left by a run that was stopped) are removed; our own lock above
+            # means no other forge-backup run of this user is using the repo.
+            restic(["-r", repo, "unlock"], timeout=600)
+            rc, out, err = restic(backup_argv(repo, home(), s))
+            # 0 = saved, 3 = saved, but some files could not be read. Anything else: nothing saved.
+            if rc not in (0, 3):
+                raise explain(rc, out, err, drive)
+            summary = {}
+            for line in out.splitlines():
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(msg, dict) and msg.get("message_type") == "summary":
+                    summary = msg
+            result, message = OK, "Backup saved."
+            if rc == 3:
+                result, message = WARN, "Backup saved, but some files could not be read (see the journal)."
+                print(err[-2000:], file=sys.stderr)
+            # Old backups are removed only now, after a backup that worked.
+            frc, fout, ferr = restic(forget_argv(repo, s))
+            if frc != 0:
+                full = explain(frc, fout, ferr, drive)
+                result = WARN
+                message = "Backup saved, but removing old backups failed: " + full.message
+            snaps, _ = snapshots(repo)
+            st.update(result=result, message=message, last_success=int(now),
+                      last_snapshot=str(summary.get("snapshot_id", ""))[:8] or None,
+                      data_added_bytes=summary.get("data_added"),
+                      files_processed=summary.get("total_files_processed"),
+                      bytes_processed=summary.get("total_bytes_processed"),
+                      snapshot_count=len(snaps) if snaps is not None else st.get("snapshot_count"),
+                      size_bytes=repo_size(repo), drive_free_bytes=drive.free_bytes(),
+                      duration_s=int(time.time() - now))
+            save_status(st)
+            print(message)
+            return 0
+    except Fail as f:
+        st.update(result=f.result, message=f.message)
+        save_status(st)
+        print(f.message, file=sys.stderr)
+        if auto and f.result == DRIVE_MISSING:
+            remind_if_overdue(st, s, now)
+        elif auto:
+            notify("Backup failed", f.message)
+        return 1
+    finally:
+        os.close(lock)
+
+
+def ask_password(repeat):
+    pw = getpass.getpass("Backup password: ")
+    if repeat and getpass.getpass("Type it again: ") != pw:
+        raise Fail(FAILED, "The two passwords are not the same. Nothing was changed.")
+    if any(ord(c) < 32 or ord(c) == 127 for c in pw) or pw != pw.strip():
+        raise Fail(FAILED, "The password cannot start or end with a space or contain control characters.")
+    if repeat and len(pw) < 8:
+        raise Fail(FAILED, "Use at least 8 characters.")
+    if not pw:
+        raise Fail(FAILED, "No password given.")
+    return pw
+
+
+WARNING = """
+IMPORTANT: write your backup password down now and keep it somewhere safe, away from this PC.
+Without it the backup can't be restored on another PC (or after reinstalling).
+Nobody, not even Forge OS, can open the backup without it.
+"""
+
+
+def cmd_init():
+    s = settings()
+    lock = take_lock()
+    if lock is None:
+        print("A backup is running. Try again when it is done.")
+        return 75
+    try:
+        with Drive(s["backup.drive_label"]) as drive:
+            private_dir(data_dir())
+            repo = drive.repo(create=True)
+            final = password_file()
+            exists = os.path.isfile(os.path.join(repo, "config"))
+            if exists and is_set_up():
+                rc, out, err = restic(["-r", repo, "cat", "config"], timeout=600)
+                if rc != 0:
+                    f = explain(rc, out, err, drive)
+                    if f.result == WRONG_PW:
+                        f.message = (f"Your saved password does not open the backup on {drive.label}. If that "
+                                     "backup has another password, delete ~/.local/share/forge-backup/password "
+                                     "and run forge-backup init again.")
+                    raise f
+                print(f"Backups are already set up on {drive.label}. Nothing to do.")
+                return 0
+            if not exists and os.listdir(repo):
+                raise Fail(FAILED, f"{repo} is not empty and is not a backup. Move its files away first.")
+            tmp = final + ".new"
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            if is_set_up():
+                print("Using your saved backup password for this new drive.")
+                with open(final, "rb") as f:
+                    secret = f.read()
+            else:
+                if exists:
+                    print(f"{drive.label} already has a backup of this PC. Type its password to use it.")
+                else:
+                    print(f"Setting up a new encrypted backup on {drive.label}.")
+                secret = (ask_password(repeat=not exists) + "\n").encode()
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(secret)
+            try:
+                args = ["-r", repo, "cat", "config"] if exists else ["-r", repo, "init"]
+                rc, out, err = restic(args, pwfile=tmp, timeout=600)
+                if rc != 0:
+                    f = explain(rc, out, err, drive)
+                    if f.result == WRONG_PW:
+                        f.message = f"That password does not open the backup on {drive.label}. Nothing was changed."
+                    raise f
+                os.replace(tmp, final)
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            write_private(os.path.join(data_dir(), "config.json"), json.dumps({"host": host_name()}) + "\n")
+            st = load_status()
+            st.setdefault("set_up_at", int(time.time()))
+            st.update(drive_label=drive.label, every_hours=s["backup.every_hours"])
+            save_status(st)
+            print(f"Done. Backups of this PC go to forge-backup/{host_name()} on {drive.label}.")
+            print(WARNING)
+            if not s["backup.enabled"]:
+                print("To back up automatically, turn on Automatic backups in Forge Settings, Backups.")
+            print("Run a first backup now with: forge-backup run")
+            return 0
+    except Fail as f:
+        print(f.message, file=sys.stderr)
+        return 1
+    finally:
+        os.close(lock)
+
+
+def fmt_size(n):
+    if not isinstance(n, (int, float)):
+        return "unknown"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def fmt_time(t):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(t)) if isinstance(t, (int, float)) else "never"
+
+
+def cmd_status(as_json):
+    s = settings()
+    st = load_status()
+    now = time.time()
+    last = st.get("last_success")
+    since = last if isinstance(last, (int, float)) else st.get("set_up_at")
+    extra = {"set_up": is_set_up(), "automatic": s["backup.enabled"], "every_hours": s["backup.every_hours"],
+             "drive_label": s["backup.drive_label"],
+             "overdue": bool(is_set_up() and isinstance(since, (int, float))
+                             and now - since >= OVERDUE_FACTOR * s["backup.every_hours"] * 3600)}
+    extra["restore_test"] = rt_summary(st, now)
+    if as_json:
+        print(json.dumps(dict(st, **extra), indent=2, sort_keys=True))
+        return 0
+    if not extra["set_up"]:
+        print("Backups are not set up. Plug in your backup drive and run: forge-backup init")
+    print(f"Automatic backups: {'on' if extra['automatic'] else 'off'}, every {extra['every_hours']} hours, "
+          f"drive {extra['drive_label']}")
+    print(f"Last good backup: {fmt_time(last)}")
+    if st.get("last_run"):
+        print(f"Last try: {fmt_time(st.get('last_run'))}: {st.get('message', st.get('result', ''))}")
+    print(f"Backups kept: {st.get('snapshot_count', 'unknown')}, size on the drive: {fmt_size(st.get('size_bytes'))}, "
+          f"free on the drive: {fmt_size(st.get('drive_free_bytes'))}")
+    if extra["overdue"]:
+        print("No backup has worked for a while. Plug in the backup drive.")
+    rt = extra["restore_test"]
+    print(f"Last good restore test: {fmt_time(rt.get('last_success'))}"
+          + (f" (last try: {rt.get('message')})" if rt.get("result") not in (None, "ok") and rt.get("message") else ""))
+    if rt["overdue"]:
+        print("No restore test has worked for over 40 days. Plug in the backup drive, or run: forge-backup restore-test")
+    return 0
+
+
+def open_repo():
+    """Common start for list, restore and check."""
+    if not is_set_up():
+        raise Fail(NOT_SET_UP, "Backups are not set up yet. Run: forge-backup init")
+    return Drive(settings()["backup.drive_label"])
+
+
+def cmd_list():
+    with open_repo() as drive:
+        snaps, failure = snapshots(drive.repo())
+        if snaps is None:
+            raise explain(*failure, drive)
+        if not snaps:
+            print("No backups yet.")
+        for sn in snaps:
+            t = str(sn.get("time", ""))[:19].replace("T", " ")
+            print(f"{sn.get('short_id', '?')}  {t}  {sn.get('hostname', '')}  {' '.join(sn.get('paths') or [])}")
+    return 0
+
+
+def valid_snapshot(s):
+    return bool(SNAPSHOT_RE.fullmatch(s or ""))
+
+
+def include_path(p, root):
+    """A file or folder inside the backed-up home folder, as a path from its top ("/Documents")."""
+    if not p or any(ord(c) < 32 or ord(c) == 127 for c in p):
+        return None
+    if p.startswith("/"):
+        if p != root and not p.startswith(root.rstrip("/") + "/"):
+            return None
+        p = p[len(root):]
+    parts = [x for x in p.split("/") if x not in ("", ".")]
+    if not parts or ".." in parts:
+        return None
+    return "/" + "/".join(parts)
+
+
+SHARED_PARENT = ("{} can be changed by other users, so a restore there is not safe. "
+                 "Pick a new folder inside your home, for example ~/Restored")
+
+
+FUSE_TYPES = ("fuse", "fuseblk")
+
+
+def fuse_mounts():
+    """Mount points of FUSE filesystems (a FUSE filesystem can claim any owner and serve links,
+    so owner checks can't trust it). None if the mount table can't be read."""
+    out = []
+    try:
+        with open(MOUNTINFO) as f:
+            for line in f:
+                left, _, right = line.partition(" - ")
+                fields = left.split()
+                if len(fields) < 5 or not right.split():
+                    continue
+                fstype = right.split()[0]
+                if fstype in FUSE_TYPES or fstype.startswith("fuse."):
+                    out.append(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[4]))
+    except OSError:
+        return None
+    return out
+
+
+def under_fuse(path, mounts):
+    return any(path == m or path.startswith(m.rstrip("/") + "/") for m in mounts)
+
+
+def walk_restore_parent(parent, create):
+    """Opens the folder that will hold the restore target, from / down, never following a link.
+
+    Every folder on the way must belong to you or root. One that others can write to needs the
+    sticky bit (like /tmp), so nobody can move your folders in it. The folder the target goes in,
+    and any folder Forge has to make a new folder in, must not be writable by others at all.
+    Returns (fd, error). With create=False it only checks, stops at the first missing folder and
+    returns no fd; with create=True it makes missing folders (owner-only) and returns an open fd."""
+    uid = os.geteuid()
+    names = [n for n in parent.split("/") if n]
+    fuse = fuse_mounts()
+    if fuse is None:
+        return None, "Could not read the mount table, so the restore folder can't be checked. Not restored."
+    for i in range(len(names) + 1):
+        if under_fuse("/" + "/".join(names[:i]), fuse):
+            return None, (f"/{'/'.join(names[:i])} is on a FUSE filesystem, which can't be trusted for a "
+                          "restore. Pick a new folder in your home, for example ~/Restored.")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open("/", flags)
+    here = "/"
+    try:
+        for i in range(len(names) + 1):
+            st = os.fstat(fd)
+            if st.st_uid not in (uid, 0):
+                return None, SHARED_PARENT.format(here)
+            open_to_others = bool(st.st_mode & 0o022)
+            if i == len(names):
+                if open_to_others:
+                    return None, SHARED_PARENT.format(here)
+                break
+            try:
+                nfd = os.open(names[i], flags, dir_fd=fd)
+            except FileNotFoundError:
+                if open_to_others:
+                    return None, SHARED_PARENT.format(here)
+                if not create:
+                    return None, None   # the rest is made later, inside a private folder
+                try:
+                    os.mkdir(names[i], 0o700, dir_fd=fd)
+                    nfd = os.open(names[i], flags, dir_fd=fd)
+                except OSError as e:
+                    return None, f"Could not make {os.path.join(here, names[i])}: {e.strerror}"
+            except OSError:
+                return None, f"{os.path.join(here, names[i])} is a link or not a folder. Pick a new folder."
+            if open_to_others and not st.st_mode & stat.S_ISVTX:
+                os.close(nfd)
+                return None, SHARED_PARENT.format(here)
+            os.close(fd)
+            fd = nfd
+            here = os.path.join(here, names[i])
+        out, fd = fd, None
+        return out, None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def check_restore_target(target, h):
+    """Returns (absolute path, error). The target must be a new folder in a private folder, never home."""
+    if not target or any(ord(c) < 32 or ord(c) == 127 for c in target):
+        return None, "Give a folder with --target."
+    path = os.path.abspath(os.path.expanduser(target))
+    real = os.path.realpath(path)
+    hreal = os.path.realpath(h)
+    if os.path.islink(path):
+        return None, f"{path} is a link. Pick a new folder."
+    if real == hreal or hreal.startswith(real.rstrip("/") + "/"):
+        return None, "Restoring over your home folder is not allowed. Pick a new folder, for example ~/Restored"
+    if os.path.lexists(path):
+        return None, f"{path} already exists. Pick a new folder (Forge makes it), so nothing gets overwritten."
+    # The folder it goes in, with links resolved. restic gets this path, so it must not change.
+    path = os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
+    _, err = walk_restore_parent(os.path.dirname(path), create=False)
+    if err:
+        return None, err
+    return path, None
+
+
+def make_restore_target(path, h):
+    """Makes the new owner-only target folder. Refuses if anything is already there."""
+    path, err = check_restore_target(path, h)
+    if err:
+        raise Fail(FAILED, err)
+    pfd, err = walk_restore_parent(os.path.dirname(path), create=True)
+    if err:
+        raise Fail(FAILED, err)
+    name = os.path.basename(path)
+    try:
+        try:
+            os.mkdir(name, 0o700, dir_fd=pfd)
+        except FileExistsError:
+            raise Fail(FAILED, f"{path} appeared while getting ready. Pick a new folder.")
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=pfd)
+        try:
+            os.fchmod(fd, 0o700)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(pfd)
+    return path
+
+
+def cmd_restore(args):
+    target, rest = None, []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--target" and i + 1 < len(args):
+            target = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--target="):
+            target = a.split("=", 1)[1]
+        else:
+            rest.append(a)
+        i += 1
+    if target is None or not 1 <= len(rest) <= 2:
+        print("Usage: forge-backup restore SNAPSHOT [PATH] --target NEW_FOLDER", file=sys.stderr)
+        return 2
+    if not valid_snapshot(rest[0]):
+        print("SNAPSHOT is an ID from forge-backup list, or latest.", file=sys.stderr)
+        return 2
+    path, err = check_restore_target(target, home())
+    if err:
+        print(err, file=sys.stderr)
+        return 1
+    with open_repo() as drive:
+        repo = drive.repo()
+        rc, out, e2 = restic(["-r", repo, "snapshots", "--json", "--", rest[0]], timeout=600)
+        if rc != 0:
+            raise explain(rc, out, e2, drive)
+        try:
+            found = json.loads(out or "[]")
+            root = found[0]["paths"][0]
+        except (ValueError, LookupError, TypeError):
+            raise Fail(FAILED, f"Backup {rest[0]} was not found. See forge-backup list.")
+        if not isinstance(root, str) or not root.startswith("/") or any(ord(c) < 32 for c in root):
+            raise Fail(FAILED, "That backup has an unexpected folder inside. Not restoring it.")
+        argv = ["-r", repo, "restore", f"{found[0].get('id', rest[0])}:{root}", "--target", path]
+        if len(rest) == 2:
+            inc = include_path(rest[1], root)
+            if not inc:
+                print("PATH must be a file or folder inside the backed-up home folder.", file=sys.stderr)
+                return 2
+            argv.append("--include=" + glob_escape(inc))
+        # Checked once more and made new and owner-only just before restic starts. Nobody else
+        # can add a link inside it, and restic would follow one (tested with restic 0.16.4).
+        path = make_restore_target(path, home())
+        argv[argv.index("--target") + 1] = path
+        print(f"Restoring into {path}...", flush=True)
+        rc, out, e2 = restic(argv)
+        if rc != 0:
+            raise explain(rc, out, e2, drive)
+        print(f"Done. Your files are in {path}")
+    return 0
+
+
+def cmd_check():
+    lock = take_lock()
+    if lock is None:
+        print("A backup is running. Try again when it is done.")
+        return 75
+    try:
+        with open_repo() as drive:
+            print(f"Checking the backup on {drive.label}...", flush=True)
+            rc, out, err = restic(["-r", drive.repo(), "check"], timeout=None)
+            if rc != 0:
+                if "wrong password" in (out + err).lower() or "no space left" in (out + err).lower():
+                    raise explain(rc, out, err, drive)
+                print(err[-2000:], file=sys.stderr)
+                raise Fail(FAILED, "The check found problems with the backup (details above). "
+                                   "Run a new backup soon, and think about a second drive.")
+            print("The backup is OK.")
+            return 0
+    finally:
+        os.close(lock)
+
+
+# Restore test --------------------------------------------------------------------------
+#
+# About once a month (and from "Test now" in Forge Dashboard): restore a few random files from the
+# newest backup into a new private temporary folder, compare them, let restic check a small random
+# part of the data, delete the folder, and record the result. Never writes into your folders.
+
+RT_EVERY_S = 30 * 86400          # the automatic test runs when the last good one is older than this
+RT_OVERDUE_S = 40 * 86400        # warn when no test has worked for this long
+RT_RETRY_S = 86400               # a failed or unfinished test is tried again a day later
+RT_SAMPLE = 12                   # files restored per test
+RT_FILE_MAX = 16 * 1024 * 1024   # only files up to this size are picked
+RT_TOTAL_MAX = 64 * 1024 * 1024  # all picked files together
+RT_LS_LINE_MAX = 1 << 20         # longest restic ls line read
+RT_LS_MAX_LINES = 5_000_000      # files looked at, at most
+RT_LS_TIMEOUT_S = 1800
+RT_CHECK_SUBSET = "256M"         # restic check --read-data-subset: a random part of the data
+RT_PREFIX = "forge-restore-test-"
+NO_BACKUP, BUSY = "no_backup_yet", "busy"
+_ISO = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d{1,9})?(Z|[+-]\d\d:\d\d)")
+
+
+def rt_path():
+    return os.path.join(state_dir(), "restore-test.json")
+
+
+def load_rt():
+    return read_json(rt_path(), {})
+
+
+def rt_summary(st, now):
+    """The last restore test for status --json, with "overdue" (no good test for 40 days)."""
+    rt = {k: v for k, v in load_rt().items() if k in (
+        "result", "message", "last_run", "last_success", "files_restored", "files_compared", "check_ok",
+        "snapshot", "duration_s", "cleanup_problem")}
+    since = rt.get("last_success")
+    if not isinstance(since, (int, float)):
+        since = st.get("set_up_at")
+    rt["overdue"] = bool(is_set_up() and isinstance(since, (int, float)) and now - since >= RT_OVERDUE_S)
+    rt["days_since"] = int((now - since) // 86400) if isinstance(since, (int, float)) else None
+    return rt
+
+
+def rt_due(rt, now):
+    last_ok, last_run = rt.get("last_success"), rt.get("last_run")
+    if isinstance(last_ok, (int, float)) and 0 <= now - last_ok < RT_EVERY_S:
+        return False
+    if (rt.get("result") not in (None, OK, DRIVE_MISSING) and isinstance(last_run, (int, float))
+            and 0 <= now - last_run < RT_RETRY_S):
+        return False
+    return True
+
+
+def rt_remind(rt, st, s, now):
+    """At most once a day: tell the user when no restore test has worked for 40 days."""
+    summary = rt_summary(st, now)
+    if not summary["overdue"]:
+        return
+    marker = os.path.join(state_dir(), "restore-test-reminded")
+    try:
+        if now - os.lstat(marker).st_mtime < NOTIFY_EVERY_S:
+            return
+    except OSError:
+        pass
+    notify(f"Backup restore test not done for {summary['days_since']} days",
+           f"Plug in your backup drive {s['backup.drive_label']}: Forge then tests by itself that your backup "
+           "can be restored. Or open Forge Dashboard, Backups, Test now.")
+    write_private(marker, f"{int(now)}\n")
+
+
+def forge_mode():
+    """The Forge mode, from the same file forge-mode and forge-game use ($XDG_STATE_HOME/forge/mode)."""
+    base = os.environ.get("XDG_STATE_HOME")
+    if not base or not os.path.isabs(base):
+        base = os.path.join(home(), ".local/state")
+    try:
+        fd = os.open(os.path.join(base, "forge/mode"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd) as f:
+            return f.read(64).strip()
+    except (OSError, ValueError):
+        return ""
+
+
+def private_tmp():
+    """A new owner-only folder for the restored files: in your runtime folder (only you can open it)
+    if it is safe, else in the system temp folder. Never inside your home folder."""
+    base = os.environ.get("XDG_RUNTIME_DIR") or ""
+    try:
+        st = os.lstat(base) if os.path.isabs(base) else None
+    except OSError:
+        st = None
+    if not (st and stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077):
+        base = tempfile.gettempdir()
+    # Leftovers of a test that was killed (we hold the backup lock, so no test is running now).
+    try:
+        for name in os.listdir(base):
+            p = os.path.join(base, name)
+            if name.startswith(RT_PREFIX):
+                old = os.lstat(p)
+                if stat.S_ISDIR(old.st_mode) and old.st_uid == os.getuid():
+                    remove_tree(p)
+    except OSError:
+        pass
+    return tempfile.mkdtemp(prefix=RT_PREFIX, dir=base)
+
+
+def iso_seconds(text):
+    m = _ISO.fullmatch(text) if isinstance(text, str) else None
+    if not m:
+        return None
+    import datetime
+    tz = "+00:00" if m.group(2) == "Z" else m.group(2)
+    try:
+        return int(datetime.datetime.fromisoformat(m.group(1) + tz).timestamp())
+    except ValueError:
+        return None
+
+
+def rt_pick(line, root):
+    """One `restic ls --json` line to (path from the top of the backup, size, mtime), or None."""
+    try:
+        n = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(n, dict) or "node" not in (n.get("struct_type"), n.get("message_type")):
+        return None
+    path, size = n.get("path"), n.get("size")
+    if n.get("type") != "file" or not isinstance(path, str) or isinstance(size, bool) or not isinstance(size, int):
+        return None
+    if not 0 < size <= RT_FILE_MAX or any(ord(c) < 32 or ord(c) == 127 for c in path):
+        return None
+    if not path.startswith(root.rstrip("/") + "/"):
+        return None
+    rel = path[len(root.rstrip("/")):]
+    parts = rel.split("/")[1:]
+    if not parts or any(x in ("", ".", "..") for x in parts):
+        return None
+    return {"rel": rel, "size": size, "mtime": iso_seconds(n.get("mtime"))}
+
+
+def rt_sample(repo, snap, root, drive=None):
+    """A random sample of the backup's files (reservoir sampling while restic lists them, so a huge
+    backup never fills memory). Returns (sample, None) or (None, Fail). Output is read with a deadline,
+    so a restic that stops printing is stopped too."""
+    rng = random.SystemRandom()
+    sample, seen, lines = [], 0, 0
+    timed_out = False
+
+    def take(line):
+        nonlocal seen
+        item = rt_pick(line.decode("utf-8", "replace"), root)
+        if not item:
+            return
+        seen += 1
+        if len(sample) < RT_SAMPLE:
+            sample.append(item)
+        else:
+            j = rng.randrange(seen)
+            if j < RT_SAMPLE:
+                sample[j] = item
+
+    with tempfile.TemporaryFile() as err:
+        p = subprocess.Popen(["restic", "-r", repo, "ls", "--json", snap], env=restic_env(password_file()),
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err)
+        deadline = time.monotonic() + RT_LS_TIMEOUT_S
+        fd = p.stdout.fileno()
+        buf, skipping = b"", False
+        try:
+            with selectors.DefaultSelector() as sel:
+                sel.register(fd, selectors.EVENT_READ)
+                while lines < RT_LS_MAX_LINES:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        timed_out = True
+                        break
+                    if not sel.select(min(left, 5)):
+                        continue
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
+                        if buf and not skipping:
+                            lines += 1
+                            take(buf)
+                        break
+                    buf += chunk
+                    while b"\n" in buf and lines < RT_LS_MAX_LINES:
+                        line, buf = buf.split(b"\n", 1)
+                        if skipping:        # the rest of a line that was too long
+                            skipping = False
+                            continue
+                        lines += 1
+                        take(line)
+                    if len(buf) > RT_LS_LINE_MAX:
+                        buf, skipping = b"", True
+        finally:
+            stopped = p.poll() is None
+            if stopped:
+                p.kill()
+            rc = p.wait()
+            p.stdout.close()
+        err.seek(0)
+        text = err.read(65536).decode("utf-8", "replace")
+    if timed_out:
+        return None, Fail(FAILED, f"Listing the files of the backup took too long (over {max(1, RT_LS_TIMEOUT_S // 60)} "
+                                  "min) and was stopped. Try again, with the drive on a faster port if you can.")
+    if rc != 0 and not stopped:
+        return None, explain(rc, "", text, drive or Drive("the backup drive"))
+    picked, total = [], 0
+    for item in sorted(sample, key=lambda i: i["size"]):
+        if total + item["size"] <= RT_TOTAL_MAX:
+            picked.append(item)
+            total += item["size"]
+    return picked, None
+
+
+def remove_tree(path):
+    """Delete a folder the restore test made. restic restores folder modes, so read-only folders
+    (0555) are made writable for us first. Links are never followed. Returns None, or what went wrong."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        return f"{path}: {e.strerror}"
+    if not stat.S_ISDIR(st.st_mode):
+        return f"{path} is not a folder"
+    me = os.getuid()
+
+    def writable(d):
+        """Give us rwx on the folder d itself: opened without following a link (O_NOFOLLOW, O_DIRECTORY),
+        then changed through that open folder, so nothing can be swapped in between."""
+        flags = os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC
+        try:
+            fd = os.open(d, os.O_RDONLY | flags)
+            by_path = False
+        except PermissionError:
+            try:    # a folder we may not even read (0100, 0000): a path-only handle to the same folder
+                fd = os.open(d, os.O_PATH | flags)
+                by_path = True
+            except OSError:
+                return
+        except OSError:
+            return      # gone, or a link, or not a folder
+        try:
+            st = os.fstat(fd)
+            mode = stat.S_IMODE(st.st_mode)
+            if st.st_uid != me or mode & 0o700 == 0o700:
+                return
+            if by_path:
+                os.chmod(f"/proc/self/fd/{fd}", mode | 0o700)   # fchmod can't use a path-only handle
+            else:
+                os.fchmod(fd, mode | 0o700)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+    def onexc(func, p, exc):
+        if not isinstance(exc, PermissionError):
+            raise exc
+        writable(os.path.dirname(p))
+        writable(p)
+        func(p)
+
+    try:
+        writable(path)
+        for d, dirs, _ in os.walk(path):     # top-down, never into links
+            for x in dirs:
+                writable(os.path.join(d, x))
+        shutil.rmtree(path, onexc=onexc)
+    except OSError as e:
+        return f"{getattr(e, 'filename', None) or path}: {e.strerror or e}"
+    return None
+
+
+def file_sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(fd, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def rt_compare(sample, tmp, root):
+    """Each restored file must be there with the backed-up size. When the original in your home folder
+    has not changed since the backup (same size and time), the contents must be the same too.
+    Returns (restored, compared, problems)."""
+    restored, compared, problems = 0, 0, []
+    live_ok = os.path.realpath(root) == home()
+    for item in sample:
+        rel = item["rel"]
+        got = os.path.join(tmp, rel.lstrip("/"))
+        try:
+            st = os.lstat(got)
+        except OSError:
+            problems.append(f"{rel.lstrip('/')} was not restored")
+            continue
+        if not stat.S_ISREG(st.st_mode) or st.st_size != item["size"]:
+            problems.append(f"{rel.lstrip('/')} came back with the wrong size")
+            continue
+        digest = file_sha256(got)
+        restored += 1
+        if not live_ok or item["mtime"] is None:
+            continue
+        live = root.rstrip("/") + rel
+        try:
+            a = os.lstat(live)
+            if not (stat.S_ISREG(a.st_mode) and a.st_size == item["size"] and int(a.st_mtime) == item["mtime"]):
+                continue    # changed since the backup: nothing to compare with
+            same = file_sha256(live) == digest
+            b = os.lstat(live)
+        except OSError:
+            continue
+        if (b.st_size, b.st_mtime_ns) != (a.st_size, a.st_mtime_ns):
+            continue        # changed while we read it
+        compared += 1
+        if not same:
+            problems.append(f"{rel.lstrip('/')} differs from your unchanged original")
+    return restored, compared, problems
+
+
+def rt_run(drive, rt):
+    """The test itself. Fills rt and returns the result."""
+    repo = drive.repo()
+    if not os.path.isfile(os.path.join(repo, "config")):
+        raise Fail(NOT_SET_UP, f"The drive {drive.label} has no Forge backup for this PC. Run: forge-backup init")
+    rc, out, err = restic(["-r", repo, "snapshots", "--json"], timeout=600)
+    if rc != 0:
+        raise explain(rc, out, err, drive)
+    try:
+        snaps = json.loads(out or "[]")
+        last = snaps[-1] if isinstance(snaps, list) and snaps else None
+    except ValueError:
+        last = None
+    if not last:
+        raise Fail(NO_BACKUP, "There is no backup to test yet. Run: forge-backup run")
+    snap = last.get("id") if isinstance(last, dict) else None
+    paths = last.get("paths") if isinstance(last, dict) else None
+    root = paths[0] if isinstance(paths, list) and len(paths) == 1 else None
+    if (not isinstance(snap, str) or not re.fullmatch(r"[0-9a-f]{64}", snap) or not isinstance(root, str)
+            or not root.startswith("/") or any(ord(c) < 32 for c in root)):
+        raise Fail(FAILED, "The newest backup looks unusual (odd id or folder). Not testing it.")
+    rt["snapshot"] = snap[:8]
+    sample, failure = rt_sample(repo, snap, root, drive)
+    if failure:
+        raise failure
+    if not sample:
+        raise Fail(NO_BACKUP, "The newest backup has no files to test.")
+    tmp = private_tmp()
+    try:
+        argv = ["-r", repo, "restore", f"{snap}:{root}", "--target", tmp]
+        argv += ["--include=" + glob_escape(i["rel"]) for i in sample]
+        rc, out, err = restic(argv, timeout=3600)
+        restore_fail = explain(rc, out, err, drive) if rc != 0 else None
+        if restore_fail and restore_fail.result == FAILED:
+            restore_fail = Fail(FAILED, "Restoring test files from the backup failed ("
+                                + restore_fail.message.replace("The backup failed: ", "", 1)
+                                + "). Run forge-backup check, and a new backup soon.")
+        restored, compared, problems = rt_compare(sample, tmp, root) if rc == 0 else (0, 0, [])
+    finally:
+        problem = remove_tree(tmp)
+        if problem:
+            rt["cleanup_problem"] = problem[:300]
+            print(f"The temporary folder could not be removed completely: {problem}", file=sys.stderr)
+    rt.update(files_restored=restored, files_compared=compared)
+    crc, cout, cerr = restic(["-r", repo, "check", f"--read-data-subset={RT_CHECK_SUBSET}"], timeout=3600)
+    rt["check_ok"] = crc == 0
+    if restore_fail:
+        raise restore_fail
+    if crc != 0:
+        f = explain(crc, cout, cerr, drive)
+        if f.result != FAILED:
+            raise f
+        last_line = [x for x in (cout + "\n" + cerr).splitlines() if x.strip()][-1:] or [f"exit code {crc}"]
+        raise Fail(FAILED, "The data check (restic check) found a problem in the backup: " + last_line[0][:300]
+                   + ". Run a new backup soon, and think about a second drive.")
+    if problems:
+        raise Fail(FAILED, "Restored files did not match: " + "; ".join(problems[:5])[:600]
+                   + ". Run forge-backup check, and a new backup soon.")
+    note = (" The temporary folder could not be removed completely: " + rt["cleanup_problem"]
+            if rt.get("cleanup_problem") else "")
+    return OK, (f"Restored {restored} random files from backup {snap[:8]} and compared {compared} with your "
+                f"unchanged originals. The data check found no problems." + note)
+
+
+def cmd_restore_test(auto):
+    s = settings()
+    now = time.time()
+    if not is_set_up():
+        if auto:
+            return 0
+        print("Backups are not set up yet. Plug in your backup drive and run: forge-backup init", file=sys.stderr)
+        return 1
+    st = load_status()
+    rt = load_rt()
+    if auto and (forge_mode() == "gaming" or not rt_due(rt, now)):
+        return 0
+    lock = take_lock()
+    if lock is None:
+        if auto:
+            return 0
+        print("A backup or restore test is running. Try again when it is done.", file=sys.stderr)
+        return 75
+    rt["last_run"] = int(now)
+    for k in ("files_restored", "files_compared", "check_ok", "snapshot", "cleanup_problem"):
+        rt.pop(k, None)
+    try:
+        try:
+            with Drive(s["backup.drive_label"]) as drive:
+                print(f"Testing a restore from the backup on {drive.label}...", flush=True)
+                try:
+                    result, message = rt_run(drive, rt)
+                except Fail as f:
+                    # A drive pulled out during the test is not a broken backup.
+                    if f.result == FAILED and (find_device(drive.label) is None
+                                               or not os.path.isdir(os.path.join(drive.mount, "forge-backup"))):
+                        raise Fail(DRIVE_MISSING, f"The backup drive {drive.label} was unplugged during the "
+                                                  "restore test. It runs again when the drive is back.")
+                    if f.result == FAILED and f.message.startswith("The backup on the drive is in use"):
+                        raise Fail(BUSY, f.message)
+                    raise
+        except subprocess.TimeoutExpired:
+            raise Fail(FAILED, "The restore test took too long and was stopped.")
+        rt.update(result=result, message=message, last_success=int(now), duration_s=int(time.time() - now))
+        write_rt(rt)
+        print(message)
+        return 0
+    except Fail as f:
+        rt.update(result=f.result, message=f.message, duration_s=int(time.time() - now))
+        write_rt(rt)
+        print(f.message, file=sys.stderr)
+        if auto and f.result in (FAILED, WRONG_PW):
+            notify("Backup restore test failed", f.message)
+        elif auto:
+            rt_remind(rt, st, s, now)
+        return 0 if auto and f.result in (DRIVE_MISSING, BUSY, NO_BACKUP, NOT_SET_UP) else 1
+    finally:
+        os.close(lock)
+
+
+def write_rt(rt):
+    private_dir(state_dir())
+    write_private(rt_path(), json.dumps(rt, indent=2, sort_keys=True) + "\n")
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0 if argv else 2
+    cmd, args = argv[0], argv[1:]
+    try:
+        if cmd == "run" and args in ([], ["--auto"]):
+            return cmd_run(auto=bool(args))
+        if cmd == "init" and not args:
+            return cmd_init()
+        if cmd == "status" and args in ([], ["--json"]):
+            return cmd_status(as_json=bool(args))
+        if cmd == "list" and not args:
+            return cmd_list()
+        if cmd == "restore":
+            return cmd_restore(args)
+        if cmd == "check" and not args:
+            return cmd_check()
+        if cmd == "restore-test" and args in ([], ["--auto"]):
+            return cmd_restore_test(auto=bool(args))
+    except Fail as f:
+        print(f.message, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("Stopped.", file=sys.stderr)
+        return 130
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

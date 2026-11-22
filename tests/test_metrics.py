@@ -7,7 +7,8 @@ import threading
 import time
 import unittest
 
-sys.path.insert(0, "/home/claude/forge-os-repo/files/system/usr/lib/forge")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "files/system/usr/lib/forge"))
 
 from forgecore import metrics  # noqa: E402
 from forgecore.metrics import Collector, NAMES  # noqa: E402
@@ -160,6 +161,106 @@ class StorageTests(Base):
         self.assertEqual(h[0], {"ts": old, "avg": 20.0, "max": 30.0})
         self.assertEqual(h[1], {"ts": old + 300, "avg": 70.0, "max": 70.0})
         self.assertEqual(h[-1]["avg"], 42.0)
+
+
+def _open_collector(path, q):
+    try:
+        Collector(path)
+        q.put("ok")
+    except Exception as e:      # noqa: BLE001 (the test wants to see any failure)
+        q.put(repr(e))
+
+
+class MigrationRaceTest(unittest.TestCase):
+    def test_two_collectors_upgrading_one_old_database_both_start(self):
+        import multiprocessing as mp
+        old = [n for n in NAMES if n not in ("cpu_temp_c", "battery_pct", "on_ac")]
+        d = tempfile.mkdtemp()
+        failures = []
+        for i in range(15):
+            p = os.path.join(d, f"m{i}.db")
+            db = sqlite3.connect(p)
+            db.execute("CREATE TABLE samples (ts INTEGER PRIMARY KEY, " + ", ".join(f"{n} REAL" for n in old) + ")")
+            db.execute("CREATE TABLE rollup_5m (ts INTEGER PRIMARY KEY, "
+                       + ", ".join(f"{n}_avg REAL, {n}_max REAL" for n in old) + ")")
+            db.commit()
+            db.close()
+            q = mp.Queue()
+            ps = [mp.Process(target=_open_collector, args=(p, q)) for _ in range(2)]
+            for x in ps:
+                x.start()
+            for x in ps:
+                x.join(30)
+            failures += [r for r in (q.get(timeout=5), q.get(timeout=5)) if r != "ok"]
+        self.assertEqual(failures, [])
+
+
+class LaptopMetricTests(Base):
+    """P1: CPU temperature, battery charge and charger state."""
+
+    def sysfs(self, rel, text):
+        p = os.path.join(self.dir, "sys", rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write(text)
+
+    def test_laptop_values(self):
+        os.environ["FORGE_SYSFS"] = os.path.join(self.dir, "sys")
+        self.sysfs("class/hwmon/hwmon0/name", "nvme\n")
+        self.sysfs("class/hwmon/hwmon0/temp1_input", "99000\n")
+        self.sysfs("class/hwmon/hwmon1/name", "k10temp\n")
+        self.sysfs("class/hwmon/hwmon1/temp1_input", "61500\n")
+        self.sysfs("class/power_supply/BAT0/type", "Battery\n")
+        self.sysfs("class/power_supply/BAT0/capacity", "77\n")
+        self.sysfs("class/power_supply/AC/type", "Mains\n")
+        self.sysfs("class/power_supply/AC/online", "1\n")
+        s = self.col.sample()
+        self.assertEqual(s["cpu_temp_c"], 61.5)        # the CPU sensor, not the SSD
+        self.assertEqual(s["battery_pct"], 77)
+        self.assertEqual(s["on_ac"], 1)
+        self.sysfs("class/power_supply/AC/online", "0\n")
+        self.assertEqual(self.col.sample()["on_ac"], 0)
+
+    def test_mouse_battery_is_not_the_pc_battery(self):
+        os.environ["FORGE_SYSFS"] = os.path.join(self.dir, "sys-mouse")
+        base = "class/power_supply/hidpp_battery_0/"
+        for k, v in (("type", "Battery"), ("scope", "Device"), ("capacity", "40")):
+            p = os.path.join(self.dir, "sys-mouse", base + k)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(v + "\n")
+        s = self.col.sample()
+        self.assertIsNone(s["battery_pct"])
+        self.assertIsNone(s["on_ac"])
+
+    def test_desktop_has_no_battery_values(self):
+        os.environ["FORGE_SYSFS"] = os.path.join(self.dir, "empty-sys")
+        s = self.col.sample()
+        self.assertIsNone(s["battery_pct"])
+        self.assertIsNone(s["on_ac"])
+        self.assertIsNone(s["cpu_temp_c"])
+
+    def test_old_database_gets_the_new_columns(self):
+        old = os.path.join(self.dir, "old.db")
+        con = sqlite3.connect(old)
+        con.execute("CREATE TABLE samples (ts INTEGER PRIMARY KEY, cpu_pct REAL, load1 REAL)")
+        con.execute("CREATE TABLE rollup_5m (ts INTEGER PRIMARY KEY, cpu_pct_avg REAL, cpu_pct_max REAL)")
+        con.execute("INSERT INTO samples (ts, cpu_pct) VALUES (1, 5)")
+        con.commit()
+        con.close()
+        c = Collector(old, interval_s=0.1)
+        try:
+            c.record()   # failed before: the old table had no column for the new metrics
+        finally:
+            c.stop()
+        con = sqlite3.connect(old)
+        cols = {r[1] for r in con.execute("PRAGMA table_info(samples)")}
+        rcols = {r[1] for r in con.execute("PRAGMA table_info(rollup_5m)")}
+        rows = con.execute("SELECT COUNT(*) FROM samples").fetchone()[0]
+        con.close()
+        self.assertTrue({"cpu_temp_c", "battery_pct", "on_ac"} <= cols)
+        self.assertTrue({"battery_pct_avg", "on_ac_max"} <= rcols)
+        self.assertEqual(rows, 2)
 
 
 class ThreadTests(Base):

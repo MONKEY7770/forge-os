@@ -1,0 +1,10 @@
+[Unit]
+Description=Forge OS home folder backup (only runs if turned on and due)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/forge-backup run --auto
+# Games and the desktop come first.
+Nice=19
+IOSchedulingClass=idle
+CPUWeight=20

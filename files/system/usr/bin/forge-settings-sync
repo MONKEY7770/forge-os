@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""forge-settings-sync: share Forge settings between your PCs through a folder they can all reach
+(a shared drive, a USB stick or a synced folder). No cloud account.
+
+  forge-settings-sync              check now: save this PC's shareable settings to the sync folder,
+                                   and tell you (once) when another PC's settings are newer
+  forge-settings-sync status       list the PCs in the sync folder (--json for the dashboard)
+  forge-settings-sync diff HOST    show what HOST's settings would change on this PC
+  forge-settings-sync apply HOST   use HOST's settings here (asks for your password, keeps a snapshot)
+
+It never changes your settings by itself. Turn it on in Forge Settings, under Settings sync.
+Settings that belong to one PC (USB key, model folder, power, laptop and VM limits) are never shared.
+"""
+import calendar
+import errno
+import hashlib
+import html
+import json
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+sys.path.insert(0, os.environ.get("FORGE_LIB", "/usr/lib/forge"))
+import forgecfg  # noqa: E402
+
+APPLY = os.environ.get("FORGE_APPLY", "/usr/libexec/forge-apply")
+# Test seam: where "/" is for the sync folder. This tool only runs as you, so it changes nothing
+# you could not do anyway.
+FS_ROOT = os.environ.get("FORGE_ROOT", "")
+MAX_FILES = 64                       # PCs looked at in one folder; more are skipped (oldest first)
+FUTURE_SLACK = 86400                 # a file dated further ahead than this counts as the oldest
+TOO_MANY = "!too-many"               # state key (never a PC name): the "too many files" notice was shown
+FILE_RE = re.compile(r"forge-settings-([a-z0-9-]{1,63})\.json")
+NOT_REACHABLE = "The sync folder can't be reached right now (not plugged in or not mounted?)"
+
+
+def fmt(v):
+    return "on" if v is True else "off" if v is False else str(v)
+
+
+def valid_host(h):
+    return bool(h) and forgecfg.clean_host(h) == h
+
+
+def state_path():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local/state")
+    return os.path.join(base, "forge", "settings-sync.json")
+
+
+def load_state():
+    try:
+        with open(state_path()) as f:
+            data = json.load(f)
+        notified = data.get("notified") if isinstance(data, dict) else None
+        return {k: v for k, v in notified.items() if isinstance(v, str)} if isinstance(notified, dict) else {}
+    except (OSError, ValueError, RecursionError):
+        return {}
+
+
+def save_state(notified):
+    p = state_path()
+    try:
+        os.makedirs(os.path.dirname(p), mode=0o700, exist_ok=True)
+        tmp = f"{p}.{os.getpid()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"notified": notified}, f)
+        os.replace(tmp, p)
+    except OSError as e:
+        print(f"Note: could not save what was already announced ({e.strerror})", file=sys.stderr)
+
+
+def open_folder(vals):
+    """Returns (dir fd, None, False), or (None, message, missing). missing is True when the folder
+    is just not there right now (a USB stick that is not plugged in)."""
+    folder, problem = forgecfg.check_sync_folder(vals.get("sync.folder", ""))
+    if problem:
+        return None, "The sync folder setting is not allowed: " + problem, False
+    if not folder:
+        return None, "No sync folder is set. Choose one in Forge Settings, under Settings sync.", False
+    real = os.path.realpath(FS_ROOT + folder)
+    try:
+        user = pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        user = None
+    roots = [os.path.realpath(FS_ROOT + os.path.expanduser("~")),
+             os.path.realpath(FS_ROOT + "/mnt"), os.path.realpath(FS_ROOT + "/var/mnt")]
+    if user:
+        roots.append(os.path.realpath(FS_ROOT + "/run/media/" + user))
+    # Checked after following any links, so a link can't lead somewhere else.
+    if not any(real.startswith(r + "/") for r in roots):
+        return None, ("The sync folder must be inside your own home folder, /run/media/<you> or /mnt "
+                      "(after following links)."), False
+    try:
+        fd = os.open(real, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None, NOT_REACHABLE, True
+    except OSError as e:
+        return None, f"The sync folder can't be opened ({e.strerror}).", e.errno in (errno.ENOENT, errno.ENODEV)
+    return fd, None, False
+
+
+def read_entry(dfd, name):
+    """Read one file from the folder: no links, no FIFOs or devices, size capped. Returns (bytes, error)."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            return None, "it is a link, and links are refused"
+        return None, f"it can't be opened ({e.strerror})"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None, "it is not a regular file"
+        if st.st_size > forgecfg.EXPORT_MAX:
+            return None, f"the file is too large (more than {forgecfg.EXPORT_MAX // 1024} KB)"
+        chunks, size = [], 0
+        while size <= forgecfg.EXPORT_MAX:
+            chunk = os.read(fd, forgecfg.EXPORT_MAX + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        return b"".join(chunks), None
+    except OSError as e:
+        return None, f"it can't be read ({e.strerror})"
+    finally:
+        os.close(fd)
+
+
+def load_host(dfd, host, schema):
+    """Another PC's file, fully checked. Returns (settings, header, notes, error)."""
+    data, err = read_entry(dfd, f"forge-settings-{host}.json")
+    if err:
+        return None, None, None, err
+    settings, header, notes, err = forgecfg.parse_export(data, schema, drop=forgecfg.machine_keys(schema))
+    if err:
+        return None, None, None, err
+    if header["from_host"] != host:
+        return None, None, None, "the file says it comes from a different PC than its name"
+    return settings, header, notes, None
+
+
+def all_hosts(dfd, me):
+    """Every other PC's name in the folder (odd names are ignored), newest file first. Names
+    can't push a PC out, and a file dated in the future counts as the oldest."""
+    found, limit = [], time.time() + FUTURE_SLACK
+    for name in os.listdir(dfd):
+        m = FILE_RE.fullmatch(name)
+        if not m or not valid_host(m.group(1)) or m.group(1) == me:
+            continue
+        try:
+            mtime = os.stat(name, dir_fd=dfd, follow_symlinks=False).st_mtime
+        except OSError:
+            mtime = 0
+        found.append((-(mtime if mtime <= limit else 0), m.group(1)))
+    return [h for _, h in sorted(found)]
+
+
+def hosts_in(dfd, me, note=True):
+    """Other PCs' file names in the folder, at most MAX_FILES (the newest)."""
+    found = all_hosts(dfd, me)
+    skipped = len(found) - MAX_FILES
+    if skipped > 0 and note:
+        print(f"Note: {skipped} more PC file(s) in the sync folder were not looked at (limit {MAX_FILES}).")
+    return found[:MAX_FILES]
+
+
+def current(schema):
+    """This PC's settings, checked. Returns (clean values, errors)."""
+    return forgecfg.validate(forgecfg.values(schema), schema)
+
+
+def own_doc(schema, clean):
+    # The time your settings last changed (not now), so a PC that was just set up does not look
+    # newer than the one you have been using.
+    try:
+        mtime = os.stat(forgecfg.OVERRIDES_PATH).st_mtime
+    except OSError:
+        mtime = 0
+    when = time.strftime(forgecfg.TIME_FORMAT, time.gmtime(max(0, mtime)))
+    return forgecfg.export_doc(clean, schema, True, forgecfg.this_host(), forgecfg.image_name(), when)
+
+
+def write_own(dfd, doc, schema):
+    """Write this PC's file in one step. Never follows a link, and leaves it alone if nothing changed."""
+    name = f"forge-settings-{doc['from_host']}.json"
+    data, err = read_entry(dfd, name)
+    if not err:
+        old, _, _, err = forgecfg.parse_export(data, schema)
+        if not err and old == doc["settings"]:
+            return False
+    text = json.dumps(doc, indent=2, sort_keys=True) + "\n"
+    tmp = f".forge-settings-{os.urandom(6).hex()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644, dir_fd=dfd)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except OSError:
+            pass
+        raise
+    return True
+
+
+def stamp(text):
+    return calendar.timegm(time.strptime(text, forgecfg.TIME_FORMAT))
+
+
+def differences(settings, clean):
+    return {k: v for k, v in sorted(settings.items()) if clean.get(k) != v}
+
+
+def digest(settings):
+    """What a notice was about: the values only, so a new export time alone is not news."""
+    return hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
+
+
+def notify(summary, body):
+    print(f"{summary}. {body}")
+    try:
+        # Escaped, so nothing in the text can add links or formatting.
+        subprocess.run(["notify-send", "-a", "Forge OS", "-u", "normal", "--",
+                        html.escape(summary), html.escape(body)], timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def cmd_check(schema):
+    clean, errors = current(schema)
+    if errors:
+        print("Not synced: your settings file has problems:\n" + "\n".join(errors), file=sys.stderr)
+        return 1
+    if not clean["sync.enabled"]:
+        print("Settings sync is off.")
+        return 0
+    dfd, err, missing = open_folder(clean)
+    if dfd is None:
+        print(err, file=sys.stdout if missing else sys.stderr)
+        return 0 if missing else 1
+    try:
+        mine = own_doc(schema, clean)
+        try:
+            if write_own(dfd, mine, schema):
+                print(f"Saved this PC's settings as {mine['from_host']}.")
+        except OSError as e:
+            print(f"Could not save this PC's settings to the sync folder ({e.strerror}).", file=sys.stderr)
+        notified, seen, new = load_state(), {}, []
+        if len(all_hosts(dfd, mine["from_host"])) > MAX_FILES:
+            seen[TOO_MANY] = "1"
+            if TOO_MANY not in notified:
+                notify("Too many files in the settings sync folder",
+                       f"Only the newest {MAX_FILES} PCs are looked at, so some PCs may be missed. "
+                       "Remove old forge-settings files you don't need.")
+        for host in hosts_in(dfd, mine["from_host"]):
+            settings, header, _, err = load_host(dfd, host, schema)
+            if err:
+                print(f"Skipped {host}: {err}")
+                continue
+            if not differences(settings, clean) or stamp(header["exported_at"]) <= stamp(mine["exported_at"]):
+                continue
+            seen[host] = digest(settings)
+            if notified.get(host) != seen[host]:
+                new.append(host)
+        if new:
+            names = new[0] if len(new) == 1 else ", ".join(new[:3]) + (
+                f" and {len(new) - 3} more" if len(new) > 3 else "")
+            notify(f"Settings from {names} are available",
+                   f"See what would change with: forge-settings-sync diff {new[0]}")
+        # Only PCs that are still newer and different are remembered, so the list stays small.
+        save_state(seen)
+    finally:
+        os.close(dfd)
+    return 0
+
+
+def open_for_command(schema):
+    clean, errors = current(schema)
+    if errors:
+        print("Your settings file has problems:\n" + "\n".join(errors), file=sys.stderr)
+        return None, None
+    dfd, err, _ = open_folder(clean)
+    if dfd is None:
+        print(err, file=sys.stderr)
+        return None, None
+    return dfd, clean
+
+
+def cmd_status(schema):
+    dfd, clean = open_for_command(schema)
+    if dfd is None:
+        return 1
+    try:
+        mine = own_doc(schema, clean)
+        print(f"This PC: {mine['from_host']}, settings last changed {mine['exported_at']}"
+              f" (sync is {'on' if clean['sync.enabled'] else 'off'})")
+        hosts = hosts_in(dfd, mine["from_host"])
+        if not hosts:
+            print("No other PCs in the sync folder yet.")
+        for host in hosts:
+            settings, header, _, err = load_host(dfd, host, schema)
+            if err:
+                print(f"  {host}: can't be used: {err.splitlines()[0]}")
+                continue
+            n = len(differences(settings, clean))
+            newer = stamp(header["exported_at"]) > stamp(mine["exported_at"])
+            print(f"  {host}: saved {header['exported_at']}, {n} difference(s)"
+                  + (", newer than this PC" if newer and n else ""))
+    finally:
+        os.close(dfd)
+    return 0
+
+
+def cmd_status_json(schema):
+    """The same as status, as JSON. Problems go into "message", so the answer is always JSON."""
+    out = {"this_pc": None, "enabled": False, "message": None, "hosts": []}
+    clean, errors = current(schema)
+    if errors:
+        out["message"] = "Your settings file has problems:\n" + "\n".join(errors)
+        print(json.dumps(out))
+        return 0
+    out["enabled"] = clean["sync.enabled"]
+    dfd, err, _ = open_folder(clean)
+    if dfd is None:
+        out["message"] = err
+        print(json.dumps(out))
+        return 0
+    try:
+        mine = own_doc(schema, clean)
+        out["this_pc"] = mine["from_host"]
+        for host in hosts_in(dfd, mine["from_host"], note=False):
+            settings, header, _, err = load_host(dfd, host, schema)
+            if err:
+                out["hosts"].append({"host": host, "saved_at": None, "differences": None, "newer": False,
+                                     "problem": err.splitlines()[0]})
+                continue
+            n = len(differences(settings, clean))
+            out["hosts"].append({"host": host, "saved_at": header["exported_at"], "differences": n,
+                                 "newer": bool(n) and stamp(header["exported_at"]) > stamp(mine["exported_at"]),
+                                 "problem": None})
+    finally:
+        os.close(dfd)
+    print(json.dumps(out))
+    return 0
+
+
+def host_arg(a):
+    if len(a) != 2 or not valid_host(a[1]):
+        print(f"Use: forge-settings-sync {a[0]} HOST (a PC name from forge-settings-sync status)",
+              file=sys.stderr)
+        return None
+    return a[1]
+
+
+def show_differences(schema, clean, host, header, notes, diff):
+    defs = forgecfg.settings_by_key(schema)
+    print(f"Settings from {host} ({header['image']}), saved {header['exported_at']}:")
+    for n in notes:
+        print("Note: " + n)
+    if not diff:
+        print("Nothing differs from this PC.")
+        return
+    for k, v in diff.items():
+        print(f"  {k} ({defs[k]['label']}): {fmt(clean.get(k))} -> {fmt(v)}")
+
+
+def cmd_diff(schema, a):
+    host = host_arg(a)
+    if host is None:
+        return 2
+    dfd, clean = open_for_command(schema)
+    if dfd is None:
+        return 1
+    try:
+        settings, header, notes, err = load_host(dfd, host, schema)
+    finally:
+        os.close(dfd)
+    if err:
+        print(f"Settings from {host} can't be used: {err}", file=sys.stderr)
+        return 2
+    diff = differences(settings, clean)
+    show_differences(schema, clean, host, header, notes, diff)
+    if diff:
+        print(f"Use them here with: forge-settings-sync apply {host}")
+    return 0
+
+
+def cmd_apply(schema, a):
+    host = host_arg(a)
+    if host is None:
+        return 2
+    dfd, clean = open_for_command(schema)
+    if dfd is None:
+        return 1
+    try:
+        settings, header, notes, err = load_host(dfd, host, schema)
+    finally:
+        os.close(dfd)
+    if err:
+        print(f"Not applied: settings from {host} can't be used: {err}", file=sys.stderr)
+        return 2
+    diff = differences(settings, clean)
+    show_differences(schema, clean, host, header, notes, diff)
+    if not diff:
+        return 0
+    _, errors = forgecfg.validate(forgecfg.values(schema, dict(forgecfg.load_overrides(), **diff)), schema)
+    if errors:
+        print("Not applied:\n" + "\n".join(errors), file=sys.stderr)
+        return 2
+    # The normal way to change settings: forge-apply checks everything again, keeps a snapshot
+    # (forge-config undo) and records the change. pkexec asks for your password.
+    with tempfile.NamedTemporaryFile("w", suffix=".json", prefix="forge-sync-", delete=False) as f:
+        json.dump(diff, f)
+        tmp = f.name
+    try:
+        os.chmod(tmp, 0o644)
+        try:
+            r = subprocess.run(["pkexec", APPLY, "--import", tmp, "--merge"])
+        except OSError as e:
+            print(f"Not applied: pkexec could not be started ({e.strerror}).", file=sys.stderr)
+            return 1
+    finally:
+        os.unlink(tmp)
+    if r.returncode in (126, 127):
+        print("Cancelled: the password was not entered. Nothing changed.", file=sys.stderr)
+        return 1
+    if r.returncode != 0:
+        print("Not applied (see above).", file=sys.stderr)
+        return r.returncode
+    notified = load_state()
+    notified[host] = digest(settings)
+    save_state(notified)
+    print(f"Applied {len(diff)} setting(s) from {host}. Undo with: forge-config undo")
+    return 0
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] in (["-h"], ["--help"], ["help"]):
+        print(__doc__.strip())
+        return 0
+    schema = forgecfg.load_schema()
+    if not a or a == ["check"]:
+        return cmd_check(schema)
+    if a == ["status"]:
+        return cmd_status(schema)
+    if a == ["status", "--json"]:
+        return cmd_status_json(schema)
+    if a[0] == "diff":
+        return cmd_diff(schema, a)
+    if a[0] == "apply":
+        return cmd_apply(schema, a)
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

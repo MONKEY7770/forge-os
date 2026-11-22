@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Forge Welcome
+Comment=First-login welcome page for Forge OS (shown once per user)
+Exec=forge-settings --welcome-once
+Icon=preferences-system
+Terminal=false
+NoDisplay=true

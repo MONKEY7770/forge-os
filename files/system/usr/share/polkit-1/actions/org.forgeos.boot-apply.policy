@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Forge OS: the root part of Forge Settings, Appearance, Bootup (boot splash and login screen).
+     Asks for an admin password every time (no "keep"), and only in an active local session. -->
+<policyconfig>
+  <vendor>Forge OS</vendor>
+  <action id="org.forgeos.boot-apply">
+    <description>Change the boot splash and the login screen background</description>
+    <message>Forge Settings needs an admin password to change the boot splash or the login screen background.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/forge-boot-apply</annotate>
+  </action>
+</policyconfig>

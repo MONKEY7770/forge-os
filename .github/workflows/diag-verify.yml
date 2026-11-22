@@ -40,3 +40,14 @@ jobs:
             echo "== v2.6.5 legacy only"
             /tmp/cosign-v2.6.5 verify --key .github/keys/ublue-os-bazzite.pub --new-bundle-format=false --experimental-oci11=false "$img" > /dev/null && echo "OK legacy" || echo "FAILED legacy"
           done
+      - name: Key check without the transparency log (what the installed system's policy checks)
+        run: |
+          for img in ghcr.io/ublue-os/bazzite:stable ghcr.io/ublue-os/bazzite-nvidia-open:stable; do
+            for v in v2.6.5 v3.1.3; do
+              echo "== $v no-tlog $img"
+              "/tmp/cosign-$v" verify --key .github/keys/ublue-os-bazzite.pub --insecure-ignore-tlog=true "$img" > /dev/null && echo "OK no-tlog" || echo "FAILED no-tlog"
+            done
+            echo "== wrong key must fail: $img"
+            [ -f /tmp/wrong.pub ] || COSIGN_PASSWORD='' /tmp/cosign-v3.1.3 generate-key-pair --output-key-prefix /tmp/wrong > /dev/null 2>&1
+            /tmp/cosign-v3.1.3 verify --key /tmp/wrong.pub --insecure-ignore-tlog=true "$img" > /dev/null && echo "WRONG KEY PASSED" || echo "wrong key refused, good"
+          done

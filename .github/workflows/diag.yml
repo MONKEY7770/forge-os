@@ -1,7 +1,9 @@
 name: diag
 # Temporary: how the UEFI boot image sits in the ISO (test branch only, removed afterwards).
 on:
-  workflow_dispatch:
+  push:
+    branches: [forge-test]
+    paths: [.github/workflows/diag.yml]
 jobs:
   diag:
     runs-on: ubuntu-latest

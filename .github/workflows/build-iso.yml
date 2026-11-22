@@ -93,7 +93,7 @@ jobs:
             --volume /tmp/iso-cache/dnf:/cache/dnf --volume /tmp/iso-cache/dnf_new:/cache/dnf_new \
             "$BUILDER" \
             ADDITIONAL_TEMPLATES="" ARCH="x86_64" DNF_CACHE="/cache/dnf" \
-            ENROLLMENT_PASSWORD="container-installer" EXTRA_BOOT_PARAMS="" \
+            EXTRA_BOOT_PARAMS="" \
             FLATPAK_REMOTE_NAME="flathub" FLATPAK_REMOTE_URL="https://flathub.org/repo/flathub.flatpakrepo" FLATPAK_DIR="" \
             IMAGE_NAME="$IMAGE_NAME" IMAGE_REPO="ghcr.io/monkey7770" IMAGE_SIGNED="true" \
             IMAGE_SRC="$IMAGE_SRC" IMAGE_TAG="$IMAGE_TAG" ISO_NAME="/github/workspace/$ISO_FILE" \

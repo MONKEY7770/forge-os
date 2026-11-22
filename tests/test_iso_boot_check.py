@@ -497,7 +497,7 @@ class SerialCopyTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.env = dict(os.environ, MTOOLS_SKIP_CHECK="1")
 
-    def make_iso(self, name, cfg=GrubConfigTests.CFG, kernel=b"kernel" * 50000, extra=None):
+    def make_iso(self, name, cfg=GrubConfigTests.CFG, kernel=b"kernel" * 50000, extra=None, hidden_efi=False):
         root = os.path.join(self.tmp, name + "-root")
         for d in ("EFI/BOOT", "boot/grub2", "images/pxeboot"):
             os.makedirs(os.path.join(root, d))
@@ -512,15 +512,31 @@ class SerialCopyTests(unittest.TestCase):
         for rel in ("EFI/BOOT/grub.cfg", "boot/grub2/grub.cfg"):
             with open(os.path.join(root, rel), "w", newline="") as f:
                 f.write(cfg)
-        img = os.path.join(root, "images/efiboot.img")
+        # hidden_efi: like Fedora's boot.iso (lorax), the UEFI boot image is not a file in the ISO but
+        # a partition appended after it, which El Torito points to.
+        img = os.path.join(self.tmp, name + "-efiboot.img") if hidden_efi else os.path.join(root, "images/efiboot.img")
         subprocess.run(["mformat", "-C", "-f", "2880", "-v", "ANACONDA", "-i", img, "::"], check=True, env=self.env)
         subprocess.run(["mmd", "-i", img, "::/EFI", "::/EFI/BOOT"], check=True, env=self.env)
         for rel in ("EFI/BOOT/BOOTX64.EFI", "EFI/BOOT/grubx64.efi", "EFI/BOOT/grub.cfg"):
             subprocess.run(["mcopy", "-i", img, os.path.join(root, rel), "::/" + rel], check=True, env=self.env)
         iso = os.path.join(self.tmp, name + ".iso")
-        subprocess.run(["xorriso", "-as", "mkisofs", "-V", "Forge-OS-45", "-R", "-J", "-e", "images/efiboot.img",
+        efi = (["-append_partition", "2", "0xef", img, "-appended_part_as_gpt",
+                "-e", "--interval:appended_partition_2:all::"] if hidden_efi else ["-e", "images/efiboot.img"])
+        subprocess.run(["xorriso", "-as", "mkisofs", "-V", "Forge-OS-45", "-R", "-J", *efi,
                         "-no-emul-boot", "-o", iso, root], check=True, capture_output=True)
         return iso, root
+
+    def hidden_image(self, iso):
+        """The appended UEFI boot image of `iso`, read where El Torito points."""
+        out = subprocess.run(["xorriso", "-indev", iso, "-report_el_torito", "plain"],
+                             capture_output=True, text=True, check=True).stdout
+        n, lba = re.search(r"^El Torito boot img :\s+(\d+)\s+UEFI\b.*\s(\d+)\s*$", out, re.M).groups()
+        self.assertNotRegex(out, rf"El Torito img path :\s+{n}\s", "the UEFI image is not a file in the ISO")
+        img = os.path.join(self.tmp, "hidden-" + hashlib.sha256(iso.encode()).hexdigest()[:12] + ".img")
+        with open(iso, "rb") as f, open(img, "wb") as o:
+            f.seek(int(lba) * 2048)
+            o.write(f.read(2880 * 1024))
+        return img
 
     def extract(self, iso, path):
         out = os.path.join(self.tmp, "x-" + hashlib.sha256((iso + path).encode()).hexdigest()[:12])
@@ -556,6 +572,71 @@ class SerialCopyTests(unittest.TestCase):
         # Same label (the installer finds its files by it) and the same UEFI boot image.
         self.assertEqual(self.m.volume_id(dest), "Forge-OS-45")
         self.assertEqual(self.m.efi_boot_images(dest), ["/images/efiboot.img"])
+
+    def test_appended_uefi_partition_like_fedora(self):
+        # CI finding: Fedora's boot.iso keeps its UEFI boot image in a partition appended after the
+        # ISO (no file in the ISO), so the test copy was refused with "no UEFI boot image file".
+        iso, root = self.make_iso("appended", hidden_efi=True)
+        self.assertNotIn("/images/efiboot.img", self.m.iso_files(iso))
+        dest = os.path.join(self.tmp, "copy.iso")
+        text = "\n".join(self.m.make_serial_copy(iso, dest, self.tmp, NONCE))
+        self.assertIn("changed: appended partition 2:/EFI/BOOT/grub.cfg", text)
+        img = self.hidden_image(dest)
+        inner = subprocess.run(["mcopy", "-n", "-i", img, "::/EFI/BOOT/grub.cfg", "-"], capture_output=True, env=self.env).stdout
+        self.assertEqual(inner.decode(), self.m.serial_grub_cfg(GrubConfigTests.CFG, NONCE)[0])
+        for rel in ("EFI/BOOT/BOOTX64.EFI", "EFI/BOOT/grubx64.efi"):
+            data = subprocess.run(["mcopy", "-n", "-i", img, "::/" + rel, "-"], capture_output=True, env=self.env).stdout
+            with open(os.path.join(root, rel), "rb") as f:
+                self.assertEqual(data, f.read(), rel)
+        for rel in ("/EFI/BOOT/grub.cfg", "/boot/grub2/grub.cfg"):
+            self.assertIn("forge.boottest=" + NONCE, self.extract(dest, rel).decode())
+        self.assertEqual(self.m.volume_id(dest), "Forge-OS-45")
+        self.assertEqual(set(self.m.hidden_efi_images(dest)), {"appended partition 2"})
+
+    def test_a_changed_appended_uefi_partition_is_caught(self):
+        a, _ = self.make_iso("ha", hidden_efi=True)
+        b = os.path.join(self.tmp, "hb.iso")
+        shutil.copyfile(a, b)
+        # Only the boot loader inside the appended partition changes (same size, same place).
+        img = self.hidden_image(b)
+        other = os.path.join(self.tmp, "other.efi")
+        with open(other, "wb") as f:
+            f.write(os.urandom(90000))
+        subprocess.run(["mcopy", "-o", "-i", img, other, "::/EFI/BOOT/grubx64.efi"], check=True, env=self.env)
+        out = subprocess.run(["xorriso", "-indev", b, "-report_el_torito", "plain"], capture_output=True, text=True).stdout
+        lba = int(re.search(r"^El Torito boot img :\s+\d+\s+UEFI\b.*\s(\d+)\s*$", out, re.M).group(1))
+        with open(img, "rb") as f, open(b, "r+b") as o:
+            o.seek(lba * 2048)
+            o.write(f.read())
+        with self.assertRaises(self.m.CopyError) as cm:
+            self.m.compare_isos(a, b, changed=set(), work=self.tmp)
+        self.assertIn("appended partition 2", str(cm.exception))
+
+    def test_hidden_or_system_files_inside_the_uefi_image_are_compared(self):
+        # Review finding: mdir leaves out files with the FAT hidden or system flag, which firmware
+        # still loads, so a changed boot loader with that flag went unseen.
+        a, _ = self.make_iso("fa", hidden_efi=True)
+        img = self.hidden_image(a)
+        subprocess.run(["mattrib", "-i", img, "+h", "+s", "::/EFI/BOOT/BOOTX64.EFI"], check=True, env=self.env)
+        out = subprocess.run(["xorriso", "-indev", a, "-report_el_torito", "plain"], capture_output=True, text=True).stdout
+        lba = int(re.search(r"^El Torito boot img :\s+\d+\s+UEFI\b.*\s(\d+)\s*$", out, re.M).group(1))
+        with open(img, "rb") as f, open(a, "r+b") as o:
+            o.seek(lba * 2048)
+            o.write(f.read())
+        b = os.path.join(self.tmp, "fb.iso")
+        shutil.copyfile(a, b)
+        img = self.hidden_image(b)
+        other = os.path.join(self.tmp, "other-shim.efi")
+        with open(other, "wb") as f:
+            f.write(os.urandom(70000))
+        subprocess.run(["mcopy", "-o", "-i", img, other, "::/EFI/BOOT/BOOTX64.EFI"], check=True, env=self.env)
+        subprocess.run(["mattrib", "-i", img, "+h", "+s", "::/EFI/BOOT/BOOTX64.EFI"], check=True, env=self.env)
+        with open(img, "rb") as f, open(b, "r+b") as o:
+            o.seek(lba * 2048)
+            o.write(f.read())
+        with self.assertRaises(self.m.CopyError) as cm:
+            self.m.compare_isos(a, b, changed=set(), work=self.tmp)
+        self.assertIn("BOOTX64.EFI", str(cm.exception))
 
     def test_iso_without_a_kernel_line_is_refused(self):
         iso, _ = self.make_iso("nokernel", cfg='insmod png\nmenuentry "Install" { echo "nothing" }\n')

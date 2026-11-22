@@ -467,8 +467,36 @@ def efi_boot_images(iso):
     return [p.strip() for n, p in paths if n in uefi]
 
 
+EFI_SYSTEM_GUID = "28732ac11ff8d211ba4b00a0c93ec93b"   # as xorriso prints the EFI System type GUID
+
+
+def hidden_efi_images(iso):
+    """UEFI boot images that are not files in the ISO but a partition appended after it, which is
+    how lorax builds Fedora's boot.iso: {"appended partition N": [(block, size in bytes)]}.
+    Each must start exactly where El Torito points and be an EFI System partition in the GPT."""
+    out = run_tool(["xorriso", "-indev", iso, "-report_el_torito", "plain"])
+    entries = re.findall(r"^El Torito boot img :\s+(\d+)\s+UEFI\s+\S+\s+\S+\s+\S+\s+\S+\s+\d+\s+(\d+)\s*$", out, re.M)
+    with_path = set(re.findall(r"^El Torito img path :\s+(\d+)\s", out, re.M))
+    hidden = [int(lba) for n, lba in entries if n not in with_path]
+    if not hidden:
+        return {}
+    area = run_tool(["xorriso", "-indev", iso, "-report_system_area", "plain"])
+    types = dict(re.findall(r"^GPT type GUID\s+:\s+(\d+)\s+([0-9a-f]{32})\s*$", area, re.M))
+    parts = {int(start): (n, int(size)) for n, start, size
+             in re.findall(r"^GPT start and size :\s+(\d+)\s+(\d+)\s+(\d+)\s*$", area, re.M)}
+    images = {}
+    for lba in hidden:
+        n, size = parts.get(lba * 4, (None, 0))
+        if n is None or types.get(n) != EFI_SYSTEM_GUID or not size:
+            raise CopyError(f"El Torito points to a UEFI boot image at block {lba} that is neither a file "
+                            "nor an appended EFI System partition")
+        images[f"appended partition {n}"] = [(lba, size * 512)]
+    return images
+
+
 def fat_files(img):
-    out = run_tool(["mdir", "-/", "-b", "-i", img, "::"], env=MTOOLS_ENV)
+    # -a: also files with the hidden or system flag, which firmware still loads.
+    out = run_tool(["mdir", "-/", "-a", "-b", "-i", img, "::"], env=MTOOLS_ENV)
     files = []
     for line in out.split("\n"):
         line = line.strip()
@@ -477,6 +505,8 @@ def fat_files(img):
         if not line.startswith("::/") or not SAFE_PATH.match(line[2:]):
             raise CopyError(f"unusual file name in the UEFI boot image: {printable(line, 200)!r}")
         files.append(line[2:])
+    if not any(f.lower().endswith(".efi") for f in files):
+        raise CopyError("the UEFI boot image lists no .efi file")
     return files
 
 
@@ -495,13 +525,18 @@ def compare_isos(iso, copy, changed, work):
     old, new = iso_files(iso), iso_files(copy)
     if set(old) != set(new):
         raise CopyError("the test copy has different files: " + ", ".join(sorted(set(old) ^ set(new)))[:300])
-    keep = {p: e for p, e in old.items() if p not in changed}
+    # Appended UEFI partitions are not files in the ISO, so their insides are always compared.
+    old_hidden, new_hidden = hidden_efi_images(iso), hidden_efi_images(copy)
+    if set(old_hidden) != set(new_hidden) or any(old_hidden[p][0][1] != new_hidden[p][0][1] for p in old_hidden):
+        raise CopyError("the test copy has a different appended UEFI partition")
+    old, new = {**old, **old_hidden}, {**new, **new_hidden}
+    keep = {p: e for p, e in old.items() if p not in changed and p not in old_hidden}
     a, b = files_sha256(iso, keep), files_sha256(copy, {p: new[p] for p in keep})
     diff = sorted(p for p in keep if a[p] != b[p])
     if diff:
         raise CopyError("files changed in the test copy: " + ", ".join(diff)[:300])
     inner = {}
-    for path in sorted(changed - set(ISO_GRUB_CFGS)):
+    for path in sorted((changed - set(ISO_GRUB_CFGS)) | set(old_hidden)):
         imgs = []
         for n, iso_path in enumerate((iso, copy)):
             img = os.path.join(work, f"compare-{n}.img")
@@ -521,10 +556,11 @@ def make_serial_copy(iso, dest, work, mark):
     """Write a copy of the ISO whose kernel lines print to the serial port and carry
     forge.boottest=<mark>. Returns report lines."""
     files = iso_files(iso)
-    images = [p for p in efi_boot_images(iso) if p in files]
-    if not images:
-        raise CopyError("no UEFI boot image file found in the ISO (El Torito)")
-    maps, changed, report, kernel_lines = [], set(), [], 0
+    images = {p: files[p] for p in efi_boot_images(iso) if p in files}
+    hidden = hidden_efi_images(iso)
+    if not images and not hidden:
+        raise CopyError("no UEFI boot image found in the ISO (El Torito)")
+    maps, patches, changed, report, kernel_lines = [], [], set(), [], 0
     for n, path in enumerate(p for p in ISO_GRUB_CFGS if p in files):
         new, count = serial_grub_cfg(file_bytes(iso, files[path]).decode("utf-8", "surrogateescape"), mark)
         if count:
@@ -535,10 +571,10 @@ def make_serial_copy(iso, dest, work, mark):
             changed.add(path)
             kernel_lines += count
             report.append(f"changed: {path} ({count} kernel lines)")
-    for n, path in enumerate(images):
+    for n, (path, extents) in enumerate(list(images.items()) + list(hidden.items())):
         img = os.path.join(work, f"efiboot-{n}.img")
         with open(img, "wb") as f:
-            f.write(file_bytes(iso, files[path]))
+            f.write(file_bytes(iso, extents))
         touched = False
         for inner in (p for p in fat_files(img) if p.lower() == FAT_GRUB_CFG):
             new, count = serial_grub_cfg(fat_read(img, inner).decode("utf-8", "surrogateescape"), mark)
@@ -551,7 +587,7 @@ def make_serial_copy(iso, dest, work, mark):
                 kernel_lines += count
                 report.append(f"changed: {path}:{inner} ({count} kernel lines)")
         if touched:
-            maps.append((img, path))
+            (patches if path in hidden else maps).append((img, path))
             changed.add(path)
     if not kernel_lines:
         raise CopyError("no kernel line (linux or linuxefi) in any grub.cfg: nothing that boots a kernel")
@@ -559,10 +595,22 @@ def make_serial_copy(iso, dest, work, mark):
     for local, path in maps:
         argv += ["-map", local, path]
     run_tool(argv)
+    if patches:
+        # xorriso copies appended partitions unchanged, so the edited image is written over the
+        # copy's partition: same size, at the place the copy's own El Torito and GPT point to.
+        placed = hidden_efi_images(dest)
+        with open(dest, "r+b") as f:
+            for img, path in patches:
+                with open(img, "rb") as g:
+                    data = g.read()
+                if path not in placed or placed[path][0][1] != len(data):
+                    raise CopyError(f"the test copy has no {path} of the same size")
+                f.seek(placed[path][0][0] * 2048)
+                f.write(data)
     sums, inner = compare_isos(iso, dest, changed, work)
     if volume_id(dest) != volume_id(iso):
         raise CopyError("the test copy has a different volume label")
-    if efi_boot_images(dest) != efi_boot_images(iso):
+    if efi_boot_images(dest) != efi_boot_images(iso) or set(hidden_efi_images(dest)) != set(hidden):
         raise CopyError("the test copy has a different UEFI boot image")
     report.append(f"byte-identical (sha256): {len(sums)} other files, {len(inner)} files inside the UEFI boot image")
     boot = re.compile(r"(\.efi$|/vmlinuz|/initrd)", re.I)

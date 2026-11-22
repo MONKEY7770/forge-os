@@ -1,6 +1,7 @@
 """Regression tests from the independent review (rvBoot) of Bootup. Each asserts the safe behaviour."""
 import json
 import os
+import shutil
 import struct
 import sys
 import unittest
@@ -118,7 +119,8 @@ class PocCatchAll(BootApplyTest):
     def test_poc_unexpected_error_after_theme_placed_is_not_recorded(self):
         import subprocess as sp
         d = self.root + "/etc/plymouth"
-        sp.run(["chattr", "+i", d], check=True)
+        if not shutil.which("chattr") or sp.run(["chattr", "+i", d], capture_output=True).returncode != 0:
+            self.skipTest("chattr +i is not available or not supported on this filesystem")
         self.addCleanup(sp.run, ["chattr", "-i", d])
         r = self.enable(frames=2)
         print("\n--- apply ---\n" + r.text)

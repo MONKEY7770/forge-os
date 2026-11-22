@@ -410,25 +410,32 @@ def _hide_text_secrets(text):
     return _hide_secret_pairs(text)
 
 
-def clean_details(value, max_str=MAX_STR, long_text=None, path=""):
+MAX_DEPTH = 64                    # deeper parts are replaced, never walked (no recursion limit)
+TOO_DEEP = "[too deeply nested]"
+
+
+def clean_details(value, max_str=MAX_STR, long_text=None, path="", _depth=0):
     """Hide secret-looking keys and URL secrets, and cut long strings, at any depth.
 
     If long_text is a list, every string longer than MAX_STR is listed there with its
-    path, length and sha256 (of the exact text sent), so an approver can check it."""
+    path, length and sha256 (of the exact text sent), so an approver can check it.
+    Parts nested deeper than MAX_DEPTH are replaced by TOO_DEEP: nothing inside is shown."""
+    if _depth > MAX_DEPTH and isinstance(value, (dict, list, tuple)):
+        return TOO_DEEP
     if isinstance(value, dict):
         # {"name": "DB_PASSWORD", "value": "x"} (env lists, HAR files): hide the value.
         label = value.get("name", value.get("key"))
         if isinstance(label, str) and "value" in value and _is_secret(label):
             value = dict(value, value=HIDDEN)
         return {str(k): (HIDDEN if _is_secret(k) or _weak_kind(k) else
-                         clean_details(v, max_str, long_text, f"{path}.{k}" if path else str(k)))
+                         clean_details(v, max_str, long_text, f"{path}.{k}" if path else str(k), _depth + 1))
                 for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         # A [name, value] pair (like a header list) hides the value of a secret name.
         if (len(value) == 2 and isinstance(value[0], str) and re.fullmatch(r"[A-Za-z0-9_.\-]{1,64}", value[0])
                 and _is_secret(value[0])):
             return [value[0], HIDDEN]
-        return [clean_details(v, max_str, long_text, f"{path}[{i}]") for i, v in enumerate(value)]
+        return [clean_details(v, max_str, long_text, f"{path}[{i}]", _depth + 1) for i, v in enumerate(value)]
     if isinstance(value, float) and not math.isfinite(value):
         return str(value)   # NaN and infinity are not valid JSON: stored as text
     if value is None or isinstance(value, (bool, int, float)):

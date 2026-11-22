@@ -122,8 +122,14 @@ class ConvertTest(unittest.TestCase):
         with open(cls.runner, "w") as f:
             f.write(RUNNER)
         src = ["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30"]
+        # Fedora's patent-free ffmpeg has no libx264: use whichever H.264 (or MPEG-4) encoder exists.
+        encoders = subprocess.run([FFMPEG, "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
+        h264 = next((e for e in ("libx264", "libopenh264") if f" {e} " in encoders), "mpeg4")
+        lossless = (["-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv444p"] if h264 == "libx264"
+                    else ["-c:v", "mpeg4", "-q:v", "1", "-pix_fmt", "yuv420p"])
+        fast = ["-preset", "ultrafast"] if h264 == "libx264" else []
         jobs = {
-            "clip.mp4": src + ["-t", "3", "-c:v", "libx264", "-pix_fmt", "yuv420p"],
+            "clip.mp4": src + ["-t", "3", "-c:v", h264, "-pix_fmt", "yuv420p"],
             "clip.webm": src + ["-t", "2", "-c:v", "libvpx", "-b:v", "500k"],
             "clip.mkv": src + ["-t", "2", "-c:v", "ffv1"],
             "clip.mov": src + ["-t", "2", "-c:v", "mpeg4"],
@@ -138,9 +144,9 @@ class ConvertTest(unittest.TestCase):
             "still.tiff": src + ["-frames:v", "1"],
             "big.png": ["-f", "lavfi", "-i", "testsrc2=size=3000x2000", "-frames:v", "1"],
             "noise.mp4": ["-f", "lavfi", "-i", "nullsrc=s=640x640:r=30,geq=random(1)*255:random(1)*255:random(1)*255",
-                          "-t", "3", "-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv444p"],
-            "long.mp4": ["-f", "lavfi", "-i", "color=c=blue:s=32x32:r=1", "-t", "7200", "-c:v", "libx264",
-                         "-preset", "ultrafast", "-pix_fmt", "yuv420p"],
+                          "-t", "3", *lossless],
+            "long.mp4": ["-f", "lavfi", "-i", "color=c=blue:s=32x32:r=1", "-t", "7200", "-c:v", h264,
+                         *fast, "-pix_fmt", "yuv420p"],
         }
         for name, args in jobs.items():
             r = subprocess.run([FFMPEG, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", *args,

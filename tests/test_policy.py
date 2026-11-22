@@ -702,3 +702,32 @@ class EdgeCoversTheLongestPatternTest(unittest.TestCase):
 
     def test_edge_is_wider_than_the_longest_pattern(self):
         self.assertGreaterEqual(P.EDGE, 4096 * 2)
+
+
+class DeepNestingTest(unittest.TestCase):
+    """Python 3.15 (Fedora 45) parses 100000 nested brackets that older Pythons refused, and the
+    parsed value then reached clean_details, which walked it recursively: RecursionError, so a
+    hostile tool call made the agent run fail (seen in CI). Deep parts are now replaced, never walked."""
+
+    @staticmethod
+    def deep(n, leaf):
+        v = leaf
+        for _ in range(n):
+            v = [v]
+        return v
+
+    def test_very_deep_lists_and_dicts_do_not_raise(self):
+        for shape in (self.deep(100000, "x"), {"a": self.deep(100000, "x")}):
+            out = P.clean_details(shape, 20_000)
+            json.dumps(out)                       # and the result is safe to store
+            self.assertIn(P.TOO_DEEP, json.dumps(out))
+
+    def test_a_secret_below_the_limit_is_still_hidden_and_one_past_it_is_not_shown(self):
+        shallow = self.deep(10, {"password": "Sup3rSecretValue"})
+        self.assertNotIn("Sup3rSecretValue", json.dumps(P.clean_details(shallow)))
+        deep = self.deep(500, {"api_key": "AnotherSecretValue1"})
+        self.assertNotIn("AnotherSecretValue1", json.dumps(P.clean_details(deep)))
+
+    def test_ordinary_nesting_is_unchanged(self):
+        v = {"a": [{"b": [1, 2, {"c": "hello"}]}]}
+        self.assertEqual(P.clean_details(v), v)

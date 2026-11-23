@@ -43,6 +43,9 @@ modules:
         - fwupd                     # firmware updates for BIOS, SSDs, docks
         - fprintd                   # fingerprint readers on laptops
         - iio-sensor-proxy          # screen rotation and light sensors on laptops
+        # Creates the first user account on first boot. The ISO uses Fedora Kinoite's installer,
+        # which leaves that to Plasma Setup; Bazzite removes it, so without it there is no account.
+        - plasma-setup
         - dbus-tools                # dbus-send, used by the Dock appearance backend to talk to Plasma and Krema
         # Virtual machine guest tools. Each one only starts inside its own kind of VM.
         - qemu-guest-agent        # QEMU / KVM / Proxmox / GNOME Boxes
@@ -78,6 +81,7 @@ modules:
         - ollama.service
         - smartd.service
         - forge-apply-firstboot.service
+        - plasma-setup.service       # first user account wizard (runs once, on first boot)
         - forge-core.service
         - forge-hwcheck.service
         - forge-mode-switch.socket   # gaming mode's root step (forge-game), no password

@@ -1,5 +1,5 @@
 name: diag
-# Temporary, test branch only: do the IBM Plex font packages exist for this image (dry run)? No secrets.
+# Temporary, test branch only: how Plasma Setup loads pages, its user and units. No secrets.
 on:
   push:
     branches: [forge-test]
@@ -11,16 +11,19 @@ jobs:
       contents: read
       packages: read
     steps:
-      - name: Dry-run font install
+      - name: Inspect plasma-setup
         env:
           REGISTRY_TOKEN: ${{ github.token }}
         run: |
           printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           docker run --rm --entrypoint bash ghcr.io/monkey7770/forge-os-universal:br-forge-test-candidate-45 -c '
             set +e
-            dnf5 -q repoquery --available "ibm-plex*" 2>&1 | sort -u | head -40
-            echo "== dry run"
-            dnf5 -y --assumeno install ibm-plex-sans-fonts ibm-plex-sans-thai-fonts ibm-plex-mono-fonts 2>&1 | tail -15
-            echo "== installed now"; rpm -qa | grep -i plex
-            echo "== kdeglobals"; cat /etc/xdg/kdeglobals
+            rpm -ql plasma-setup | grep -v "/locale/\|/doc/\|/icons/"
+            echo "== sysusers"; cat /usr/lib/sysusers.d/*plasma-setup* 2>/dev/null
+            echo "== units"; for u in $(rpm -ql plasma-setup | grep "\.service$\|\.target$"); do echo "--- $u"; cat "$u"; done
+            echo "== qml module"; for f in $(rpm -ql plasma-setup | grep -E "qmldir$|SetupModule|\.qmltypes$"); do echo "--- $f"; cat "$f" | head -80; done
+            echo "== wifi page"; for f in $(rpm -ql plasma-setup | grep -E "wifi.*(main\.qml|metadata\.json)$"); do echo "--- $f"; cat "$f"; done
+            echo "== account page"; for f in $(rpm -ql plasma-setup | grep -E "account.*main\.qml$"); do echo "--- $f"; head -120 "$f"; done
+            echo "== strings"; b=$(rpm -ql plasma-setup | grep -E "/bin/plasma-setup$"); strings "$b" | grep -iE "KDE/PlasmaSetup|nextRequested|X-KDE-Weight|kpackage|\.qml" | sort -u | head -40
+            echo "== libs"; for l in $(rpm -ql plasma-setup | grep "\.so"); do strings "$l" | grep -iE "nextRequested|KDE/PlasmaSetup|SetupModule|function|Weight" | sort -u | head -30; done
           '

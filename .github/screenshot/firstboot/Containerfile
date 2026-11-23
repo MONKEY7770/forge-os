@@ -1,0 +1,9 @@
+# First-boot test image: the published Forge OS image (by digest, signature checked by the
+# workflow) plus only a probe that reports to the runner. No account, no automatic login, nothing
+# else changed, so the first boot is the one a fresh install gets. Built on the runner, used once,
+# never pushed anywhere.
+ARG BASE
+FROM ${BASE}
+COPY files/ /
+RUN chmod 0755 /usr/libexec/forge-firstboot-probe \
+ && systemctl enable forge-firstboot-probe.service

@@ -1,0 +1,5 @@
+## Lorax template run inside the installer as it is built (build-iso.yml, ADDITIONAL_TEMPLATES).
+## The web installer's title and welcome text come from NAME and PRETTY_NAME in this file.
+## ID and VARIANT_ID stay, so the installer still picks Fedora Kinoite's settings.
+replace "^NAME=.*" "NAME=\"Forge OS\"" usr/lib/os-release
+replace "^PRETTY_NAME=.*" "PRETTY_NAME=\"Forge OS\"" usr/lib/os-release

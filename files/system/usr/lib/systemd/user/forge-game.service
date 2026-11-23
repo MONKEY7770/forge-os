@@ -1,4 +1,5 @@
 [Unit]
+ConditionUser=!@system
 Description=Forge OS: gaming mode while a game runs (only if turned on in Forge Settings, Gaming)
 After=graphical-session.target
 PartOf=graphical-session.target

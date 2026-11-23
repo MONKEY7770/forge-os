@@ -74,6 +74,32 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertFalse(os.path.exists(os.path.join(self.root, "etc/systemd/system/ollama.service.d")))
 
+    def test_ollama_starts_when_the_models_folder_is_missing(self):
+        # Review finding: ReadWritePaths= without "-" stops the service (226/NAMESPACE) while the
+        # folder does not exist, for example a drive that is not mounted yet.
+        r = self.run_apply()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(self.root, "etc/systemd/system/ollama.service.d/90-forge.conf")) as f:
+            lines = f.read().splitlines()
+        rw = [l for l in lines if l.startswith("ReadWritePaths=")]
+        self.assertEqual(len(rw), 1, lines)
+        self.assertTrue(rw[0].startswith("ReadWritePaths=-/"), rw)
+
+    def test_ollama_port_is_tailscale_only_in_every_zone(self):
+        # Review finding: Bazzite's default zone (FedoraWorkstation) accepts every port above 1024,
+        # so "Allow my other devices to use Ollama" opened it to the whole home network.
+        r = self.run_apply(FORGE_TEST_ZONES="FedoraWorkstation public trusted")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rules = [l for l in r.stdout.splitlines() if "--add-rich-rule" in l]
+        for zone in ("FedoraWorkstation", "public"):
+            self.assertIn(f'would run: firewall-cmd --permanent --zone={zone} --add-rich-rule=rule family="ipv4" '
+                          'source NOT address="100.64.0.0/10" port port="11434" protocol="tcp" reject', rules)
+            self.assertIn(f'would run: firewall-cmd --permanent --zone={zone} --add-rich-rule=rule family="ipv6" '
+                          'source NOT address="fd7a:115c:a1e0::/48" port port="11434" protocol="tcp" reject', rules)
+        self.assertFalse([l for l in rules if "--zone=trusted" in l])
+        out = r.stdout.splitlines()
+        self.assertLess(max(out.index(l) for l in rules), out.index("would run: firewall-cmd --reload"))
+
     def test_core_control_is_delayed_and_unique(self):
         r = self.run_apply()
         self.assertEqual(r.returncode, 0, r.stderr)

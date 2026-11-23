@@ -1,0 +1,31 @@
+#!/usr/bin/bash
+# Forge OS: a small powerprofilesctl for this base, which uses tuned-ppd. tuned-ppd offers the same
+# D-Bus API as power-profiles-daemon but no command. Only what Forge uses (forge-mode, forge-game,
+# forge-power-switch): "get" and "set PROFILE". Linked as /usr/bin/powerprofilesctl only when the
+# real one is missing (finalize.sh).
+set -uo pipefail
+
+usage() {
+  echo "usage: powerprofilesctl get | set power-saver|balanced|performance" >&2
+  exit 2
+}
+case "${1:-}" in
+  get) [ $# -eq 1 ] || usage ;;
+  set) if [ $# -ne 2 ] || [[ ! $2 =~ ^(power-saver|balanced|performance)$ ]]; then usage; fi ;;
+  *) usage ;;
+esac
+
+for name in org.freedesktop.UPower.PowerProfiles net.hadess.PowerProfiles; do
+  path="/${name//./\/}"
+  if [ "$1" = get ]; then
+    if out=$(busctl --system get-property "$name" "$path" "$name" ActiveProfile 2>/dev/null); then
+      out=${out#s \"}
+      echo "${out%\"}"
+      exit 0
+    fi
+  elif busctl --system set-property "$name" "$path" "$name" ActiveProfile s "$2" 2>/dev/null; then
+    exit 0
+  fi
+done
+echo "powerprofilesctl: no power profile service answered" >&2
+exit 1

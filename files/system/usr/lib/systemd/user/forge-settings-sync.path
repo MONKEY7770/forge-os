@@ -1,4 +1,5 @@
 [Unit]
+ConditionUser=!@system
 Description=Share Forge OS settings soon after they change
 
 [Path]

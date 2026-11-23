@@ -120,6 +120,29 @@ def run(*cmd):
     return r.returncode == 0
 
 
+# Ollama's port is for Tailscale only ("Allow my other devices to use Ollama"). Bazzite's default
+# zone accepts every port above 1024, so each zone rejects it from anything that is not Tailscale
+# (100.64.0.0/10, fd7a:115c:a1e0::/48). Harmless while Ollama only listens on 127.0.0.1.
+OLLAMA_PORT_RULES = (
+    'rule family="ipv4" source NOT address="100.64.0.0/10" port port="11434" protocol="tcp" reject',
+    'rule family="ipv6" source NOT address="fd7a:115c:a1e0::/48" port port="11434" protocol="tcp" reject',
+)
+
+
+def firewall_zones():
+    """The firewall's zones (all of them: a network connection can be put in any)."""
+    if DRY:
+        return os.environ.get("FORGE_TEST_ZONES", "FedoraWorkstation trusted").split()
+    try:
+        r = subprocess.run(["firewall-cmd", "--permanent", "--get-zones"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        r = None
+    if r is None or r.returncode != 0:
+        log.append("note: could not list the firewall zones, so Ollama's port rule was not checked")
+        return []
+    return [z for z in r.stdout.split() if re.fullmatch(r"[A-Za-z0-9_+-]{1,64}", z)]
+
+
 def service(name, on, user=False):
     scope = ["--global"] if user else ["--now"]
     run("systemctl", "enable" if on else "disable", *scope, name)
@@ -636,6 +659,10 @@ def apply(v):
     service("tailscaled.service", v["network.tailscale"])
     action = "--add-interface=tailscale0" if v["network.trust_tailscale"] else "--remove-interface=tailscale0"
     run("firewall-cmd", "--permanent", "--zone=trusted", action)
+    for zone in firewall_zones():
+        if zone != "trusted":
+            for rule in OLLAMA_PORT_RULES:
+                run("firewall-cmd", "--permanent", f"--zone={zone}", f"--add-rich-rule={rule}")
     run("firewall-cmd", "--reload")
 
     # AI: Ollama
@@ -646,7 +673,7 @@ def apply(v):
           f"Environment=OLLAMA_KEEP_ALIVE={v['ai.keep_alive_min']}m\n"
           f"Environment=OLLAMA_MAX_LOADED_MODELS={v['ai.max_loaded_models']}\n"
           f"Environment=OLLAMA_MODELS={v['ai.models_dir']}\n"
-          f"ReadWritePaths={v['ai.models_dir']}\n")
+          f"ReadWritePaths=-{v['ai.models_dir']}\n")
     if not DRY or TEST_OLLAMA_USER:
         make_models_dir(v["ai.models_dir"])
 

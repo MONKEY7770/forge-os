@@ -206,6 +206,14 @@ class SettingsPageTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn("http://", r.stdout)
 
+    def test_welcome_once_is_not_shown_to_system_accounts(self):
+        # Review finding: the welcome page opened inside Plasma Setup's temporary session (a system
+        # account), on top of the wizard. It is for real people (UID 1000 and up) only.
+        r = subprocess.run([sys.executable, APP, "--welcome-once"], env=self.env, preexec_fn=as_uid(977),
+                           capture_output=True, text=True, timeout=10)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("http://", r.stdout)
+
     def test_welcome_save_changes_only_the_given_settings(self):
         base, k = self.start("--welcome")
         status, body = request(OWNER, "GET", f"{base}/?k={k}")

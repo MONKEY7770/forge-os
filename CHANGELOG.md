@@ -10,7 +10,7 @@ Channels: **stable** (image tag `latest`, built from `main`) and **testing** (im
 
 - Version number in every image (`/usr/share/forge/version.json` and the image label `org.forgeos.version`), shown in Forge Settings and Forge Dashboard.
 - Update channels: stable and testing. Switching is done in Forge Settings (System, Updates and recovery) after a confirmation, always to the signed image, and starts after the next restart.
-- Automatic rollback with greenboot: on the first start of a new version, a failed login screen or a missing NVIDIA driver makes the PC go back to the previous version after 4 failed starts (the NVIDIA check only when the driver worked on the last good start). Can be turned off.
+- Automatic rollback with greenboot: on the first start of a new version, a failed login screen or a missing NVIDIA driver makes the PC go back to the previous version after 3 failed starts (the NVIDIA check only when the driver worked on the last good start). Can be turned off.
 - An SBOM (SPDX) for each image, kept with each build and attached to the image as a signed attestation.
 - Screenshot test of the built image in a virtual machine (separate workflow, never blocks a release).
 

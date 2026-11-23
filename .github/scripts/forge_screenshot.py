@@ -15,12 +15,27 @@
                last.png            the last screen when something timed out
                result.txt, result.json, probe.log
              Passes when the desktop is reached within --desktop-minutes and Forge Settings starts.
+  firstboot-tag  which image tag the first-boot test uses: like pick-tag, except that a run by hand
+             with IMAGE_TAG_INPUT set tests that tag (checked by forge_release.py's iso-tag rule,
+             the same check build-iso uses). Prints "tag=<tag>".
+  firstboot  boots a disk of the first-boot test image (.github/screenshot/firstboot: no account at
+             all, only a probe) and checks that Plasma Setup, the first account wizard, appears:
+             passes when plasma-setup.service ran (not skipped), a graphical session of the user
+             plasma-setup is active (loginctl), there is no account with UID 1000 to 60000 yet, and
+             the plasma-setup user's UID is below 1000. Saves into --out boot/frame-NNN.png,
+             wizard.png and wizard-2.png (or failure.png / last.png), guest-logs.txt (journal of
+             plasma-setup and plasmalogin, failed units, sessions), result.txt, result.json and
+             probe.log. Also reports, without failing on it, whether the wheel group is in
+             /etc/group at that point.
 
 The test image (.github/screenshot) adds the test account "forgetest" (no password, automatic
 login), Firefox (the real image installs Firefox as a Flatpak on first boot, online) and a probe
 service that talks to this script over a virtio serial port: it says "desktop-ready" when the test
 account's plasmashell runs, and opens Forge Settings when asked. Guest text is untrusted: only
 known event names are used, and it is printed without control characters.
+
+The first-boot probe sends "state" lines (fixed words and numbers only, checked strictly here)
+and, when asked, the guest logs as "log" lines.
 
 Reuses the QMP and screenshot code of iso_boot_check.py. Exit codes: 0 pass, 1 fail, 2 bad use.
 """
@@ -38,8 +53,10 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from iso_boot_check import OVMF_DIR, Qmp, firmware_files, print_untrusted, printable, read_ppm, to_png  # noqa: E402
+import forge_release  # noqa: E402
 
 EVENTS = ("started", "desktop-ready", "settings-started", "settings-failed")
+FIRSTBOOT_EVENTS = ("started", "state", "log", "logs-end")
 LINE_MAX = 4096
 _IMAGE = re.compile(r"[a-z0-9.-]+(?::[0-9]+)?/[a-z0-9._/-]+(?::[A-Za-z0-9_.-]+|@sha256:[0-9a-f]{64})")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -57,6 +74,17 @@ def pick_tag(event, channel_input, branch):
             raise ValueError("only builds from main or testing are tested")
         return tags[branch]
     raise ValueError(f"unexpected event {event!r}")
+
+
+def firstboot_tag(event, channel_input, branch, tag_input):
+    """The first-boot test's tag. By hand with an image tag: that tag, checked by the same rule as
+    build-iso (forge_release.iso_tag: latest, testing, br-<branch>-candidate-NN, <sha7>-candidate-NN).
+    Otherwise the same choice as pick_tag."""
+    if tag_input:
+        if event != "workflow_dispatch":
+            raise ValueError("an image tag can only be chosen in a run by hand")
+        return forge_release.iso_tag(tag_input)
+    return pick_tag(event, channel_input, branch)
 
 
 def install_argv(image, work):
@@ -88,14 +116,14 @@ def qemu_argv(qemu, disk, code, nvram, serial, qmp, probe, kvm, memory_mb, cpus)
             "-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"]
 
 
-def parse_probe(buf):
+def parse_probe(buf, names=EVENTS):
     """Complete lines from the guest -> ([(event, detail)], rest). Unknown lines are dropped."""
     *lines, rest = buf.split(b"\n")
     events = []
     for raw in lines:
         text = _CONTROL.sub(" ", raw.decode("utf-8", "replace"))[:300].strip()
         parts = text.split(" ", 2)
-        if len(parts) >= 2 and parts[0] == "FORGE-PROBE" and parts[1] in EVENTS:
+        if len(parts) >= 2 and parts[0] == "FORGE-PROBE" and parts[1] in names:
             events.append((parts[1], parts[2].strip() if len(parts) > 2 else ""))
     return events, rest[-LINE_MAX:]
 
@@ -143,6 +171,139 @@ class Session:
         return acts
 
 
+# First-boot test. The probe's "state" line: every field, always, in any order, for example
+# "unit=ran session=yes regular=0 setup-uid=974 wheel=yes wizard=yes autologin=yes".
+UNIT_WORDS = ("waiting", "disabled", "running", "ran", "skipped-condition", "skipped-exec-condition", "failed",
+              "not-loaded")
+_YES_NO = re.compile(r"yes|no")
+STATE_FIELDS = {"unit": re.compile("|".join(UNIT_WORDS)), "session": _YES_NO, "regular": re.compile(r"[0-9]{1,6}"),
+                "setup-uid": re.compile(r"[0-9]{1,10}|none"), "wheel": _YES_NO, "wizard": _YES_NO,
+                "autologin": _YES_NO}
+SETUP_USER = "plasma-setup"
+
+
+def parse_state(detail):
+    """The probe's state line -> dict, or None unless it has exactly the known fields with valid values."""
+    state = {}
+    for item in detail.split():
+        key, sep, value = item.partition("=")
+        if not sep or key not in STATE_FIELDS or key in state or not STATE_FIELDS[key].fullmatch(value):
+            return None
+        state[key] = value
+    if set(state) != set(STATE_FIELDS):
+        return None
+    state["regular"] = int(state["regular"])
+    state["setup-uid"] = None if state["setup-uid"] == "none" else int(state["setup-uid"])
+    return state
+
+
+def firstboot_verdict(state):
+    """(True, text) when the wizard is up as it should be, (False, text) when it can't come any more,
+    None while it may still come."""
+    unit, uid = state["unit"], state["setup-uid"]
+    if unit == "not-loaded":
+        return False, "plasma-setup.service is not loaded (not installed in the image, or masked)"
+    if unit == "skipped-exec-condition":
+        return False, ("plasma-setup.service was skipped: its ExecCondition (forge-first-user check) said an account "
+                       f"with UID 1000 to 60000 exists (the probe counts {state['regular']})")
+    if unit == "skipped-condition":
+        return False, "plasma-setup.service was skipped: a Condition of the unit failed (see guest-logs.txt)"
+    if unit == "failed":
+        return False, "plasma-setup.service failed (see guest-logs.txt)"
+    if uid is not None and uid >= 1000:
+        return False, (f"the {SETUP_USER} user has UID {uid}, 1000 or more: forge-first-user check counts it as a "
+                       "regular account, so the wizard would never run")
+    if state["regular"]:
+        return False, f"an account with UID 1000 to 60000 exists before the wizard ({state['regular']} found)"
+    if unit == "ran" and state["session"] == "yes":
+        return True, f"plasma-setup.service ran and a graphical session of {SETUP_USER} is active, with no account yet"
+    return None
+
+
+def describe_state(state):
+    if state is None:
+        return "the probe never reported"
+    return (f"last report: plasma-setup.service {state['unit']}, {SETUP_USER} session {state['session']}, "
+            f"accounts with UID 1000 to 60000: {state['regular']}")
+
+
+def info_lines(state):
+    """What is reported but does not decide the result."""
+    if state is None:
+        return ["wheel group in /etc/group: unknown (no report from the probe)", f"{SETUP_USER} UID: unknown"]
+    uid = state["setup-uid"]
+    if uid is None:
+        uid_text = "none (the user does not exist)"
+    else:
+        uid_text = f"{uid} ({'below 1000, ok' if uid < 1000 else '1000 or more, FAIL'})"
+    return [f"wheel group in /etc/group: {state['wheel']}", f"{SETUP_USER} UID: {uid_text}",
+            f"wizard process (plasma-setup) running: {state['wizard']}",
+            f"autologin file /etc/plasmalogin.conf.d/99-plasma-setup.conf: {state['autologin']}"]
+
+
+class FirstbootSession:
+    """Like Session, for the first-boot test. tick() returns the same kinds of actions. After the
+    verdict the screen is saved, then the probe is asked for the guest logs ("send-logs") and the run
+    ends when they are in ("logs-end") or after logs_timeout."""
+
+    def __init__(self, start, wizard_timeout, shots=((30, "wizard"), (90, "wizard-2")), logs_timeout=120,
+                 max_frames=150):
+        self.start, self.wizard_timeout, self.shots = start, wizard_timeout, shots
+        self.logs_timeout, self.max_frames = logs_timeout, max_frames
+        self.phase, self.since, self.frames, self.finished = "booting", start, 0, False
+        self.state, self.final_state, self.verdict, self.probe_seen, self.next_shot = None, None, None, False, 0
+
+    def _logs(self, now):
+        if not self.probe_seen:
+            self.finished, self.phase = True, "done"
+            return [("done", *self.verdict)]
+        self.phase, self.since = "logs", now
+        return [("send", "send-logs")]
+
+    def _fail(self, now, text, shot):
+        self.verdict, self.final_state = (False, text), self.state
+        return [("shot", shot)] + self._logs(now)
+
+    def tick(self, now, events):
+        if self.finished:
+            return []
+        for name, detail in events:
+            if name == "started":
+                self.probe_seen = True
+            elif name == "state":
+                parsed = parse_state(detail)
+                if parsed is not None:
+                    self.state, self.probe_seen = parsed, True
+            elif name == "logs-end" and self.phase == "logs":
+                self.finished, self.phase = True, "done"
+                return [("done", *self.verdict)]
+        acts = []
+        if self.phase == "booting":
+            verdict = firstboot_verdict(self.state) if self.state else None
+            if verdict is not None and not verdict[0]:
+                return self._fail(now, verdict[1], "failure")
+            if verdict is not None:
+                self.phase, self.since = "settle", now
+                self.verdict = (True, f"after {int(now - self.start)} s: {verdict[1]}")
+                self.final_state = self.state
+            elif now - self.start > self.wizard_timeout:
+                return self._fail(now, f"no wizard session after {int(self.wizard_timeout // 60)} minutes "
+                                       f"({describe_state(self.state)})", "last")
+            elif self.frames < self.max_frames:
+                acts.append(("frame", self.frames))
+                self.frames += 1
+        if self.phase == "settle":
+            while self.next_shot < len(self.shots) and now - self.since >= self.shots[self.next_shot][0]:
+                acts.append(("shot", self.shots[self.next_shot][1]))
+                self.next_shot += 1
+            if self.next_shot == len(self.shots):
+                acts += self._logs(now)
+        elif self.phase == "logs" and now - self.since > self.logs_timeout:
+            self.finished, self.phase = True, "done"
+            acts.append(("done", self.verdict[0], self.verdict[1] + "; the guest logs did not arrive"))
+        return acts
+
+
 def run_root(argv, timeout):
     if os.geteuid() != 0:
         argv = ["sudo", "--non-interactive", *argv]
@@ -187,8 +348,9 @@ def cmd_boot(a):
     os.makedirs(out, exist_ok=True)
     start = time.monotonic()
     private = tempfile.mkdtemp(prefix="forge-shots-")
-    proc = log = qmp = probe = None
-    verdict, probe_log = (False, "not started"), []
+    proc = log = qmp = probe = session = None
+    verdict, probe_log, guest_log = (False, "not started"), [], []
+    firstboot = a.cmd == "firstboot"
 
     def stop(signum, frame):
         raise KeyboardInterrupt(f"stopped by signal {signum}")
@@ -202,11 +364,16 @@ def cmd_boot(a):
         log = open(os.path.join(out, "qemu.log"), "wb")
         proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
         qmp = Qmp(sock, proc)
-        limit = a.desktop_minutes * 60 if kvm else a.desktop_minutes * 180
-        session = Session(start=time.monotonic(), desktop_timeout=limit, desktop_settle=20, settings_timeout=300,
-                          settings_settle=30, max_frames=150)
+        minutes = a.wizard_minutes if firstboot else a.desktop_minutes
+        limit = minutes * 60 if kvm else minutes * 180
+        if firstboot:
+            session = FirstbootSession(start=time.monotonic(), wizard_timeout=limit)
+        else:
+            session = Session(start=time.monotonic(), desktop_timeout=limit, desktop_settle=20, settings_timeout=300,
+                              settings_settle=30, max_frames=150)
         buf = b""
-        print(f"Booting {a.disk}: {'KVM' if kvm else 'no KVM (TCG, slow)'}, desktop limit {int(limit // 60)} min", flush=True)
+        print(f"Booting {a.disk}: {'KVM' if kvm else 'no KVM (TCG, slow)'}, "
+              f"{'wizard' if firstboot else 'desktop'} limit {int(limit // 60)} min", flush=True)
         while not session.finished:
             time.sleep(a.interval)
             if proc.poll() is not None:
@@ -234,8 +401,12 @@ def cmd_boot(a):
                     pass
                 except OSError:
                     probe = None
-                events, buf = parse_probe(buf)
+                events, buf = parse_probe(buf, FIRSTBOOT_EVENTS if firstboot else EVENTS)
             for name, detail in events:
+                if name == "log":     # guest logs go to guest-logs.txt only
+                    if len(guest_log) < 5000:
+                        guest_log.append(detail)
+                    continue
                 probe_log.append(f"{int(time.monotonic() - start)} s: {name} {detail}".strip())
                 print(f"[{time.monotonic() - start:6.0f} s] probe: {printable(name + ' ' + detail, 300)}", flush=True)
             for act in session.tick(time.monotonic(), events):
@@ -271,13 +442,25 @@ def cmd_boot(a):
             probe.close()
         shutil.rmtree(private, ignore_errors=True)
     ok, text = verdict
+    result = {"ok": ok, "result": text, "seconds": int(time.monotonic() - start), "kvm": kvm}
+    info = []
+    if firstboot:
+        state = session and (session.final_state or session.state)
+        info = info_lines(state)
+        result.update(state=state, info=info)
+        with open(os.path.join(out, "guest-logs.txt"), "w") as f:
+            f.write(printable("\n".join(guest_log), 2000000) + "\n" if guest_log else "(no logs from the guest)\n")
     with open(os.path.join(out, "probe.log"), "w") as f:
         f.write(printable("\n".join(probe_log), 20000) + "\n")
     with open(os.path.join(out, "result.json"), "w") as f:
-        json.dump({"ok": ok, "result": text, "seconds": int(time.monotonic() - start), "kvm": kvm}, f, indent=2)
+        json.dump(result, f, indent=2)
     with open(os.path.join(out, "result.txt"), "w") as f:
-        f.write(f"{'PASS' if ok else 'FAIL'}: {text}\n")
+        f.write(f"{'PASS' if ok else 'FAIL'}: {text}\n" + "".join(f"{line}\n" for line in info))
     print(f"{'PASS' if ok else 'FAIL'}: {text}")
+    for line in info:
+        print(f"  {line}")
+    if not ok and guest_log:
+        print_untrusted("Last guest log lines:", "\n".join(guest_log), 4000)
     if not ok:
         try:
             with open(os.path.join(out, "serial.log"), "rb") as f:
@@ -304,7 +487,26 @@ def main(argv=None):
     b.add_argument("--cpus", type=int, default=min(4, os.cpu_count() or 1))
     b.add_argument("--ovmf-dir", default=OVMF_DIR)
     b.add_argument("--qemu", default="qemu-system-x86_64")
+    sub.add_parser("firstboot-tag")
+    fb = sub.add_parser("firstboot")
+    fb.add_argument("--disk", required=True)
+    fb.add_argument("--out", required=True)
+    fb.add_argument("--wizard-minutes", type=int, default=20)
+    fb.add_argument("--interval", type=float, default=3.0)
+    fb.add_argument("--memory", type=int, default=8192)
+    fb.add_argument("--cpus", type=int, default=min(4, os.cpu_count() or 1))
+    fb.add_argument("--ovmf-dir", default=OVMF_DIR)
+    fb.add_argument("--qemu", default="qemu-system-x86_64")
     a = ap.parse_args(argv)
+    if a.cmd == "firstboot-tag":
+        try:
+            tag = firstboot_tag(os.environ.get("EVENT", ""), os.environ.get("CHANNEL_INPUT", ""),
+                                os.environ.get("RUN_BRANCH", ""), os.environ.get("IMAGE_TAG_INPUT", ""))
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+        print(f"tag={tag}")
+        return 0
     if a.cmd == "pick-tag":
         try:
             tag = pick_tag(os.environ.get("EVENT", ""), os.environ.get("CHANNEL_INPUT", ""),
@@ -323,7 +525,8 @@ def main(argv=None):
         except ValueError as e:
             print(f"ERROR: {e}")
             return 2
-    if not (1 <= a.desktop_minutes <= 120 and 0.5 <= a.interval <= 60 and 2048 <= a.memory <= 65536 and 1 <= a.cpus <= 64):
+    minutes = a.wizard_minutes if a.cmd == "firstboot" else a.desktop_minutes
+    if not (1 <= minutes <= 120 and 0.5 <= a.interval <= 60 and 2048 <= a.memory <= 65536 and 1 <= a.cpus <= 64):
         print("ERROR: a value is out of range")
         return 2
     return cmd_boot(a)

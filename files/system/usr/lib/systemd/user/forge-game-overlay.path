@@ -1,4 +1,5 @@
 [Unit]
+ConditionUser=!@system
 Description=Forge OS: update your MangoHud overlay file when Forge Settings change
 
 [Path]

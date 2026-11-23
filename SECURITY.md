@@ -235,19 +235,59 @@ Built by parallel builders with failing-first tests, each part reviewed independ
 | Low | many | Redaction gaps (password="x", pw=, psk=, curl -u, mysql -p, sshpass -p, full-width separators, other languages), restore test leftovers and a missing time limit, slow-upload and lock issues, i18n slowdown on long lines, Thai marks lost in file names, GTK apps not told about cursor and font changes, clock-skewed pins, CI runs of the same commit mixing images, and others | Fixed, each with a regression test |
 
 Accepted and open:
-- The animated dock (Krema) and Wallpaper Engine are switched off until their exact package versions and repository keys are pinned (their COPR repositories could not be checked from here).
 - Any program running as the administrator at the PC can switch between the five configured modes (the same power `forge-mode` has). The mode service needs CAP_SYS_ADMIN to manage units; its only input is one word.
 - A program of the same user named like a game can start game mode.
 - Redaction cannot catch secrets written as free text ("the password was x").
 - Test hooks (FORGE_* environment variables) are honoured in user tools; only your own environment can set them.
 - Not seen on a real screen yet: wallpapers, dock styles, boot splash and unlock box, login and lock screens, themes, game mode, greenboot on a real update, and the new CI jobs.
 
+### CI round (11-22 to 11-23): first real runs on GitHub
+
+- Bazzite's images are signed keylessly: the base check now verifies the signer identity pinned to Bazzite's own build workflow on main (wrong identities shown refused).
+- The archived ISO builder action pulled an image tag that never exists for a commit pin: its v1.5.0 image now runs pinned by digest, with the Secure Boot key URL pinned to a commit.
+- bluez was dropped (Bazzite ships terra-bluez); checked repo keys are imported into rpm.
+- Python 3.15 parses deeper JSON than before: redaction now stops at 64 levels instead of hitting the recursion limit.
+- The ISO boot test now handles Fedora's UEFI image in an appended partition, compares hidden or system FAT files, and allows only the BIOS image's own position bytes (8 to 23, 2548 to 2555) to differ. A reviewer found one Medium in each version; both fixed.
+
+### Fourth round (11-23): a real install, then an after-install bug hunt
+
+The first VM install had no user account. Three read-only reviews of first boot, Settings and system services followed, then a review of all fixes.
+
+| Sev. | Area | Finding | Status |
+|---|---|---|---|
+| High | First boot | No account could be created: the installer (Fedora Kinoite's) leaves it to Plasma Setup, which Bazzite removes | Fixed: Plasma Setup installed and enabled |
+| High | First boot | Plasma Setup only checks a "done" file, so PCs with accounts (rebased from Bazzite) would get the wizard, a passwordless session allowed to create administrators | Fixed: it runs only while no account with UID 1000 to 60513 exists (read with getent; a failed lookup skips it), and comes back if account creation failed |
+| High | First boot | Offline or Wi-Fi-only first boot: the one-time app install (Firefox included) never retried, so there was no browser | Fixed: retried every 3 minutes for about an hour |
+| High | Virtual machines | Turning VMs on always failed: libvirt is only in /usr/lib/group, which usermod does not edit | Fixed: the group's line is copied to /etc/group (and /etc/gshadow), as Bazzite's docs say |
+| Medium (security) | Ollama | "Allow my other devices to use Ollama" opened it to the whole home network: Bazzite's default firewall zone accepts ports 1025 to 65535 | Fixed: every zone except trusted rejects 11434 unless the source is Tailscale (100.64.0.0/10, fd7a:115c:a1e0::/48); checked with firewalld's own parser |
+| Medium | Ollama | ReadWritePaths without "-" stopped the service while the models folder was missing | Fixed |
+| Medium | Services | forge and ollama users exist only through sysusers.d; my first fix ("+" ExecStartPre) could not work, as systemd resolves User= first (review) | Fixed: a small service without User= creates them, required by both |
+| Medium | Health alerts | A critical alert came back every 10 minutes for as long as a problem lasted | Fixed: each problem shown once until the PC is healthy again |
+| Medium | Session | Forge user units and the welcome page also ran for system accounts (Plasma Setup's user, the login screen) | Fixed: ConditionUser=!@system, welcome only from UID 1000 |
+| Medium | Background | The screen list was always empty: sysfs files report 4096 bytes | Fixed |
+| Medium | Thai | Background, Dock and Bootup results were English only; the Thai password word was not redacted (split at its vowel mark, and missed inside longer names) | Fixed: 183 message templates; Thai marks kept inside words, the word found inside names |
+| Medium | Redaction | A weak name's value was judged on its first 64 characters, so a secret after them stayed | Fixed: a value that goes on is hidden |
+| Medium | Power | This base has tuned-ppd and no powerprofilesctl, so modes never changed the power profile | Fixed: a small stand-in using the same D-Bus API, linked only when the real one is missing |
+| Medium | Wallpaper Engine | Once pinned, a COPR outage would stop every build; then a bad pin would have been dropped quietly (review) | Fixed: only "COPR unreachable" skips it; a bad pin, signature or anything else stops the build |
+| Low | Branding | The installer said Fedora Kinoite and the system said Bazzite | Fixed: display names only, IDs kept |
+| Low | Repos | The Claude Desktop repo failed its first metadata check on installed systems too | Fixed: turned off once installed (it updates with the image); checks stay on |
+| Low | Docs | Rollback was described as after 4 failed starts; greenboot does it after 3 | Fixed |
+| Low | First login | Bazzite Portal opened next to Forge Welcome | Fixed: Portal stays in the menu only |
+
+Krema 0.13.0-1.fc45 and Wallpaper Engine 1.5^20261108.192.g8173e09-1.fc45 are now pinned with their COPR keys (18B2C521BF9E618E9F9D950C124E1771EDE61218, 44E8D456D5C4D6C6F9672E5E4BEA2DC31EEAD2C7). The keys come from COPR over HTTPS (no second source exists); the pins stop a later key change. Both were shown to install into the image in a dry run.
+
+A new CI job boots an install with no account and checks that the Plasma Setup wizard session starts (first run still to come).
+
+Accepted and open (this round):
+- A network that itself hands out 100.64.0.0/10 (some ISPs, hotspots) counts as Tailscale for Ollama's port. Virtual machines and containers can no longer reach Ollama.
+- Not sure: NoNewPrivileges on forge-virt.service under SELinux (domain changes for groupadd, usermod, restorecon); whether Plasma Login Manager reads /etc/plasmalogin.conf.d (the first-boot CI job will show it, as Plasma Setup relies on it too); BlueBuild's "Flatpaks installed" notice may go to the login screen's session.
+
 ### Scanners (11-19)
 
 - bandit: production code has no High findings. Medium patterns were checked by hand: SQL built only from fixed column names (not injectable), urlopen only on 127.0.0.1 or the system's OLLAMA_HOST, "0.0.0.0" is a comparison, not a bind. Accepted.
 - shellcheck: every shell script clean at warning level.
 - detect-secrets (all files): 26 hits, all false positives (public Universal Blue enrollment password, public Ollama checksum, environment variable names, a folder path, fake test values and ids, a key header with no key in it). An earlier run reported 0 because it scanned nothing outside git; that result was wrong and was replaced.
-- Unit tests: 1707, all passing (11-22, full merged branch; 1 skipped needs a tool not installed here), with the real-tool tests run (restic 0.16.4, PowerShell 7, QEMU with OVMF for the boot test). Workflows pass actionlint (with its shellcheck checks).
+- Unit tests: 1809, all passing (11-23, full merged branch; 18 skipped need tools or root features not available here), with the real-tool tests run (restic 0.16.4, PowerShell 7, QEMU with OVMF for the boot test). Workflows pass actionlint (with its shellcheck checks).
 - gitleaks: not available in this environment.
 
 ### Could not verify here (needs real hardware)
@@ -257,7 +297,7 @@ USB unlock at boot (initramfs drivers, udev, real lsblk output), the stick mount
 ## Known open risks (not fixed yet)
 
 - **Nothing has been verified on real hardware yet.** Everything above is tested with real tools or simulations only.
-- **The GitHub checks have never run yet.** They are written and tested here only as files; the first push shows whether package names, the Fedora 45 container and the pinned key fingerprints are right.
+- **The new first-boot CI job has not run yet.** All other GitHub checks run on every push to the test branch and pass.
 - **Cloud API keys are stored as plain text** in `/var/lib/forge/secrets.json` (owner-only). Their protection is the disk encryption and file permissions.
 - **Viewer token readable by every program you run.** It can read status, runs and agents, but not secrets, the audit log, policy, approval details or the doctor report, and it can't change anything. Changes need `sudo forge-api`.
 - **Your single USB stick (H:) holds both the disk unlock key and the cosign signing key.** Losing it exposes both. Better: keep the signing key somewhere else, and add a second unlock stick with `forge-usbkey`.

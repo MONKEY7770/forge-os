@@ -667,6 +667,39 @@ class ForgeHealthNotifyTest(unittest.TestCase):
         self.assertIn("&lt;a href=", joined)
         self.assertIn("Forge OS: hardware changed", json.dumps(summaries))
 
+    def health_calls(self, calls):
+        return [c for c in calls if "Forge OS health" in c]
+
+    def test_the_same_problems_are_shown_once(self):
+        # Review finding: a critical alert came back every 10 minutes for as long as a problem
+        # lasted (for example a failed service on a first boot without network).
+        r, calls = self.run_health()
+        self.assertEqual(len(self.health_calls(calls)), 1, (calls, r.stderr))
+        os.remove(self.log)
+        r, calls = self.run_health()        # same problem, other numbers: low memory again
+        self.assertEqual(self.health_calls(calls), [], calls)
+        write_exec(os.path.join(self.fake, "systemctl"),
+                   "#!/bin/sh\n[ \"$1\" = --failed ] && echo 'x.service loaded failed failed X'\nexit 0\n")
+        r, calls = self.run_health()        # a new problem: shown, with the others
+        health = self.health_calls(calls)
+        self.assertEqual(len(health), 1, calls)
+        self.assertIn("x.service", json.dumps(health))
+        os.remove(self.log)
+        r, calls = self.run_health()
+        self.assertEqual(self.health_calls(calls), [], calls)
+
+    def test_a_problem_that_comes_back_after_a_healthy_run_is_shown_again(self):
+        self.run_health()
+        os.remove(self.log)
+        write_exec(os.path.join(self.fake, "forge-config"),
+                   open(os.path.join(self.fake, "forge-config")).read().replace('echo "999999"', 'echo "0"'))
+        r, calls = self.run_health()        # healthy
+        self.assertEqual(self.health_calls(calls), [], calls)
+        write_exec(os.path.join(self.fake, "forge-config"),
+                   open(os.path.join(self.fake, "forge-config")).read().replace('mem_warn_gb) echo "0"', 'mem_warn_gb) echo "999999"'))
+        r, calls = self.run_health()
+        self.assertEqual(len(self.health_calls(calls)), 1, calls)
+
     def test_a_new_check_alone_does_not_claim_settings_were_reapplied(self):
         with open(self.hw, "w") as fh:
             json.dump({"changes": ["This PC has an NVIDIA GPU, but runs the universal image."],

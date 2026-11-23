@@ -1247,3 +1247,12 @@ class ToolTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BackendEnvTest(unittest.TestCase):
+    def test_backends_see_the_same_theme_and_config_folders_as_the_desktop(self):
+        # Review finding: Bazzite's login scripts add Flatpak folders to XDG_DATA_DIRS; without it
+        # (and XDG_CONFIG_DIRS) the backends and the Plasma tools they start saw fewer themes.
+        import forgeappearance as fa
+        for name in ("XDG_DATA_DIRS", "XDG_CONFIG_DIRS"):
+            self.assertIn(name, fa.BACKEND_ENV)

@@ -1,0 +1,12 @@
+# First-boot test image only (never in the real Forge OS image). Runs as root and only reads
+# state; it creates no account.
+[Unit]
+Description=Forge OS first-boot test probe
+After=systemd-user-sessions.service
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/forge-firstboot-probe
+
+[Install]
+WantedBy=multi-user.target

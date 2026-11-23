@@ -857,19 +857,23 @@ class KremaImageTest(unittest.TestCase):
     def calls(self):
         return read(self.log).splitlines() if os.path.exists(self.log) else []
 
-    def test_shipped_pins_are_empty_and_the_build_skips_krema(self):
+    def test_shipped_pins_are_the_reviewed_ones(self):
+        # Reviewed 2026-11-23: the newest COPR build for Fedora 45, and the COPR project's key.
         text = read(KREMA_SCRIPT)
-        self.assertRegex(text, r'(?m)^KREMA_VERSION=""$')
-        self.assertRegex(text, r'(?m)^KREMA_KEY_FPR=""$')
-        r = self.run_script(KREMA_SCRIPT, KREMA_VERSION="0.13.0-1.fc45", KREMA_KEY_FPR="A" * 40)
+        self.assertRegex(text, r'(?m)^KREMA_VERSION="0.13.0-1.fc45"$')
+        self.assertRegex(text, r'(?m)^KREMA_KEY_FPR="18B2C521BF9E618E9F9D950C124E1771EDE61218"$')
+
+    def test_empty_pins_skip_krema_and_the_environment_cannot_fill_them(self):
+        path = self.pinned_copy("", version="")
+        r = self.run_script(path, KREMA_VERSION="0.13.0-1.fc45", KREMA_KEY_FPR="A" * 40)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("install-krema: skipped", r.stdout)
         self.assertEqual(self.calls(), [], "nothing is downloaded or installed")
 
     def pinned_copy(self, fpr, version="0.13.0-1.fc45"):
         text = read(KREMA_SCRIPT)
-        text = re.sub(r'(?m)^KREMA_VERSION=""$', f'KREMA_VERSION="{version}"', text)
-        text = re.sub(r'(?m)^KREMA_KEY_FPR=""$', f'KREMA_KEY_FPR="{fpr}"', text)
+        text = re.sub(r'(?m)^KREMA_VERSION=".*"$', f'KREMA_VERSION="{version}"', text)
+        text = re.sub(r'(?m)^KREMA_KEY_FPR=".*"$', f'KREMA_KEY_FPR="{fpr}"', text)
         path = os.path.join(self.tmp, "install-krema.sh")
         with open(path, "w") as f:
             f.write(text)

@@ -30,6 +30,9 @@ import forgecfg  # noqa: E402
 STATE = os.environ.get("FORGE_VIRT_STATE", "/var/lib/forge-virt")
 ROOT = os.environ.get("FORGE_VIRT_ROOT", "")          # for testing only
 GROUP_FILE = os.environ.get("FORGE_GROUP_FILE")       # for testing only
+ETC_GROUP = os.environ.get("FORGE_ETC_GROUP", GROUP_FILE or "/etc/group")
+LIB_GROUP = os.environ.get("FORGE_LIB_GROUP", "/usr/lib/group")
+ETC_GSHADOW = os.environ.get("FORGE_ETC_GSHADOW", None if GROUP_FILE else "/etc/gshadow")
 RECORD = os.path.join(STATE, "state.json")
 
 APPS = ("org.virt_manager.virt-manager", "org.virt_manager.virt_manager.Extension.Qemu")
@@ -56,6 +59,47 @@ def ok(*cmd, timeout=1800):
     if r is not None and r.returncode != 0:
         print(f"{' '.join(cmd)} failed: {(r.stderr or r.stdout).strip()[:300]}", file=sys.stderr)
     return r is not None and r.returncode == 0
+
+
+def append_line(path, line):
+    with open(path) as f:
+        text = f.read()
+    with open(path, "a") as f:
+        f.write(("" if not text or text.endswith("\n") else "\n") + line + "\n")
+
+
+def in_gshadow(group):
+    """gpasswd also needs the group in /etc/gshadow (when that file exists): add "group:!::"."""
+    if not ETC_GSHADOW or not os.path.exists(ETC_GSHADOW):
+        return
+    with open(ETC_GSHADOW) as f:
+        if any(line.split(":", 1)[0] == group for line in f.read().splitlines()):
+            return
+    append_line(ETC_GSHADOW, f"{group}:!::")
+
+
+def in_etc_group(group):
+    """usermod and gpasswd only edit /etc/group (and /etc/gshadow), but on this system many groups
+    (libvirt among them) are only in /usr/lib/group. Copy the group's line over first, as Bazzite's
+    docs say. False if the files can't be read or written."""
+    try:
+        in_gshadow(group)
+        with open(ETC_GROUP) as f:
+            text = f.read()
+        if any(line.split(":", 1)[0] == group for line in text.splitlines()):
+            return True
+        try:
+            with open(LIB_GROUP) as f:
+                line = next((l for l in f.read().splitlines() if l.split(":", 1)[0] == group), None)
+        except FileNotFoundError:
+            line = None
+        if line is None:
+            return True     # nothing to copy: the group is in /etc/group or nowhere
+        append_line(ETC_GROUP, line)
+        return True
+    except OSError as e:
+        print(f"could not copy {group} into {ETC_GROUP}: {e}", file=sys.stderr)
+        return False
 
 
 def members(group):
@@ -151,6 +195,7 @@ def turn_on(rec):
     # VM rights for administrators.
     if members("libvirt") is None:
         failed |= not ok("groupadd", "--system", "libvirt")
+    failed |= not in_etc_group("libvirt")
     have = members("libvirt") or []
     wheel = members("wheel")
     admins = wheel or []

@@ -1,0 +1,14 @@
+[Unit]
+Description=Forge OS: create the forge and ollama system users if they are missing
+# They come from sysusers.d, which systemd-sysusers.service applies when /etc needs an update. After
+# a rebase from Bazzite that is not certain, so the services that run as them pull this in first.
+# (It has no User=: a service with User= can't create its own user, even in a "+" command.)
+DefaultDependencies=no
+After=systemd-sysusers.service
+Before=shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/systemd-sysusers forge.conf ollama.conf

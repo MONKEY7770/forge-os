@@ -71,6 +71,7 @@ modules:
       - install-video-wallpaper.sh
       # Wallpaper Engine backgrounds: optional, skipped until a version and key are pinned in the script.
       - install-wallpaper-engine.sh
+      - brand-os-release.sh   # "Forge OS" as the system's name (display names only)
       - finalize.sh
 
   # 4. Services that start on boot.

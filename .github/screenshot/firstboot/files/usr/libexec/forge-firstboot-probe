@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""forge-firstboot-probe: runs inside the first-boot test VM only (never in the real image).
+
+Reports the first boot of a system with no account to the runner's forge_screenshot.py (firstboot)
+over the virtio serial port org.forgeos.probe. It only reads state; it creates no account.
+  -> "FORGE-PROBE started"
+  -> "FORGE-PROBE state unit=<word> session=yes|no regular=<n> setup-uid=<n>|none wheel=yes|no
+                        wizard=yes|no autologin=yes|no"
+        when something changes, and at least once a minute:
+        unit       plasma-setup.service: waiting, disabled, running, ran, skipped-condition,
+                   skipped-exec-condition, failed or not-loaded
+        session    a graphical session (loginctl) of the user plasma-setup is active
+        regular    accounts with UID 1000 to 60000 (getent passwd)
+        setup-uid  UID of the user plasma-setup
+        wheel      /etc/group has the wheel group
+        wizard     the wizard (process plasma-setup) runs as the user plasma-setup
+        autologin  /etc/plasmalogin.conf.d/99-plasma-setup.conf exists (written by Plasma Setup's bootutil)
+  <- "send-logs"
+  -> "FORGE-PROBE log <line>" ... then "FORGE-PROBE logs-end"
+        the journal of plasma-setup and plasmalogin for this boot, failed units, sessions, and the
+        plasma-setup user's own journal
+"""
+import os
+import re
+import select
+import subprocess
+import sys
+import time
+
+PORT = "/dev/virtio-ports/org.forgeos.probe"
+UNIT = "plasma-setup.service"
+SETUP_USER = "plasma-setup"
+AUTOLOGIN = "/etc/plasmalogin.conf.d/99-plasma-setup.conf"
+SYSTEMCTL, LOGINCTL, JOURNALCTL, GETENT = "/usr/bin/systemctl", "/usr/bin/loginctl", "/usr/bin/journalctl", "/usr/bin/getent"
+UNIT_PROPS = ("LoadState", "UnitFileState", "ActiveState", "SubState", "Result", "ConditionResult",
+              "ConditionTimestampMonotonic", "ExecMainStartTimestampMonotonic", "ExecMainStatus")
+SESSION_PROPS = ("Name", "Type", "State", "Active", "Class")
+ENV = {"PATH": "/usr/bin:/usr/sbin", "LANG": "C.UTF-8", "SYSTEMD_COLORS": "0", "SYSTEMD_PAGER": "",
+       "SYSTEMD_LESS": ""}
+_SESSION_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+
+
+def run(argv, timeout=30, stderr=False):
+    """Output of a command as text ("" when it can't run)."""
+    try:
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, env=ENV)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"({argv[0]} could not run: {e.__class__.__name__})\n" if stderr else ""
+    out = r.stdout.decode("utf-8", "replace")
+    return out + r.stderr.decode("utf-8", "replace") if stderr else out
+
+
+def props(text):
+    """systemctl/loginctl show output (Key=Value lines) -> dict."""
+    out = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            out[key.strip()] = value.strip()
+    return out
+
+
+def _set(value):
+    return value not in ("", "0", None)
+
+
+def unit_status(p):
+    """One word for plasma-setup.service from its systemctl show properties."""
+    if p.get("LoadState") != "loaded":
+        return "not-loaded"
+    if p.get("Result") == "exec-condition":
+        return "skipped-exec-condition"
+    if _set(p.get("ConditionTimestampMonotonic")) and p.get("ConditionResult") == "no":
+        return "skipped-condition"
+    if p.get("ActiveState") == "failed" or p.get("Result", "success") != "success":
+        return "failed"
+    if p.get("ActiveState") in ("activating", "deactivating", "reloading", "refreshing"):
+        return "running"
+    if _set(p.get("ExecMainStartTimestampMonotonic")):
+        return "ran"
+    if p.get("UnitFileState") == "disabled":
+        return "disabled"
+    return "waiting"
+
+
+def wizard_session(sessions, user=SETUP_USER):
+    """True if one of the sessions (loginctl show-session properties) is an active graphical
+    session of user."""
+    for s in sessions:
+        if (s.get("Name") == user and s.get("Type") in ("wayland", "x11") and s.get("Class", "").startswith("user")
+                and (s.get("Active") == "yes" or s.get("State") == "active")):
+            return True
+    return False
+
+
+def _passwd(text):
+    for line in text.splitlines():
+        f = line.split(":")
+        if len(f) >= 3 and f[2].isdigit():
+            yield f[0], int(f[2])
+
+
+def regular_count(passwd_text):
+    return sum(1 for _, uid in _passwd(passwd_text) if 1000 <= uid <= 60000)
+
+
+def uid_of(passwd_text, name):
+    for n, uid in _passwd(passwd_text):
+        if n == name:
+            return uid
+    return None
+
+
+def has_wheel(group_text):
+    return any(line.startswith("wheel:") for line in group_text.splitlines())
+
+
+def running(proc_root, uid, name):
+    """True if a process called name runs as uid (from /proc/<pid>/comm and status)."""
+    try:
+        pids = [p for p in os.listdir(proc_root) if p.isdigit()]
+    except OSError:
+        return False
+    for pid in pids:
+        try:
+            with open(os.path.join(proc_root, pid, "comm")) as f:
+                if f.read().strip() != name:
+                    continue
+            with open(os.path.join(proc_root, pid, "status")) as f:
+                for line in f:
+                    if line.startswith("Uid:") and line.split()[1] == str(uid):
+                        return True
+        except (OSError, IndexError):
+            continue
+    return False
+
+
+def sessions(run_fn=run):
+    out = []
+    for line in run_fn([LOGINCTL, "list-sessions", "--no-legend", "--no-pager"]).splitlines():
+        parts = line.split()
+        if parts and _SESSION_ID.fullmatch(parts[0]):
+            argv = [LOGINCTL, "show-session", parts[0], "--no-pager"]
+            for p in SESSION_PROPS:
+                argv += ["-p", p]
+            out.append(props(run_fn(argv)))
+    return out
+
+
+def collect(run_fn=run, proc_root="/proc", group_path="/etc/group", autologin=AUTOLOGIN):
+    argv = [SYSTEMCTL, "show", UNIT, "--no-pager"]
+    for p in UNIT_PROPS:
+        argv += ["-p", p]
+    passwd = run_fn([GETENT, "passwd"])
+    try:
+        with open(group_path) as f:
+            group = f.read()
+    except OSError:
+        group = ""
+    uid = uid_of(passwd, SETUP_USER)
+    return {"unit": unit_status(props(run_fn(argv))), "session": wizard_session(sessions(run_fn)),
+            "regular": regular_count(passwd), "setup-uid": uid, "wheel": has_wheel(group),
+            "wizard": uid is not None and running(proc_root, uid, SETUP_USER), "autologin": os.path.exists(autologin)}
+
+
+def state_line(st):
+    yn = {True: "yes", False: "no"}
+    uid = "none" if st["setup-uid"] is None else str(st["setup-uid"])
+    return (f"unit={st['unit']} session={yn[bool(st['session'])]} regular={min(st['regular'], 999999)} "
+            f"setup-uid={uid} wheel={yn[bool(st['wheel'])]} wizard={yn[bool(st['wizard'])]} "
+            f"autologin={yn[bool(st['autologin'])]}")
+
+
+def log_commands(setup_uid):
+    cmds = [[SYSTEMCTL, "show", UNIT, "--no-pager"] + [a for p in UNIT_PROPS for a in ("-p", p)],
+            [SYSTEMCTL, "status", UNIT, "plasmalogin.service", "--no-pager", "--full", "--lines=0"],
+            [SYSTEMCTL, "list-units", "--failed", "--no-pager", "--plain"],
+            [LOGINCTL, "list-sessions", "--no-pager"],
+            [JOURNALCTL, "-b", "-u", UNIT, "-u", "plasmalogin.service", "--no-pager", "-o", "short-monotonic",
+             "-n", "600"]]
+    if setup_uid is not None:
+        cmds.append([JOURNALCTL, "-b", f"_UID={int(setup_uid)}", "--no-pager", "-o", "short-monotonic", "-n", "300"])
+    return cmds
+
+
+def guest_logs(st, run_fn=run):
+    lines = []
+    for argv in log_commands(st.get("setup-uid") if st else None):
+        lines.append("## " + " ".join([os.path.basename(argv[0])] + argv[1:]))
+        lines += run_fn(argv, timeout=60, stderr=True).splitlines()
+        lines.append("")
+    return lines
+
+
+def say(fd, text):
+    os.write(fd, f"FORGE-PROBE {text}\n".encode("utf-8", "replace"))
+
+
+def read_commands(fd, buf, timeout):
+    """Complete command lines from the runner within timeout -> ([commands], rest)."""
+    ready, _, _ = select.select([fd], [], [], timeout)
+    if ready:
+        chunk = os.read(fd, 256)
+        if not chunk:          # no runner connected: don't spin
+            time.sleep(timeout)
+        buf = (buf + chunk)[-1024:]
+    *lines, rest = buf.split(b"\n")
+    return [x.decode("ascii", "replace").strip() for x in lines], rest
+
+
+def serve(fd, collect_fn=collect, logs_fn=guest_logs, poll=5.0, heartbeat=60.0, max_runtime=4 * 3600.0):
+    say(fd, "started")
+    end = time.monotonic() + max_runtime
+    last, last_at, buf, st = None, 0.0, b"", None
+    while time.monotonic() < end:
+        try:
+            st = collect_fn()
+            line = state_line(st)
+            now = time.monotonic()
+            if line != last or now - last_at >= heartbeat:
+                say(fd, f"state {line}")
+                last, last_at = line, now
+            cmds, buf = read_commands(fd, buf, poll)
+            for cmd in cmds:
+                if cmd == "send-logs":
+                    for text in logs_fn(st):
+                        say(fd, f"log {text[:280] or ' '}")
+                    say(fd, "logs-end")
+        except OSError:
+            time.sleep(poll)   # the runner went away for a moment; keep going
+
+
+def main():
+    deadline = time.monotonic() + 600
+    while not os.path.exists(PORT):
+        if time.monotonic() > deadline:
+            return 1
+        time.sleep(2)
+    fd = os.open(PORT, os.O_RDWR | os.O_CLOEXEC)
+    try:
+        serve(fd)
+    finally:
+        os.close(fd)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

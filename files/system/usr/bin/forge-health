@@ -120,13 +120,20 @@ If that was not on purpose, see: forge-api GET /api/system/updates"
 fi
 
 # Log every run, notify only on problems
+# Each problem is shown once (numbers such as temperatures may change), not every 10 minutes: only a
+# problem not shown before brings the alert back. A healthy run forgets what was shown.
+SHOWN="$STATE_DIR/health-shown"
 if [ ${#problems[@]} -eq 0 ]; then
   echo "$(date -Is) ok ${gpu_line:-} mem_free=${mem_avail}G" >> "$LOG"
+  rm -f "$SHOWN"
 else
   msg=$(printf '%s\n' "${problems[@]}")
   echo "$(date -Is) PROBLEM ${msg//$'\n'/; }" >> "$LOG"
-  if [ "$(cfg monitor.notify)" = "on" ]; then
+  kinds=$(printf '%s\n' "${problems[@]}" | sed 's/[0-9][0-9]*/N/g' | sort -u)
+  if [ "$(cfg monitor.notify)" = "on" ] && [ -n "$(comm -23 <(printf '%s\n' "$kinds") <(sort -u "$SHOWN" 2>/dev/null))" ]; then
     notify critical "Forge OS health" "$msg"
+    printf '%s\n' "$kinds" | sort -u - "$SHOWN" 2>/dev/null > "$SHOWN.tmp" || printf '%s\n' "$kinds" > "$SHOWN.tmp"
+    mv "$SHOWN.tmp" "$SHOWN"
   fi
 fi
 

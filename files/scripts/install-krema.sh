@@ -15,8 +15,9 @@
 # FORGE_KREMA_ROOT and FORGE_KEY_TEST_DIR are only for tests.
 set -uo pipefail
 
-KREMA_VERSION=""
-KREMA_KEY_FPR=""
+# Reviewed 2026-11-23: newest COPR build for Fedora 45, key of the COPR project isac322/krema.
+KREMA_VERSION="0.13.0-1.fc45"
+KREMA_KEY_FPR="18B2C521BF9E618E9F9D950C124E1771EDE61218"
 
 KEY_URL="https://download.copr.fedorainfracloud.org/results/isac322/krema/pubkey.gpg"
 ROOT=${FORGE_KREMA_ROOT:-}

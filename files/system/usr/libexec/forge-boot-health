@@ -3,7 +3,7 @@
 
 greenboot (shipped by Bazzite) runs /usr/lib/greenboot/check/required.d/60_forge_boot_health.sh
 at every start, which runs "forge-boot-health check". Exit code 3 means "this start is broken";
-greenboot then restarts the PC, and after 4 failed starts of a new system version goes back to
+greenboot then restarts the PC, and after 3 failed starts of a new system version goes back to
 the previous one. Every other exit code passes, so a bug here can never roll back a good update.
 
 It only fails on the first start(s) of a new system version: greenboot's mark

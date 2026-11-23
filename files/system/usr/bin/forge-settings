@@ -880,7 +880,9 @@ def main():
     if os.geteuid() == 0:
         sys.exit("forge-settings: don't run this as root. Run it as your normal user; "
                  "saving asks for your password.")
-    if args == ["--welcome-once"] and not first_welcome():
+    # The welcome page is for people, not system accounts such as Plasma Setup's temporary user,
+    # whose session runs the first-boot wizard (it would open on top of it).
+    if args == ["--welcome-once"] and (os.getuid() < 1000 or not first_welcome()):
         return
     DASHBOARD = args == ["--dashboard"]
     if DASHBOARD:

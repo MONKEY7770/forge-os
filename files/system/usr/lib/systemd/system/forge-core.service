@@ -1,4 +1,7 @@
 [Unit]
+# Its user comes from sysusers.d: forge-sysusers.service makes sure it exists (also after a rebase).
+Requires=forge-sysusers.service
+After=forge-sysusers.service
 Description=Forge Core API (settings, monitoring, AI models)
 After=network.target ollama.service
 

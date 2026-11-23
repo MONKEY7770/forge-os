@@ -1,4 +1,5 @@
 [Unit]
+ConditionUser=!@system
 Description=Forge OS home folder backup (only runs if turned on and due)
 
 [Service]

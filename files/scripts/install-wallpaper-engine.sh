@@ -17,8 +17,10 @@
 # and no repo file is left in the image, so updates never pull an unpinned build.
 set -euo pipefail
 
-WE_VERSION=""
-WE_KEY_FPR=""
+# Reviewed 2026-11-23: newest COPR build that succeeded (the project publishes commit snapshots of
+# 1.5, not tagged releases), key of the COPR project captsilver666/wallpaper-engine-kde-plugin.
+WE_VERSION="1.5^20261108.192.g8173e09-1.fc45"
+WE_KEY_FPR="44E8D456D5C4D6C6F9672E5E4BEA2DC31EEAD2C7"
 WE_PACKAGE="wallpaper-engine-kde-plugin-qt6"
 WE_REPO="https://download.copr.fedorainfracloud.org/results/captsilver666/wallpaper-engine-kde-plugin/fedora-\$releasever-\$basearch/"
 WE_KEY_URL="https://download.copr.fedorainfracloud.org/results/captsilver666/wallpaper-engine-kde-plugin/pubkey.gpg"
@@ -27,7 +29,7 @@ if [[ -z "${WE_VERSION}" && -z "${WE_KEY_FPR}" ]]; then
   echo "install-wallpaper-engine: skipped, no pinned version. Wallpaper Engine support is not included in this build."
   exit 0
 fi
-if [[ ! "${WE_VERSION}" =~ ^[0-9][0-9A-Za-z.+~_]*-[0-9A-Za-z.+~_]+$ ]]; then
+if [[ ! "${WE_VERSION}" =~ ^[0-9][0-9A-Za-z.+~^_]*-[0-9A-Za-z.+~^_]+$ ]]; then
   echo "install-wallpaper-engine: WE_VERSION must be an exact version-release like 1.5-1.fc45 (got '${WE_VERSION}')." >&2
   exit 1
 fi
@@ -38,7 +40,15 @@ fi
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "${tmp}"' EXIT
-curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "${tmp}/key" "${WE_KEY_URL}"
+# COPR not reachable: the image is built without it (a pinned feature must not stop every daily
+# build). A key that does not match still stops the build.
+not_installed() {
+  echo "install-wallpaper-engine: Wallpaper Engine NOT installed: $*"
+  echo "install-wallpaper-engine: the image is built without it; Forge Settings says Wallpaper Engine support is not included in this build."
+  exit 0
+}
+curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "${tmp}/key" "${WE_KEY_URL}" \
+  || not_installed "the signing key could not be downloaded"
 mkdir -m 0700 "${tmp}/gnupg"
 got=$(GNUPGHOME="${tmp}/gnupg" gpg --batch --with-colons --show-keys "${tmp}/key" 2>/dev/null \
       | awk -F: '$1=="pub"{p=1; next} p && $1=="fpr"{print $10; p=0}' | tr '\n' ' ')
@@ -49,10 +59,19 @@ if [[ "${got}" != "${WE_KEY_FPR} " ]]; then
   exit 1
 fi
 install -m 0644 "${tmp}/key" "${tmp}/forge-wallpaper-engine.gpg"
-dnf -y install \
+if ! dnf -y install \
   --repofrompath="forge-wallpaper-engine,${WE_REPO}" \
   --setopt="forge-wallpaper-engine.gpgcheck=1" \
   --setopt="forge-wallpaper-engine.gpgkey=file://${tmp}/forge-wallpaper-engine.gpg" \
-  "${WE_PACKAGE}-${WE_VERSION}"
+  "${WE_PACKAGE}-${WE_VERSION}" 2> "${tmp}/dnf.err"; then
+  cat "${tmp}/dnf.err" >&2
+  # Only COPR being unreachable skips it. Anything else (the pinned build is gone, a signature that
+  # does not match the pinned key, a conflict) stops the build, so it is never dropped quietly.
+  if grep -qiE "curl error|cannot download|failed to download|could not resolve|timeout was reached|connection (refused|reset|timed out)" "${tmp}/dnf.err"; then
+    not_installed "COPR could not be reached"
+  fi
+  echo "install-wallpaper-engine: dnf could not install ${WE_PACKAGE}-${WE_VERSION} (see above). Check the pin." >&2
+  exit 1
+fi
 test -f /usr/share/plasma/wallpapers/com.github.captsilver.wallpaperEngineKde/metadata.json
 echo "install-wallpaper-engine: ${WE_PACKAGE}-${WE_VERSION} installed."

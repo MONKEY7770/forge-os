@@ -77,7 +77,9 @@ class SettingsSchemaTests(unittest.TestCase):
 
     def test_help_is_accurate(self):
         rb = self.by["updates.auto_rollback"]["help"]
-        self.assertIn("4 failed starts", rb)
+        # greenboot sets boot_counter to 3 before the restart; GRUB counts it down on each start of
+        # the new version and boots the previous one when it reaches 0: 3 failed starts.
+        self.assertIn("3 failed starts", rb)
         ch = self.by["updates.channel"]["help"]
         self.assertNotIn("boot menu", ch, "the boot menu does not change the channel updates come from")
         import forgerelease

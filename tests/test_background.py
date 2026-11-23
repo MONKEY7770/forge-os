@@ -1125,15 +1125,20 @@ class WallpaperEngineOptionalTest(unittest.TestCase):
         fakebin = os.path.join(self.tmp, "bin")
         os.makedirs(fakebin, exist_ok=True)
         for name in ("curl", "dnf", "gpg"):
+            if os.path.exists(os.path.join(fakebin, name)):
+                continue        # a test's own fake stays
             with open(os.path.join(fakebin, name), "w") as f:
                 f.write(f'#!/bin/sh\necho "{name} $*" >> "{self.tmp}/ran"\nexit 1\n')
             os.chmod(os.path.join(fakebin, name), 0o755)
         return subprocess.run(["bash", p], capture_output=True, text=True, timeout=30,
                               env=dict(os.environ, PATH=fakebin + ":/usr/bin:/bin"))
 
-    def test_shipped_pins_are_empty_so_the_build_skips_it_with_a_clear_line(self):
-        self.assertRegex(self.text, r'(?m)^WE_VERSION=""$')
-        self.assertRegex(self.text, r'(?m)^WE_KEY_FPR=""$')
+    def test_shipped_pins_are_the_reviewed_ones(self):
+        # Reviewed 2026-11-23: the newest COPR build that succeeded, and the COPR project's key.
+        self.assertIn('WE_VERSION="1.5^20261108.192.g8173e09-1.fc45"\n', self.text)
+        self.assertIn('WE_KEY_FPR="44E8D456D5C4D6C6F9672E5E4BEA2DC31EEAD2C7"\n', self.text)
+
+    def test_empty_pins_skip_it_with_a_clear_line(self):
         r = self.run_copy("", "")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("Wallpaper Engine support is not included in this build", r.stdout)
@@ -1150,9 +1155,49 @@ class WallpaperEngineOptionalTest(unittest.TestCase):
         self.assertIn('"${WE_PACKAGE}-${WE_VERSION}"', self.text)
         self.assertNotIn("copr enable", self.text)
         self.assertNotIn("/etc/yum.repos.d", self.text, "no repo file may stay in the image")
-        # A full pin with a key that does not match: the build stops (curl fails here: no network).
+
+    def fake(self, name, body):
+        path = os.path.join(self.tmp, "bin", name)
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\n" + body)
+        os.chmod(path, 0o755)
+
+    def test_no_network_skips_it_without_stopping_the_build(self):
+        # Pinned now: a COPR outage must not stop every daily build (Krema behaves the same way).
+        r = self.run_copy("1.5-1.fc45", "A" * 40)     # curl fails here: no network
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Wallpaper Engine NOT installed: the signing key could not be downloaded", r.stdout)
+
+    def test_a_key_that_does_not_match_stops_the_build(self):
+        self.run_copy("", "")                           # makes the fake tools
+        self.fake("curl", 'while [ $# -gt 0 ]; do [ "$1" = -o ] && echo key > "$2"; shift; done\n')
+        self.fake("gpg", 'echo "pub:-:2048:1:X:1::::"\necho "fpr:::::::::' + "B" * 40 + ':"\n')
         r = self.run_copy("1.5-1.fc45", "A" * 40)
         self.assertNotEqual(r.returncode, 0)
+        self.assertIn("does not match the pinned fingerprint", r.stderr)
+
+    def dnf_fails_with(self, message):
+        self.run_copy("", "")
+        self.fake("curl", 'while [ $# -gt 0 ]; do [ "$1" = -o ] && echo key > "$2"; shift; done\n')
+        self.fake("gpg", 'echo "pub:-:2048:1:X:1::::"\necho "fpr:::::::::' + "A" * 40 + ':"\n')
+        self.fake("dnf", f'echo "{message}" >&2\nexit 1\n')
+        return self.run_copy("1.5-1.fc45", "A" * 40)
+
+    def test_network_errors_skip_it(self):
+        for msg in ("Curl error (6): Couldn't resolve host name", "Failed to download metadata for repo",
+                    "Librepo error: Cannot download repomd.xml", "Curl error (28): Timeout was reached"):
+            r = self.dnf_fails_with(msg)
+            self.assertEqual(r.returncode, 0, (msg, r.stderr))
+            self.assertIn("Wallpaper Engine NOT installed: COPR could not be reached", r.stdout, msg)
+
+    def test_other_dnf_errors_stop_the_build(self):
+        # Review finding: a wrong or deleted pinned build, or a package not signed by the pinned key,
+        # must not quietly drop Wallpaper Engine from every build.
+        for msg in ("No match for argument: wallpaper-engine-kde-plugin-qt6-1.5-1.fc45",
+                    "OpenPGP check for package failed", "Transaction failed", ""):
+            r = self.dnf_fails_with(msg)
+            self.assertNotEqual(r.returncode, 0, msg)
+            self.assertIn("dnf could not install", r.stderr, msg)
 
     def test_recipe_and_finalize(self):
         with open(RECIPE) as f:
@@ -1597,3 +1642,34 @@ class InstalledButNotRunningTest(BackendBase):
         self.assertEqual(rc, 0, out)
         self.assertIn("crash guard is off", out)
         self.assertEqual(self.calls("systemd-run"), [])
+
+
+class SysfsSizeTest(unittest.TestCase):
+    """Review finding: sysfs files always report a size of 4096, so the 64 byte size check rejected
+    every connector status and the screen list was always empty on a real PC."""
+
+    def test_connector_status_with_sysfs_size(self):
+        mod = load_backend()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        os.makedirs(os.path.join(tmp, "card1-DP-1"))
+        with open(os.path.join(tmp, "card1-DP-1", "status"), "w") as f:
+            f.write("connected\n")
+        real = os.fstat
+
+        def sysfs_fstat(fd):
+            st = real(fd)
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid, st.st_gid, 4096,
+                                   st.st_atime, st.st_mtime, st.st_ctime))
+        with mock.patch.dict(os.environ, {"FORGE_SYS_DRM": tmp}), mock.patch.object(mod.os, "fstat", sysfs_fstat):
+            self.assertEqual(mod.connectors(), ["DP-1"])
+
+    def test_long_status_is_still_refused(self):
+        mod = load_backend()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        os.makedirs(os.path.join(tmp, "card1-DP-1"))
+        with open(os.path.join(tmp, "card1-DP-1", "status"), "w") as f:
+            f.write("connected" + " " * 100)
+        with mock.patch.dict(os.environ, {"FORGE_SYS_DRM": tmp}):
+            self.assertEqual(mod.connectors(), [])

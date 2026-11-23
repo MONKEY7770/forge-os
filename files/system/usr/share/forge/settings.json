@@ -243,7 +243,7 @@
      "restart": "boot"},
     {"key": "updates.auto_rollback", "group": "updates", "machine": true, "type": "toggle", "default": true,
      "label": "Go back automatically if an update fails to start", "tags": ["updates", "recovery", "boot", "rollback"],
-     "help": "Only on the first start of a new system version: if the login screen fails to start, or the NVIDIA driver does not load although it loaded on the last good start, the PC restarts and tries again, and after 4 failed starts goes back to the previous version. Optional Forge services and a slow or USB key disk unlock never count. Off keeps a new version even when these checks fail.",
+     "help": "Only on the first start of a new system version: if the login screen fails to start, or the NVIDIA driver does not load although it loaded on the last good start, the PC restarts and tries again, and after 3 failed starts goes back to the previous version. Optional Forge services and a slow or USB key disk unlock never count. Off keeps a new version even when these checks fail.",
      "restart": "boot"},
     {"key": "gaming.overlay", "group": "gaming", "type": "select", "default": "off", "options": ["off", "minimal", "full"],
      "label": "Game overlay (MangoHud)", "tags": ["gaming", "overlay", "fps", "performance"],

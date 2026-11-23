@@ -131,15 +131,16 @@ def clean_title(s, limit=80):
     return " ".join(s.split())[:limit].strip()
 
 
-def read_small(path, limit, dir_fd=None):
-    """Bytes of a regular file of at most limit bytes, never following a link, never blocking. None otherwise."""
+def read_small(path, limit, dir_fd=None, sized=True):
+    """Bytes of a regular file of at most limit bytes, never following a link, never blocking. None otherwise.
+    sized=False for sysfs files, which always report 4096 bytes: only what is read counts then."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
     except OSError:
         return None
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+        if not stat.S_ISREG(st.st_mode) or (sized and st.st_size > limit):
             return None
         data = b""
         while len(data) <= limit:
@@ -520,7 +521,7 @@ def connectors():
         m = re.fullmatch(r"card[0-9]{1,3}-(.+)", name)
         if not m or not re.fullmatch(CONNECTOR_RE, m.group(1)):
             continue
-        data = read_small(os.path.join(root, name, "status"), 64)
+        data = read_small(os.path.join(root, name, "status"), 64, sized=False)
         if data and data.strip() == b"connected" and m.group(1) not in out:
             out.append(m.group(1))
     return sorted(out)

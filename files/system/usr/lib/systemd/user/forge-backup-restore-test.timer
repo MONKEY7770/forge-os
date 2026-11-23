@@ -1,4 +1,5 @@
 [Unit]
+ConditionUser=!@system
 Description=Check a few times a day whether the monthly Forge OS backup restore test is due
 
 [Timer]

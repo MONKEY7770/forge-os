@@ -69,8 +69,9 @@ SECRET_WORDS = {"password", "passwd", "passphrase", "secret", "token", "cookie",
 SOFT_NAMES = {"pin", "pw"}
 FOREIGN_WORDS = {"passwort", "kennwort", "contrasena", "senha", "wachtwoord", "losenord", "salasana", "haslo",
                  "heslo", "jelszo", "sifre", "passord", "adgangskode", "parool", "пароль", "密码", "密碼",
-                 "パスワード", "비밀번호"}
+                 "パスワード", "비밀번호", "รหสผาน", "พาสเวรด"}   # Thai: รหัสผ่าน, พาสเวิร์ด without marks
 FOREIGN_PAIRS = {"depasse", "katasandi"}
+THAI_PASSWORD_WORDS = ("รหสผาน", "พาสเวรด")    # รหัสผ่าน, พาสเวิร์ด without marks, also inside a longer name
 # Only these names count when a tab is the only separator ("password<TAB>x"): "Session<TAB>42" and
 # "secret<TAB>not set" are table columns, not secrets.
 TAB_WORDS = {"password", "passwd", "passphrase", "pwd", "pgpassword", "apikey", "privatekey", "apitoken"}
@@ -143,12 +144,17 @@ CREATE INDEX IF NOT EXISTS audit_ts ON audit(ts);
 
 
 _WORD_SPLIT = re.compile(r"[\W_]+")
+# Thai vowel and tone marks: part of a word, not a break (รหัสผ่าน is one word). Removed before
+# words are compared, like accents.
+THAI_MARKS = "\u0e31\u0e34-\u0e3a\u0e47-\u0e4e"
+_THAI_MARK = re.compile(f"[{THAI_MARKS}]")
 
 
 def _split_words(name):
     name = _CAMEL_2.sub(r"\1_\2", _CAMEL_1.sub(r"\1_\2", name))
     if not name.isascii():
         name = "".join(c for c in unicodedata.normalize("NFKD", name) if not unicodedata.combining(c))
+        name = _THAI_MARK.sub("", name)
     return tuple(w for w in _WORD_SPLIT.split(name.lower()) if w)
 
 
@@ -241,7 +247,7 @@ def _plain(text):
 # Secret pairs anywhere, also inside another pair's value ("login failed: password=x", where the
 # pattern above reads "failed" = "password=x"). Only name and separator are matched here, so no value
 # hides the next name; the value is then matched at that spot. Tabs and full-width : and = separate too.
-_NAME_SEP = re.compile(r"(?<![\w.\-])([^\W\d][\w.\-]{0,63})([ \t]*[:=\uff1a\uff1d]>?[ \t]*|\t+)")
+_NAME_SEP = re.compile(rf"(?<![\w{THAI_MARKS}.\-])([^\W\d][\w{THAI_MARKS}.\-]{{0,63}})([ \t]*[:=\uff1a\uff1d]>?[ \t]*|\t+)")
 _PAIR_VALUE = re.compile(r"\"[^\"\n]*\"?|'[^'\n]*'?|\[[^\]\n]*\]?|<[^>\n]*>?"
                          r"|\([^)\n]*\)?|`[^`\n]*`?|[^\s,;&\"'<>]+")
 PAIR_HITS_MAX = 2000   # past this many secret names in one text, the rest of the text is hidden (speed)
@@ -285,6 +291,9 @@ def _weak_kind_uncached(name):
     pairs = {a + b for a, b in zip(words, words[1:])}
     if set(words) & FOREIGN_WORDS or pairs & FOREIGN_PAIRS:
         return "foreign"
+    # Thai writes no spaces between words: "new password" is one name that contains the word.
+    if not str(name).isascii() and any(t in w for w in words for t in THAI_PASSWORD_WORDS):
+        return "foreign"
     return None
 
 
@@ -311,6 +320,22 @@ def _tab_name(name):
 WEAK_LOOK = 64
 _WEAK_VALUE = re.compile(r"\"[^\"\n]{0,64}\"?|'[^'\n]{0,64}'?|\[[^\]\n]{0,64}\]?|<[^>\n]{0,64}>?"
                          r"|\([^)\n]{0,64}\)?|`[^`\n]{0,64}`?|[^\s,;&\"'<>]{1,64}")
+
+
+_CLOSING = {'"': '"', "'": "'", "[": "]", "<": ">", "(": ")", "`": "`"}
+_BARE_VALUE_CHAR = re.compile(r"[^\s,;&\"'<>]")
+
+
+def _weak_cut(text, w):
+    """True when the value goes on past the WEAK_LOOK characters that were looked at. Such a value is
+    hidden: whatever follows the first 64 characters was never judged."""
+    s, end = w.group(0), w.end()
+    if end >= len(text):
+        return False
+    if s[0] in _CLOSING:
+        closed = len(s) > 1 and s.endswith(_CLOSING[s[0]])
+        return not closed and text[end] != "\n"
+    return len(s) >= WEAK_LOOK and _BARE_VALUE_CHAR.match(text, end) is not None
 
 
 def _hide_jwts(text):
@@ -365,7 +390,9 @@ def _hide_secret_pairs(text):
             # Decided on at most WEAK_LOOK characters, so text like "pin:(pin:(pin:(..." stays linear.
             # A value that is kept is not skipped: a real secret pair can be inside it.
             w = _WEAK_VALUE.match(text, m.end())
-            if not w or w.group(0).startswith(HIDDEN) or not _weak_value_hidden(name, w.group(0)):
+            if not w or w.group(0).startswith(HIDDEN):
+                continue
+            if not _weak_cut(text, w) and not _weak_value_hidden(name, w.group(0)):
                 continue
         v = _PAIR_VALUE.match(text, m.end())      # hidden to its end, however long
         if not v or v.group(0).startswith(HIDDEN):

@@ -1,4 +1,5 @@
 [Unit]
+ConditionUser=!@system
 Description=Forge OS: open the drive shared with Windows
 Documentation=man:udisksctl(1)
 # Needs the desktop for notifications and for udisks to see an active login.

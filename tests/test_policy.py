@@ -704,6 +704,45 @@ class EdgeCoversTheLongestPatternTest(unittest.TestCase):
         self.assertGreaterEqual(P.EDGE, 4096 * 2)
 
 
+class ThaiAndLongWeakValueTests(unittest.TestCase):
+    """Review findings: the Thai word for password was not recognised (the word was split at its
+    vowel mark), and a weak name's value was judged on its first 64 characters only, so a secret
+    after 64 harmless ones stayed visible."""
+
+    def clean(self, text):
+        return P.clean_details({"m": text})["m"]
+
+    def test_thai_password_words(self):
+        for text in ("รหัสผ่าน: Zq8v12ab", "รหัสผ่าน = mysecret99", "พาสเวิร์ด: Zq8v12ab"):
+            self.assertNotIn("Zq8v12ab", self.clean(text), text)
+            self.assertNotIn("mysecret99", self.clean(text), text)
+        self.assertEqual(P.clean_details({"รหัสผ่าน": "x"}), {"รหัสผ่าน": P.HIDDEN})
+
+    def test_thai_password_words_inside_longer_names(self):
+        # Review finding: Thai has no spaces between words, so "new password" or "please enter the
+        # password" is one name that only contains the word.
+        for text in ("รหัสผ่านใหม่: Zq8v12ab", "กรุณาใส่รหัสผ่าน: Zq8v12ab", "ยืนยันพาสเวิร์ด = Zq8v12ab"):
+            self.assertNotIn("Zq8v12ab", self.clean(text), text)
+        self.assertEqual(P.clean_details({"รหัสผ่านใหม่": "x"}), {"รหัสผ่านใหม่": P.HIDDEN})
+
+    def test_ordinary_thai_text_stays(self):
+        for text in ("ผ่านการทดสอบ: 12 ข้อ", "รหัสไปรษณีย์: 10110", "สถานะ: ผ่าน"):
+            self.assertEqual(self.clean(text), text)
+
+    def test_secret_after_64_harmless_characters(self):
+        for text in ("PIN: " + "0" * 64 + "secret123abc", "pw: " + "1" * 70 + "abcdef9",
+                     "pin: \"" + "0" * 70 + "abc9\"", "пароль: " + "0" * 80 + "zz9"):
+            out = self.clean(text)
+            self.assertNotIn("secret123abc", out, text)
+            self.assertNotIn("abcdef9", out, text)
+            self.assertNotIn("abc9", out, text)
+            self.assertNotIn("zz9", out, text)
+
+    def test_short_weak_values_still_judged(self):
+        for text in ("GPIO pin: 17", "PW: 120W", "pin: \"17\"", "PW: " + "1" * 64):
+            self.assertEqual(self.clean(text), text)
+
+
 class DeepNestingTest(unittest.TestCase):
     """Python 3.15 (Fedora 45) parses 100000 nested brackets that older Pythons refused, and the
     parsed value then reached clean_details, which walked it recursively: RecursionError, so a

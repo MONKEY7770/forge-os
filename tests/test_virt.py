@@ -68,6 +68,10 @@ elif name == "systemctl":
 elif name == "groupadd":
     gs = groups(); gs[args[-1]] = ("975", []); save_groups(gs)
 elif name == "usermod":
+    # Like the real usermod: it only edits /etc/group, so a group only in /usr/lib/group fails.
+    etc = os.environ.get("FORGE_ETC_GROUP")
+    if etc and not any(l.split(":")[0] == args[-2] for l in open(etc).read().splitlines()):
+        print(f"usermod: group '{args[-2]}' does not exist in /etc/group", file=sys.stderr); sys.exit(6)
     gs = groups(); gid, mem = gs[args[-2]]; mem.append(args[-1]); save_groups(gs)
 elif name == "gpasswd":
     gs = groups(); gid, mem = gs[args[-1]]
@@ -116,10 +120,10 @@ class VirtTest(unittest.TestCase):
         with open(self.conf, "w") as f:
             json.dump({"virt.enabled": on}, f)
 
-    def run_tool(self):
+    def run_tool(self, **extra):
         env = dict(os.environ, FORGE_CONF=self.conf, FORGE_SCHEMA=SCHEMA, FORGE_LIB=LIB, FAKE=self.fake,
                    FORGE_VIRT_STATE=self.state, FORGE_VIRT_ROOT=self.root, FORGE_GROUP_FILE=self.group_file,
-                   PATH=self.bin + ":" + os.environ["PATH"])
+                   PATH=self.bin + ":" + os.environ["PATH"], **extra)
         return subprocess.run([sys.executable, TOOL], env=env, capture_output=True, text=True, timeout=30)
 
     def calls(self):
@@ -167,6 +171,30 @@ class VirtTest(unittest.TestCase):
         self.assertIn("restorecon -rv " + os.path.join(self.root, "var/lib/libvirt"), calls)
         self.assertIn("restorecon -rv " + os.path.join(self.root, "var/log/libvirt"), calls)
         self.assertIn("restart", r.stdout.lower())
+
+    def test_group_only_in_usr_lib_group_is_copied_to_etc_group(self):
+        # Review finding: on Bazzite, libvirt is in /usr/lib/group, which usermod does not edit,
+        # so every "turn on" failed. Its line is copied to /etc/group first (Bazzite's documented way).
+        self.write_groups({"root": [], "wheel": ["alice"], "libvirt": []})
+        etc, lib = os.path.join(self.t, "etc-group"), os.path.join(self.t, "lib-group")
+        with open(etc, "w") as f:
+            f.write("root:x:0:\nwheel:x:10:alice")          # no newline at the end
+        with open(lib, "w") as f:
+            f.write("libvirt:x:974:\n")
+        gshadow = os.path.join(self.t, "gshadow")
+        with open(gshadow, "w") as f:
+            f.write("root:::\n")
+        self.settings(True)
+        r = self.run_tool(FORGE_ETC_GROUP=etc, FORGE_LIB_GROUP=lib, FORGE_ETC_GSHADOW=gshadow)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.members("libvirt"), ["alice"])
+        self.assertEqual(open(etc).read(), "root:x:0:\nwheel:x:10:alice\nlibvirt:x:974:\n")
+        # gpasswd (taking rights away again) also needs the group in /etc/gshadow (review finding).
+        self.assertEqual(open(gshadow).read(), "root:::\nlibvirt:!::\n")
+        self.calls()
+        r = self.run_tool(FORGE_ETC_GROUP=etc, FORGE_LIB_GROUP=lib, FORGE_ETC_GSHADOW=gshadow)    # once only
+        self.assertEqual(open(etc).read().count("libvirt:"), 1)
+        self.assertEqual(open(gshadow).read().count("libvirt:"), 1)
 
     def test_only_administrators_get_vm_rights(self):
         # Managing system VMs is close to root access, so only wheel members get it

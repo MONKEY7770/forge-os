@@ -276,11 +276,11 @@ The first VM install had no user account. Three read-only reviews of first boot,
 
 Krema 0.13.0-1.fc45 and Wallpaper Engine 1.5^20261108.192.g8173e09-1.fc45 are now pinned with their COPR keys (18B2C521BF9E618E9F9D950C124E1771EDE61218, 44E8D456D5C4D6C6F9672E5E4BEA2DC31EEAD2C7). The keys come from COPR over HTTPS (no second source exists); the pins stop a later key change. Both were shown to install into the image in a dry run.
 
-A new CI job boots an install with no account and checks that the Plasma Setup wizard session starts (first run still to come).
+A new CI job boots an install with no account and checks that the Plasma Setup wizard session starts. First run (11-23, this branch's image, real QEMU): passed after 75 s; Plasma Setup's user is UID 967; its automatic login works, which also shows that Plasma Login Manager reads /etc/plasmalogin.conf.d.
 
 Accepted and open (this round):
 - A network that itself hands out 100.64.0.0/10 (some ISPs, hotspots) counts as Tailscale for Ollama's port. Virtual machines and containers can no longer reach Ollama.
-- Not sure: NoNewPrivileges on forge-virt.service under SELinux (domain changes for groupadd, usermod, restorecon); whether Plasma Login Manager reads /etc/plasmalogin.conf.d (the first-boot CI job will show it, as Plasma Setup relies on it too); BlueBuild's "Flatpaks installed" notice may go to the login screen's session.
+- Not sure: NoNewPrivileges on forge-virt.service under SELinux (domain changes for groupadd, usermod, restorecon); BlueBuild's "Flatpaks installed" notice may go to the login screen's session.
 
 ### Scanners (11-19)
 
@@ -297,7 +297,7 @@ USB unlock at boot (initramfs drivers, udev, real lsblk output), the stick mount
 ## Known open risks (not fixed yet)
 
 - **Nothing has been verified on real hardware yet.** Everything above is tested with real tools or simulations only.
-- **The new first-boot CI job has not run yet.** All other GitHub checks run on every push to the test branch and pass.
+- **The first-boot CI job only runs on its own from main or testing** (GitHub starts workflows by hand only from the default branch); it was run once on the test branch through a temporary copy, and passed.
 - **Cloud API keys are stored as plain text** in `/var/lib/forge/secrets.json` (owner-only). Their protection is the disk encryption and file permissions.
 - **Viewer token readable by every program you run.** It can read status, runs and agents, but not secrets, the audit log, policy, approval details or the doctor report, and it can't change anything. Changes need `sudo forge-api`.
 - **Your single USB stick (H:) holds both the disk unlock key and the cosign signing key.** Losing it exposes both. Better: keep the signing key somewhere else, and add a second unlock stick with `forge-usbkey`.

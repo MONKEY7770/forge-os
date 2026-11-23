@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for the first-boot wizard's AI model storage choice
+
+[Path]
+PathExists=/var/lib/forge-setup/storage.ini
+Unit=forge-setup-storage.service
+
+[Install]
+WantedBy=paths.target

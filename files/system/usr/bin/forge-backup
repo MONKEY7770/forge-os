@@ -366,10 +366,12 @@ def publish_activity():
             pass
 
 
-def notify(summary, body):
+def notify(summary, body, urgent=True):
+    """Critical (stays until read) only when data could be lost; reminders are normal."""
     if not shutil.which("notify-send"):
         return
-    subprocess.run(["notify-send", "-u", "critical", "-a", "Forge Backup", "--",
+    subprocess.run(["notify-send", "-u", "critical" if urgent else "normal", "-a", "Forge OS",
+                    "-i", "dialog-warning" if urgent else "drive-harddisk", "--",
                     html.escape(summary), html.escape(body)], capture_output=True, timeout=30)
 
 
@@ -390,7 +392,8 @@ def remind_if_overdue(st, s, now):
     days = int((now - since) // 86400)
     when = f"{days} days" if days >= 1 else f"{int((now - since) // 3600)} hours"
     notify("No backup for " + when,
-           f"Plug in your backup drive {s['backup.drive_label']} so Forge can back up your home folder.")
+           f"Plug in your backup drive {s['backup.drive_label']} so Forge can back up your home folder.",
+           urgent=False)
     private_dir(state_dir())
     write_private(marker, f"{int(now)}\n")
 
@@ -946,7 +949,7 @@ def rt_remind(rt, st, s, now):
         pass
     notify(f"Backup restore test not done for {summary['days_since']} days",
            f"Plug in your backup drive {s['backup.drive_label']}: Forge then tests by itself that your backup "
-           "can be restored. Or open Forge Dashboard, Backups, Test now.")
+           "can be restored. Or open Forge Dashboard, Backups, Test now.", urgent=False)
     write_private(marker, f"{int(now)}\n")
 
 

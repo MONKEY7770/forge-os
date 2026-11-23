@@ -1,0 +1,10 @@
+[Unit]
+Description=Save the first-boot wizard's AI model storage choice in Forge Settings
+# The first apply of the settings comes first; forge-apply waits for any other run itself.
+After=forge-apply-firstboot.service
+
+[Service]
+Type=oneshot
+# Checks the file strictly (numbers in range, nothing else), removes it, then saves the choice
+# through forge-apply --import --merge.
+ExecStart=/usr/libexec/forge-model-guard --apply-setup

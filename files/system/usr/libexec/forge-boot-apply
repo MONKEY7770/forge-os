@@ -551,8 +551,20 @@ def conf_without_theme(text):
     return "\n".join(out)
 
 
+def bar_colors(background):
+    """Progress bar (track, fill) that stays visible on the background: white on grey, or a dark
+    fill on a light track when white would not stand out (contrast below 3:1)."""
+    def lum(h):
+        v = [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+        v = [x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4 for x in v]
+        return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2]
+    white_contrast = 1.05 / (lum(background[1:]) + 0.05)
+    return ("606060", "ffffff") if white_contrast >= 3 else ("c9c6c1", "1c1b19")
+
+
 def theme_text(play, background, logo):
     c = background[1:]
+    track, fill = bar_colors(background)
     fw = "true" if logo else "false"
     modes = "".join(f"\n[{m}]\nUseEndAnimation=false\nUseFirmwareBackground={fw}\n"
                     for m in ("boot-up", "shutdown", "reboot"))
@@ -568,7 +580,7 @@ def theme_text(play, background, logo):
             "TitleVerticalAlignment=.382\nWatermarkHorizontalAlignment=.5\nWatermarkVerticalAlignment=.96\n"
             "Transition=none\nTransitionDuration=0.0\n"
             f"BackgroundStartColor=0x{c}\nBackgroundEndColor=0x{c}\n"
-            "ProgressBarBackgroundColor=0x606060\nProgressBarForegroundColor=0xffffff\n"
+            f"ProgressBarBackgroundColor=0x{track}\nProgressBarForegroundColor=0x{fill}\n"
             "DialogClearsFirmwareBackground=true\nMessageBelowAnimation=true\n"
             + ("ProgressFunction=linear\n" if play == "once" else "") + modes)
 

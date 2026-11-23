@@ -348,7 +348,7 @@ def tell_once_a_day(summary, body):
             return
     except OSError:
         pass
-    run(["notify-send", "-a", "Forge", "--", html.escape(summary), html.escape(body)], 15)
+    run(["notify-send", "-a", "Forge OS", "-i", "input-gaming", "--", html.escape(summary), html.escape(body)], 15)
     try:
         write_atomic(marker, f"{int(time.time())}\n")
     except OSError:

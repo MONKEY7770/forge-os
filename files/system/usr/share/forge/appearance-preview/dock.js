@@ -10,6 +10,7 @@
                  "alignItems", "gap", "padding", "borderRadius", "background", "backdropFilter", "boxShadow",
                  "opacity", "transition", "maxWidth", "maxHeight"];
   const SPEED = {natural: [180, 240], quick: [100, 100], relaxed: [300, 400], instant: [0, 0]};
+  const EASE_OUT = "cubic-bezier(.3, 0, .1, 1)";   // Forge's "temper" curve, the same in and out
 
   const px = n => Math.round(n * 100) / 100 + "px";
   const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, Number(n) || 0));
@@ -50,36 +51,58 @@
     node.style.flexDirection = vertical ? "column" : "row";
   }
 
+  // Hover zoom, at most once per frame: every position is read first (the layout without the zoom), then only
+  // transforms are written. Wave zoom makes room for the bigger icons by moving their neighbors aside (translate),
+  // never by changing margins, so nothing else on the page has to be laid out again. Both ways ease out.
+  const frame = typeof requestAnimationFrame === "function" ? requestAnimationFrame : f => f();
+  const pending = new WeakMap();         // dock element -> the last mouse position not drawn yet
+
   function zoomAt(dock, ev) {
+    const first = !pending.has(dock);
+    pending.set(dock, {x: ev.clientX, y: ev.clientY});
+    if (first) frame(() => { const at = pending.get(dock); pending.delete(dock); if (at) zoomDraw(dock, at); });
+  }
+
+  function zoomDraw(dock, ev) {
     const st = live.get(dock);
     const icons = Array.from(dock.querySelectorAll("i"));
     if (!st || !st.zoom) {
-      icons.forEach(i => { i.style.transform = ""; i.style.margin = ""; });
+      icons.forEach(i => { i.style.transform = ""; });
       return;
     }
-    const at = st.vertical ? ev.clientY : ev.clientX;
-    icons.forEach(i => {
-      const r = i.getBoundingClientRect();
-      const center = st.vertical ? r.top + r.height / 2 : r.left + r.width / 2;
-      const d = Math.abs(at - center);
-      const reach = st.inPlace ? st.icon * 0.75 : st.icon * 2.5;
-      const k = Math.max(0, 1 - (d / reach) * (d / reach));
-      const scale = 1 + (st.factor - 1) * k;
-      i.style.transition = "transform " + st.inMs + "ms ease-out, margin " + st.inMs + "ms ease-out";
+    // Read: where each icon sits without the zoom (offsets ignore transforms), from the dock's own box.
+    const box = dock.getBoundingClientRect();
+    const base = st.vertical ? box.top : box.left;
+    const centers = icons.map(i => base + (st.vertical ? (i.offsetTop || 0) + (i.offsetHeight || st.icon) / 2
+                                                       : (i.offsetLeft || 0) + (i.offsetWidth || st.icon) / 2));
+    const at = st.vertical ? ev.y : ev.x;
+    const reach = st.inPlace ? st.icon * 0.75 : st.icon * 2.5;
+    const scales = centers.map(c => {
+      const d = Math.abs(at - c), k = Math.max(0, 1 - (d / reach) * (d / reach));
+      return 1 + (st.factor - 1) * k;
+    });
+    // Wave zoom: each icon moves by the growth of the icons before it, less half of all the growth, so the
+    // row spreads out evenly around the mouse.
+    const grow = scales.map(sc => st.inPlace ? 0 : (sc - 1) * st.icon);
+    const total = grow.reduce((a, b) => a + b, 0);
+    let before = 0;
+    // Write: transforms only.
+    icons.forEach((i, n) => {
+      const shift = before + grow[n] / 2 - total / 2;
+      before += grow[n];
+      i.style.transition = "transform " + st.inMs + "ms " + EASE_OUT;
       i.style.transformOrigin = st.origin;
-      i.style.transform = "scale(" + Math.round(scale * 1000) / 1000 + ")";
-      // Wave zoom makes room for the bigger icons; in place lets them grow over their neighbors.
-      const room = st.inPlace ? 0 : (scale - 1) * st.icon / 2;
-      i.style.margin = st.vertical ? px(room) + " 0" : "0 " + px(room);
+      const move = shift ? (st.vertical ? "translateY(" : "translateX(") + px(shift) + ") " : "";
+      i.style.transform = move + "scale(" + Math.round(scales[n] * 1000) / 1000 + ")";
     });
   }
 
   function zoomOut(dock) {
+    pending.delete(dock);
     const st = live.get(dock);
     Array.from(dock.querySelectorAll("i")).forEach(i => {
-      i.style.transition = "transform " + (st ? st.outMs : 0) + "ms ease-in, margin " + (st ? st.outMs : 0) + "ms ease-in";
+      i.style.transition = "transform " + (st ? st.outMs : 0) + "ms " + EASE_OUT;
       i.style.transform = "";
-      i.style.margin = "";
     });
   }
 
@@ -185,7 +208,6 @@
       i.style.borderRadius = px(Math.max(3, icon / 4));
       i.style.flex = "none";
       i.style.transform = "";
-      i.style.margin = "";
     });
 
     const speed = v.zoom_speed === "custom" ? [clamp(v.zoom_in_ms, 0, 1000), clamp(v.zoom_out_ms, 0, 1000)]

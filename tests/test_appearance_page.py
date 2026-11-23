@@ -366,7 +366,7 @@ class AdvancedFlagTest(unittest.TestCase):
     """The settings page folds settings marked "advanced": true away. The list stays small and changes no
     key, default, type or group."""
     ADVANCED = {"privacy.dns_strict", "security.usb_key_timeout_sec", "core.port", "core.metrics_interval_s",
-                "virt.cpu_weight"}
+                "virt.cpu_weight", "ai.storage_min_free_gb"}
 
     def test_advanced_settings(self):
         with open(SCHEMA) as f:

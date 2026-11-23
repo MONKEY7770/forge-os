@@ -660,12 +660,41 @@ class ForgeHealthNotifyTest(unittest.TestCase):
             self.assertEqual(len(rest), 2, c)
             for text in rest:
                 self.assertNotIn("<", text, c)
-            for opt in c[:c.index("--")]:
-                self.assertIn(opt, ("-u", "critical", "normal"), c)
+            opts = c[:c.index("--")]
+            self.assertIn("-a", opts, c)
+            self.assertEqual(opts[opts.index("-a") + 1], "Forge OS", c)
+            self.assertIn("-i", opts, c)                       # every notice has an icon
+            for i, opt in enumerate(opts):
+                if i and opts[i - 1] in ("-a", "-i"):
+                    continue
+                self.assertIn(opt, ("-u", "critical", "normal", "-a", "-i"), c)
         joined = json.dumps(calls)
         self.assertIn("&lt;b&gt;Evil USB&lt;/b&gt; &amp;", joined)
         self.assertIn("&lt;a href=", joined)
         self.assertIn("Forge OS: hardware changed", json.dumps(summaries))
+
+    def approval_calls(self, calls):
+        return [c for c in calls if any("need your OK" in a or "needs your OK" in a for a in c)]
+
+    def test_approval_requests_are_shown_once_and_not_critical(self):
+        # Audit finding: a critical notice came back every 10 minutes while anything waited, and it
+        # pointed to a web address and a terminal command.
+        r, calls = self.run_health()
+        first = self.approval_calls(calls)
+        self.assertEqual(len(first), 1, calls)
+        self.assertNotIn("critical", first[0])
+        text = json.dumps(first[0])
+        self.assertIn("1 agent action needs your OK", text)
+        self.assertIn("Forge Dashboard", text)
+        self.assertNotIn("forge-api", text)
+        self.assertNotIn("http://", text)
+        os.remove(self.log)
+        r, calls = self.run_health()            # still the same one waiting: no new notice
+        self.assertEqual(self.approval_calls(calls), [], calls)
+
+    def test_hot_gpu_shows_degrees(self):
+        with open(os.path.join(ROOT, "files/system/usr/bin/forge-health")) as f:
+            self.assertIn("GPU is hot: ${temp}°C", f.read())
 
     def health_calls(self, calls):
         return [c for c in calls if "Forge OS health" in c]

@@ -11,6 +11,15 @@ A custom Bazzite-based OS for AI agents, creative work and gaming. Runs on deskt
 
 Both have the same apps and Forge tools. Not sure: on AMD, local AI models run on the CPU unless ROCm support is added later.
 
+## Installing (VM or real PC)
+
+1. **Get the ISO:** the latest `build-iso` run on GitHub, Artifacts, `forge-os-universal-iso` for VMs and AMD or Intel PCs, `forge-os-iso` for NVIDIA PCs. Unzip it to get the `.iso`.
+2. **VM settings (VirtualBox):** Type Linux, Version Fedora (64-bit), tick "Skip Unattended Installation", turn on **EFI** (System), at least 8 GB memory, 4 CPUs and a 64 GB disk, Graphics Controller VMSVGA (try VBoxSVGA if the screen is black). Attach the ISO in Storage.
+3. **Real PC:** write the ISO to a USB stick (for example with Fedora Media Writer), boot it in UEFI mode.
+4. **Install:** choose Install (skip the media check if you like), pick the disk, Erase and install. Check that the plan shows `/boot/efi`: if it shows `biosboot`, the PC or VM started in BIOS mode.
+5. **First start:** if a blue "MOK management" screen appears, choose Enroll MOK and type `universalblue`. Then the **setup wizard** creates your account (username and password) and asks how much space to keep free for normal use next to AI models.
+6. **Sound in a VM:** if notification sounds crackle, Forge already uses a larger audio buffer inside VMs; switching the VM's audio controller (Intel HD Audio or ICH AC97) can also help. Real PCs are not affected.
+
 ## Hardware changes
 
 Forge OS adapts when you change parts:
@@ -31,7 +40,7 @@ On first login, a **Forge Welcome** page shows this report and helps with locati
 | Area | Apps |
 |---|---|
 | Essentials | Firefox, Discord, Claude Desktop, VS Code, GitHub Desktop, VLC |
-| Gaming | Steam (from Bazzite), Sober (Roblox Player), Vinegar (Roblox Studio), Minecraft Bedrock launcher |
+| Gaming | Steam (from Bazzite), Sober (Roblox Player), Vinegar (Roblox Studio), Minecraft Bedrock launcher, Prism Launcher (Minecraft Java Edition and mods) |
 | Creative | Blender, Blockbench, Krita, Pixelorama, Audacity, OBS, Kdenlive, GPU Screen Recorder |
 | AI | Ollama (CUDA), agent resource limits |
 | Remote access | Tailscale, Moonlight, RustDesk, LocalSend, KDE Connect (built in), Sunshine (one click in Bazzite Portal) |
@@ -327,14 +336,14 @@ Forge Settings, Appearance, Dock has three styles. All of it is per user and nee
 - Krema starts from `~/.config/autostart/forge-krema.desktop` for you only, and its settings are in `~/.config/kremarc`. Other Krema settings you change in Krema itself are kept, also when you go to Default and back: pinned apps, and per-screen choices (those win on their screen). If `kremarc` is a link (a dotfile manager), Forge writes to the file it points to and keeps the link.
 - Floating clean and Animated only change the Plasma panel that holds your app list. Your other panels are never touched; Default puts every panel back.
 - Not possible: zoom inside the Plasma panel, a bounce when an app starts, and turning running-app dots on or off (Krema has no setting for them).
-- **Krema is not in the image yet.** Its COPR package is pinned to one exact Qt version, so it is only installed when `KREMA_VERSION` and `KREMA_KEY_FPR` in `files/scripts/install-krema.sh` are filled in. To fill them in: on a Forge OS PC run `dnf --repofrompath=k,https://download.copr.fedorainfracloud.org/results/isac322/krema/fedora-45-x86_64/ list --showduplicates krema` for the version, and check the key fingerprint at `https://download.copr.fedorainfracloud.org/results/isac322/krema/pubkey.gpg` with the project. If anything does not match, the build leaves Krema out and says why in the log; it never fails because of Krema. Until then the Animated style says Krema is not installed.
+- **Krema 0.13.0 is in the image**, pinned to its exact version and its COPR signing key (`files/scripts/install-krema.sh`). If the COPR is ever unreachable or the package does not fit, the build leaves Krema out and says why; it never fails because of Krema.
 
 ## Backgrounds: pictures, videos and Wallpaper Engine
 
 Forge Settings, Appearance, Background picks what fills your desktop, per user and without a password: a **picture**, a **slideshow** (every picture in your media library), a **video**, a **Wallpaper Engine** wallpaper, a **solid color** or a **gradient**. Only the options that fit the chosen type show. "Save and apply" changes the wallpaper right away through Plasma's own desktop scripting; `forge-appearance apply background` does the same.
 
 - **Videos** use the Smart Video Wallpaper Reborn plugin (built into the image, version pinned). They loop, pause while a window is maximized or fullscreen (a fullscreen game counts), can pause on battery, and are muted unless you raise the volume. Optional: a second video for the night, switched at set hours or with the light or dark Plasma style.
-- **Wallpaper Engine** needs Wallpaper Engine bought in Steam; Forge lists the wallpapers you subscribed to (from `~/.local/share/Steam` and your other Steam library folders). Video and web wallpapers are offered by default; scene wallpapers only after you turn on "Allow scene wallpapers (experimental)", because they can crash the desktop. The plugin is **not in the image until its version is pinned** (see `files/scripts/install-wallpaper-engine.sh`); until then the page says "Wallpaper Engine support is not included in this build".
+- **Wallpaper Engine** needs Wallpaper Engine bought in Steam; Forge lists the wallpapers you subscribed to (from `~/.local/share/Steam` and your other Steam library folders). Video and web wallpapers are offered by default; scene wallpapers only after you turn on "Allow scene wallpapers (experimental)", because they can crash the desktop. The plugin is in the image, pinned to its exact version and COPR signing key (`files/scripts/install-wallpaper-engine.sh`). If COPR cannot be reached the build leaves it out and the page says "Wallpaper Engine support is not included in this build"; a wrong pin or signature stops the build instead.
 - **Crash guard:** after a video or Wallpaper Engine background is applied, Forge watches the desktop for a minute. If plasmashell crashes again and again, it switches back to the last picture that worked (or Plasma's default wallpaper) once, and tells you the next time you apply.
 - **One screen:** under advanced settings, use a background on one screen only (by its connector name, like DP-1).
 - Not offered, because no plugin can do it: dimming the background, and a separate "pause while a game runs" (games pause it as fullscreen windows). The lock screen and login screen are set in the Bootup part.

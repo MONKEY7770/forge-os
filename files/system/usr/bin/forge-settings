@@ -58,6 +58,33 @@ LOOK_BODY_MAX = 64 * 1024
 # Preview scripts for the Appearance page that later parts of Forge OS add: <section id>.js in here.
 PREVIEW_DIR = os.environ.get("FORGE_APPEARANCE_PREVIEWS", "/usr/share/forge/appearance-preview")
 PREVIEW_MAX = 256 * 1024
+# The shared "Tempered" design tokens (colours, spacing, motion), put inline into the Settings and Welcome pages.
+TEMPERED_CSS = os.environ.get("FORGE_TEMPERED_CSS", "/usr/share/forge/tempered.css")
+TEMPERED_MAX = 64 * 1024
+# Used only when that file is missing or unusable: the same colour names, so the pages still look right.
+TEMPERED_FALLBACK = """:root { color-scheme: light dark;
+  --bg: #f7f6f3; --panel: #ffffff; --rail: #efede9; --field: #fbfaf8; --text: #1c1b19; --muted: #64605a;
+  --line: #d6d2cb; --border: #8a857d; --accent: #d9622b; --accent-fill: #c2541f; --accent-text: #a9461a;
+  --on-accent: #ffffff; --accent-soft: #f7e6dc; --glow: #ff9a5c; --ok: #276b45; --ok-soft: #e1f0e7;
+  --warn: #8f5a07; --warn-soft: #f6ebd6; --bad: #b3261e; --bad-soft: #f7e0dd; --info: #3f6383; --info-soft: #e3ebf3;
+  --radius-s: 4px; --radius-m: 8px; --radius-pill: 999px; --radius: 8px; --space-1: 4px; --space-2: 8px;
+  --space-3: 12px; --space-4: 16px; --space-5: 24px; --space-6: 32px; --space-7: 48px; --gap: 16px;
+  --edge: inset 0 1px 0 rgba(255, 255, 255, .7); --shadow-1: 0 1px 2px rgba(40, 30, 20, .06);
+  --shadow-2: 0 8px 24px rgba(40, 30, 20, .12); --font: system-ui, "Noto Sans", "Noto Sans Thai", sans-serif;
+  --font-mono: "Noto Sans Mono", "DejaVu Sans Mono", monospace; --text-s: 13px; --text-m: 14px; --text-l: 18px;
+  --text-xl: 24px; --leading: 1.45; --ease: cubic-bezier(.3, 0, .1, 1); --dur-1: 120ms; --dur-2: 200ms;
+  --dur-3: 320ms; --dur-cool: 240ms; }
+@media (prefers-color-scheme: dark) { :root {
+  --bg: #141312; --panel: #1e1d1b; --rail: #181715; --field: #191816; --text: #ecebe8; --muted: #a39e96;
+  --line: #34312d; --border: #6e6962; --accent: #ff7a3d; --accent-fill: #ff7a3d; --accent-text: #ff7a3d;
+  --on-accent: #1c1b19; --accent-soft: #3a2418; --glow: #ffb07f; --ok: #5cc98d; --ok-soft: #16301f;
+  --warn: #e8b04a; --warn-soft: #362a14; --bad: #ff7b6e; --bad-soft: #3b1d1a; --info: #8fb3d6; --info-soft: #1a2633;
+  --edge: inset 0 1px 0 rgba(255, 255, 255, .06); --shadow-1: 0 1px 2px rgba(0, 0, 0, .4);
+  --shadow-2: 0 10px 30px rgba(0, 0, 0, .5); } }
+:lang(th) { --leading: 1.6; }
+:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--accent); }
+@media (prefers-reduced-motion: reduce) { :root { --dur-1: 0ms; --dur-2: 0ms; --dur-3: 0ms; --dur-cool: 0ms; } }
+"""
 doctor_lock = threading.Lock()
 doctor_last = {"at": None, "report": None}
 
@@ -221,8 +248,7 @@ class Handler(BaseHTTPRequestHandler):
             if DASHBOARD:
                 return self.send(200, dashboard_page(), "text/html; charset=utf-8")
             if WELCOME:
-                return self.send(200, WELCOME_PAGE.replace("__TOKEN__", TOKEN).replace("__NONCE__", NONCE)
-                                 .replace("<!--__I18N__-->", i18n_block(), 1), "text/html; charset=utf-8")
+                return self.send(200, welcome_page(), "text/html; charset=utf-8")
             self.send(200, settings_page(), "text/html; charset=utf-8")
         elif self.path == "/api/ping" and self.authed():
             self.send(200, "{}")
@@ -739,9 +765,7 @@ def doctor_report():
 
 
 def dashboard_page():
-    path = os.path.join(os.path.dirname(os.path.abspath(forgedash.__file__)), "dashboard.html")
-    with open(path, encoding="utf-8") as f:
-        page = f.read()
+    page = forgedash.page_template()    # dashboard.html with the shared tokens inlined
     page = page.replace("__TOKEN__", TOKEN).replace("__NONCE__", NONCE)
     return page.replace("<!--__I18N__-->", i18n_block(), 1)
 
@@ -780,12 +804,38 @@ def preview_scripts(schema):
                       for s in schema["sections"] if preview_code(s["id"]) is not None)
 
 
+def tempered_css(path=None):
+    """The shared design tokens as CSS for an inline <style>. A missing, too big or odd file (one that could end
+    the <style> element) gives the built-in fallback instead, so the page always has its colours."""
+    try:
+        fd = os.open(path or TEMPERED_CSS, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb") as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                return TEMPERED_FALLBACK
+            data = f.read(TEMPERED_MAX + 1)
+        text = data.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return TEMPERED_FALLBACK
+    if len(data) > TEMPERED_MAX or "<" in text:
+        return TEMPERED_FALLBACK
+    return text
+
+
+def with_tempered(page):
+    return page.replace("/*__TEMPERED__*/", tempered_css(), 1)
+
+
+def welcome_page():
+    page = with_tempered(WELCOME_PAGE).replace("__TOKEN__", TOKEN).replace("__NONCE__", NONCE)
+    return page.replace("<!--__I18N__-->", i18n_block(), 1)
+
+
 def settings_page():
     try:
         schema = forgeappearance.load_schema()
     except Exception:
         schema = {"sections": []}
-    page = PAGE.replace("__TOKEN__", TOKEN).replace("__MEDIA_KEY__", MEDIA_KEY).replace("__NONCE__", NONCE)
+    page = with_tempered(PAGE).replace("__TOKEN__", TOKEN).replace("__MEDIA_KEY__", MEDIA_KEY).replace("__NONCE__", NONCE)
     page = page.replace("<!--__I18N__-->", i18n_block(), 1)
     return page.replace("<!--__PREVIEW_HOOKS__-->", preview_scripts(schema), 1)
 
@@ -923,146 +973,232 @@ PAGE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<link rel="icon" href="data:,">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%23c2541f'/%3E%3Cpath d='M5 4h6v2H7v1.5h3v2H7V12H5z' fill='%23fff'/%3E%3C/svg%3E">
 <title data-i18n="ui.title">Forge Settings</title>
 <style nonce="__NONCE__">
-:root {
-  --bg: #f6f6f4; --panel: #ffffff; --text: #1c1c1e; --muted: #64646a; --line: #e4e4e0; --rail: #efefec;
-  --accent: #d9622b; --accent-fill: #c2541f; --accent-text: #a9461a; --on-accent: #ffffff; --accent-soft: #fbe9e0;
-  --ok: #2b7d50; --bad: #b8352a; --field: #fbfbfa;
-  --gap: 16px; --radius: 12px;
-}
-@media (prefers-color-scheme: dark) {
-  :root { --bg: #141416; --panel: #1d1d20; --text: #ececee; --muted: #a0a0a8; --line: #2e2e33; --rail: #18181b;
-          --accent: #ff7a3d; --accent-fill: #ff7a3d; --accent-text: #ff7a3d; --on-accent: #1c1c1e; --accent-soft: #3a2418;
-          --ok: #4cbf82; --bad: #ff6b5b; --field: #161618; }
-}
+/*__TEMPERED__*/
+/* Forge Settings on the shared "Tempered" tokens above. Only transform and opacity animate; the token
+   durations drop to 0 when you ask for reduced motion. Icons: Lucide (ISC license), drawn inline. */
 * { box-sizing: border-box; }
 html, body { height: 100%; }
-body { margin: 0; background: var(--bg); color: var(--text);
-       font: 14px/1.45 system-ui, "Noto Sans", "Noto Sans Thai", sans-serif; }
+body { margin: 0; background: var(--bg); color: var(--text); font: var(--text-m)/var(--leading) var(--font); }
 button, input, select { font: inherit; color: inherit; }
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 [hidden] { display: none !important; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+svg.ic { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round;
+         stroke-linejoin: round; vertical-align: -3px; }
+.btn, .rail nav a, input, select, .seg button, .reset, .more, .rtags button, dialog .pick, .menu button {
+  transition: color var(--dur-1) var(--ease), background-color var(--dur-1) var(--ease),
+              border-color var(--dur-1) var(--ease), box-shadow var(--dur-1) var(--ease), transform var(--dur-1) var(--ease); }
 
-.shell { display: grid; grid-template-columns: 248px minmax(0, 1fr); min-height: 100%; }
-.rail { background: var(--rail); border-right: 1px solid var(--line); padding: 22px 14px 18px; display: flex;
-        flex-direction: column; gap: 16px; position: sticky; top: 0; height: 100vh; }
-.brand h1 { font-size: 18px; margin: 0 0 0 10px; letter-spacing: .2px; white-space: nowrap; }
-.brand h1 span { color: var(--accent-text); }
+.shell { display: grid; grid-template-columns: 280px minmax(0, 1fr); min-height: 100%; }
+.rail { background: var(--rail); border-right: 1px solid var(--line); padding: var(--space-5) var(--space-3) var(--space-4);
+        display: flex; flex-direction: column; gap: var(--space-4); position: sticky; top: 0; height: 100vh; min-width: 0; }
+.brand h1 { font-size: var(--text-l); margin: 0 0 0 var(--space-2); font-weight: 600; white-space: nowrap; overflow: hidden;
+            text-overflow: ellipsis; }
 .find { position: relative; }
-.find input { width: 100%; padding: 8px 30px 8px 10px; border: 1px solid var(--line); border-radius: 8px;
-              background: var(--panel); }
+.find input { width: 100%; height: 34px; padding: 0 30px 0 var(--space-3); border: 1px solid var(--line);
+              border-radius: var(--radius-s); background: var(--panel); }
+.find input:hover { border-color: var(--border); }
 .find input::placeholder { color: var(--muted); }
-.find kbd { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); font: 11px ui-monospace, monospace;
-            color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; }
+.find kbd { position: absolute; right: var(--space-2); top: 50%; transform: translateY(-50%); font: 11px var(--font-mono);
+            color: var(--muted); border: 1px solid var(--line); border-radius: var(--radius-s); padding: 0 5px; }
 .find input:focus + kbd, .find input:not(:placeholder-shown) + kbd { display: none; }
 .rail nav { display: flex; flex-direction: column; gap: 1px; }
-.rail nav a { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px; color: var(--muted);
-              text-decoration: none; }
-.rail nav a:hover { color: var(--text); background: var(--panel); }
+.rail nav a { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-3);
+              border-radius: var(--radius-s); color: var(--muted); text-decoration: none; min-width: 0; }
+.rail nav a:hover { color: var(--text); background: color-mix(in srgb, var(--panel) 70%, transparent); }
 .rail nav a[aria-current="page"] { background: var(--panel); color: var(--text); font-weight: 600;
-                                   box-shadow: inset 3px 0 0 var(--accent); }
-.rail nav a .n { flex: 1; }
+                                   box-shadow: inset 3px 0 0 var(--accent), var(--shadow-1); }
+.rail nav a .n { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .rail nav a .cnt { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--muted); font-weight: 400; }
 .rail nav a.hit { color: var(--text); }
-.rail nav a .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
-.rail .foot { margin-top: auto; display: flex; flex-direction: column; gap: 6px; }
+.rail nav a .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
+.rail .foot { margin-top: auto; display: flex; flex-direction: column; gap: var(--space-2); }
 
-main { padding: 30px 40px 0; max-width: 1120px; width: 100%; display: flex; flex-direction: column; min-height: 100vh; }
-.content { flex: 1; padding-bottom: 28px; }
-.ph { margin: 0 0 22px; }
-.ph h2 { font-size: 22px; margin: 0; font-weight: 650; letter-spacing: -.1px; }
-.ph h2:focus { outline: none; }
-.ph p { margin: 4px 0 0; color: var(--muted); max-width: 72ch; }
+main { padding: var(--space-6) var(--space-6) 0; max-width: 1120px; width: 100%; margin-inline: auto; display: flex;
+       flex-direction: column; min-height: 100vh; min-width: 0; }
+.content { flex: 1; padding-bottom: var(--space-6); }
+.ph { margin: 0 0 var(--space-5); }
+.ph h2 { font-size: var(--text-xl); margin: 0 0 0 calc(-1 * var(--space-1)); padding: 0 var(--space-1); font-weight: 600;
+         letter-spacing: -.1px; display: inline-block; border-radius: var(--radius-s); }
+.ph p { margin: var(--space-1) 0 0; color: var(--muted); max-width: 72ch; }
 
-.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: 18px; }
-.card > h3 { font-size: 15px; margin: 0; padding: 14px 18px 12px; font-weight: 650; }
-.card > h3 small { font-weight: 400; color: var(--muted); font-size: 13px; margin-left: 8px; }
-.card > .sub { color: var(--muted); font-size: 13px; padding: 0 18px 12px; margin-top: -8px; }
-.row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 20px; align-items: center;
-       padding: 12px 18px; border-top: 1px solid var(--line); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-m); margin-bottom: var(--space-4);
+        box-shadow: var(--edge), var(--shadow-1); }
+.card > h3 { font-size: 15px; margin: 0; padding: var(--space-3) var(--space-4); font-weight: 600; }
+.card > h3 small { font-weight: 400; color: var(--muted); font-size: var(--text-s); margin-left: var(--space-2); }
+.card > .sub { color: var(--muted); font-size: var(--text-s); padding: 0 var(--space-4) var(--space-3); margin-top: calc(-1 * var(--space-2)); }
+.row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-2) var(--space-5); align-items: center;
+       padding: var(--space-3) var(--space-4); border-top: 1px solid var(--line); }
 .row.stack { grid-template-columns: minmax(0, 1fr); }
-.label { font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.label { font-weight: 600; display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap; }
 .label .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); display: none; }
 .row.changed .label .dot { display: inline-block; }
-.help { color: var(--muted); font-size: 13px; margin-top: 2px; max-width: 70ch; }
-.rtags { margin-top: 6px; display: flex; gap: 4px; flex-wrap: wrap; }
-.rtags button { font-size: 11.5px; color: var(--muted); background: var(--bg); border: 0; border-radius: 4px;
+.help { color: var(--muted); font-size: var(--text-s); margin-top: 2px; max-width: 70ch; }
+.rtags { margin-top: 6px; display: flex; gap: var(--space-1); flex-wrap: wrap; }
+.rtags button { font-size: 12px; color: var(--muted); background: var(--bg); border: 0; border-radius: var(--radius-s);
                 padding: 1px 6px; cursor: pointer; }
 .rtags button:hover { color: var(--text); }
-.pill { font-size: 11.5px; font-weight: 500; color: var(--muted); border: 1px solid var(--line); border-radius: 999px;
-        padding: 0 7px; }
-.pill.accent { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
-.ctl { display: flex; align-items: center; gap: 10px; justify-content: flex-end; }
-.reset { border: none; background: none; color: var(--muted); cursor: pointer; font-size: 12.5px; visibility: hidden;
-         padding: 4px 6px; border-radius: 6px; }
-.row.custom .reset { visibility: visible; }
-.reset:hover { color: var(--accent); }
-input[type=number], input[type=text], select { padding: 6px 9px; border: 1px solid var(--line); border-radius: 7px;
-  background: var(--field); min-height: 32px; }
+.pill { font-size: 12px; font-weight: 500; color: var(--muted); border: 1px solid var(--line); border-radius: var(--radius-pill);
+        padding: 0 7px; white-space: nowrap; }
+.ctl { display: flex; align-items: center; gap: var(--space-2); justify-content: flex-end; }
+.reset { display: none; border: none; background: none; color: var(--muted); cursor: pointer; font-size: var(--text-s);
+         padding: var(--space-1) 6px; border-radius: var(--radius-s); white-space: nowrap; }
+.row.custom > .ctl > .reset, .row.custom > .ctl .reset, .cell.custom .reset { display: inline-flex; align-items: center; gap: 4px; }
+.reset:hover { color: var(--text); background: var(--bg); }
+
+input[type=number], input[type=text], select { height: 32px; padding: 0 var(--space-2); border: 1px solid var(--border);
+  border-radius: var(--radius-s); background: var(--field); }
+input[type=number]:hover, input[type=text]:hover, select:hover { border-color: var(--text); }
 input[type=number] { width: 96px; font-variant-numeric: tabular-nums; }
-input[type=text] { width: 270px; }
-input[type=text].hex { width: 92px; font: 13px ui-monospace, monospace; }
-input[type=color] { width: 40px; height: 32px; padding: 2px; border: 1px solid var(--line); border-radius: 7px;
+input[type=text] { width: 270px; min-width: 12em; }
+input[type=text].hex { width: 92px; min-width: 0; font: var(--text-s) var(--font-mono); }
+input[aria-invalid="true"], input[aria-invalid="true"]:hover { border-color: var(--bad); box-shadow: 0 0 0 1px var(--bad); }
+select { appearance: none; -webkit-appearance: none; min-width: 10em; padding-right: 28px; cursor: pointer;
+         background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%);
+         background-position: calc(100% - 15px) 52%, calc(100% - 10px) 52%; background-size: 5px 5px; background-repeat: no-repeat; }
+select option { background: var(--panel); color: var(--text); }
+input[type=color] { width: 40px; height: 32px; padding: 2px; border: 1px solid var(--border); border-radius: var(--radius-s);
                     background: var(--field); cursor: pointer; }
-input[type=range] { width: 200px; accent-color: var(--accent); }
-.unit { color: var(--muted); font-size: 13px; min-width: 2.5em; font-variant-numeric: tabular-nums; }
-.switch { position: relative; width: 40px; height: 22px; display: inline-block; flex: none; }
-.switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
-.switch .knob { position: absolute; inset: 0; background: var(--line); border-radius: 22px; pointer-events: none;
-                transition: background .15s; }
-.switch .knob::before { content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px;
-                        background: #fff; border-radius: 50%; transition: transform .15s; box-shadow: 0 1px 2px rgba(0,0,0,.25); }
-.switch input:checked + .knob { background: var(--accent-fill); }
-.switch input:checked + .knob::before { transform: translateX(18px); }
-.switch input:focus-visible + .knob { outline: 2px solid var(--accent); outline-offset: 2px; }
-.more { width: 100%; text-align: left; background: none; border: 0; border-top: 1px dashed var(--line);
-        padding: 10px 18px; color: var(--muted); cursor: pointer; border-radius: 0 0 var(--radius) var(--radius); }
-.more:hover { color: var(--text); }
-.more::before { content: "+"; display: inline-block; width: 1.2em; font-weight: 600; }
-.more[aria-expanded="true"]::before { content: "\2212"; }
+input[type=range] { width: 180px; accent-color: var(--accent-fill); }
+.unit, .range, .lim { color: var(--muted); font-size: var(--text-s); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.unit { min-width: 3.5em; }
+.num { display: inline-grid; grid-template-columns: auto auto; align-items: center; justify-items: end; gap: var(--space-1) var(--space-2); }
+.err { color: var(--bad); font-size: var(--text-s); grid-column: 1 / -1; }
+.switch { position: relative; width: 36px; height: 20px; display: inline-block; flex: none; }
+.switch input { position: absolute; inset: 0; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+.switch .knob { position: absolute; inset: 0; background: var(--field); border-radius: var(--radius-pill); pointer-events: none;
+                box-shadow: inset 0 0 0 1px var(--border);
+                transition: background-color var(--dur-1) var(--ease), box-shadow var(--dur-1) var(--ease); }
+.switch .knob::before { content: ""; position: absolute; width: 14px; height: 14px; left: 3px; top: 3px; border-radius: 50%;
+                        background: var(--border); transition: transform var(--dur-2) var(--ease), background-color var(--dur-1) var(--ease); }
+.switch:hover .knob { box-shadow: inset 0 0 0 1px var(--text); }
+.switch input:checked + .knob { background: var(--accent-fill); box-shadow: inset 0 0 0 1px var(--accent-fill); }
+.switch input:checked + .knob::before { transform: translateX(16px); background: var(--on-accent); }
+.switch input:focus-visible + .knob { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent); animation: forge-cool var(--dur-cool) var(--ease); }
 
-.btn { padding: 7px 13px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel);
-       cursor: pointer; white-space: nowrap; }
-.btn:hover { border-color: var(--muted); }
+/* Advanced settings fold away; the fold opens by its rows' height (grid rows 0fr to 1fr). */
+.adv { display: grid; grid-template-rows: 0fr; transition: grid-template-rows var(--dur-2) var(--ease); }
+.adv.open { grid-template-rows: 1fr; }
+.adv > .adv-in { min-height: 0; overflow: hidden; visibility: hidden; transition: visibility 0s linear var(--dur-2); }
+.adv.open > .adv-in { visibility: visible; transition: none; }
+.more { width: 100%; text-align: left; background: none; border: 0; border-top: 1px dashed var(--line); display: flex; gap: var(--space-2);
+        align-items: center; padding: var(--space-3) var(--space-4); color: var(--muted); cursor: pointer; border-radius: 0 0 var(--radius-m) var(--radius-m); }
+.more:hover { color: var(--text); background: color-mix(in srgb, var(--bg) 60%, transparent); }
+.more svg { transition: transform var(--dur-2) var(--ease); }
+.more[aria-expanded="true"] svg { transform: rotate(180deg); }
+
+/* Performance modes: one row per setting, one column per mode */
+.grid-wrap { overflow-x: auto; border-top: 1px solid var(--line); }
+.modes-grid { width: 100%; border-collapse: collapse; }
+.modes-grid th, .modes-grid td { padding: var(--space-2) var(--space-3); text-align: left; vertical-align: middle; }
+.modes-grid thead th { font-size: var(--text-s); color: var(--muted); font-weight: 600; white-space: nowrap; }
+.modes-grid tbody tr { border-top: 1px solid var(--line); }
+.modes-grid tbody th { font-weight: 600; padding-left: var(--space-4); }
+.modes-grid tbody th .range { display: block; font-weight: 400; }
+.modes-grid td:last-child, .modes-grid th:last-child { padding-right: var(--space-4); }
+.cell { white-space: nowrap; }
+.cell > .in { display: inline-flex; align-items: center; gap: var(--space-1); position: relative; }
+.cell select { min-width: 0; width: 132px; }
+.cell input[type=number] { width: 84px; }
+.cell .reset { padding: 4px; }
+.cell .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); position: absolute; left: -10px; top: calc(50% - 3px); display: none; }
+.cell.changed .dot { display: block; }
+
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 32px; padding: 0 var(--space-3);
+       border-radius: var(--radius-s); border: 1px solid var(--line); background: var(--panel); cursor: pointer; white-space: nowrap; }
+.btn:hover:not(:disabled) { border-color: var(--border); background: var(--bg); }
+.btn:active:not(:disabled) { transform: scale(.98); }
 .btn.primary { background: var(--accent-fill); border-color: var(--accent-fill); color: var(--on-accent); font-weight: 600; }
-.btn.quiet { background: transparent; border-color: transparent; color: var(--muted); text-align: left; padding-left: 10px; }
-.btn.quiet:hover { color: var(--text); background: var(--panel); }
-.btn.small { padding: 4px 10px; font-size: 13px; }
+.btn.primary:hover:not(:disabled) { background: color-mix(in srgb, var(--accent-fill) 86%, var(--text)); border-color: transparent; }
+.btn.primary.danger { background: var(--bad); border-color: var(--bad); color: var(--panel); }
+.btn.primary.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--bad) 86%, var(--text)); }
+.btn.quiet { background: transparent; border-color: transparent; color: var(--muted); justify-content: flex-start; padding-left: var(--space-3); }
+.btn.quiet:hover:not(:disabled) { color: var(--text); background: var(--panel); border-color: transparent; }
+.btn.small { height: 28px; padding: 0 var(--space-2); font-size: var(--text-s); }
 .btn.danger { color: var(--bad); }
-.btn:disabled { opacity: .45; cursor: default; }
-.empty { color: var(--muted); padding: 16px 18px 18px; border-top: 1px solid var(--line); }
+.btn:disabled { cursor: default; color: var(--muted); background: transparent; border-color: var(--line); }
+.btn.primary:disabled { background: var(--line); border-color: var(--line); color: var(--muted); }
+.btn.busy:disabled { background: var(--accent-fill); border-color: var(--accent-fill); color: var(--on-accent); cursor: progress; }
+.btn.busy::before { content: ""; width: 12px; height: 12px; border-radius: 50%; border: 2px solid currentColor;
+                    border-right-color: transparent; animation: forge-spin 700ms linear infinite; }
+@keyframes forge-spin { to { transform: rotate(360deg); } }
+.empty { color: var(--muted); padding: var(--space-4); border-top: 1px solid var(--line); }
 .card > .empty:first-child { border-top: 0; }
-.nomatch { color: var(--muted); padding: 40px 0; text-align: center; }
+.nomatch { color: var(--muted); padding: var(--space-7) 0; text-align: center; grid-column: 1 / -1; }
 
-.bar { position: sticky; bottom: 0; background: var(--bg); border-top: 1px solid var(--line); padding: 12px 0 14px;
-       margin: 0 -2px; display: flex; flex-direction: column; gap: 10px; }
-.bar .in { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.bar .count { flex: 1; min-width: 200px; }
+/* Loading and "could not load" */
+.skel { background: var(--line); border-radius: var(--radius-s); animation: forge-pulse 1.2s var(--ease) infinite alternate; }
+.skel.h { width: 180px; height: 28px; margin-bottom: var(--space-2); }
+.skel.p { width: 420px; max-width: 80%; height: 14px; margin-bottom: var(--space-5); }
+.skel.card { height: 150px; border-radius: var(--radius-m); margin-bottom: var(--space-4); background: var(--panel); border: 1px solid var(--line); }
+@keyframes forge-pulse { from { opacity: 1; } to { opacity: .55; } }
+.load-error { padding: var(--space-5); text-align: center; }
+.load-error h3 { margin: 0 0 var(--space-1); font-size: var(--text-l); font-weight: 600; }
+.load-error p { margin: 0 0 var(--space-4); color: var(--muted); }
+
+/* The save bar: sticks to the bottom, see-through with a blur and a hairline */
+.bar { position: sticky; bottom: 0; z-index: 5; display: flex; align-items: center; gap: var(--space-2); flex-wrap: nowrap;
+       padding: var(--space-3) 0; margin: 0 calc(-1 * var(--space-2)); padding-inline: var(--space-2);
+       background: color-mix(in srgb, var(--bg) 78%, transparent); backdrop-filter: blur(12px) saturate(1.2);
+       -webkit-backdrop-filter: blur(12px) saturate(1.2); border-top: 1px solid var(--line); }
+.bar .count { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .bar .count b { font-weight: 600; }
-.bar .file { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
-.out { white-space: pre-wrap; font: 12.5px/1.45 ui-monospace, monospace; background: var(--panel); border-radius: 8px;
-       padding: 9px 12px; margin: 0; border: 1px solid var(--line); border-left: 3px solid var(--muted);
+.menu-wrap { position: relative; }
+.menu { position: absolute; right: 0; bottom: calc(100% + 6px); min-width: 220px; background: var(--panel); border: 1px solid var(--line);
+        border-radius: var(--radius-m); box-shadow: var(--shadow-2); padding: var(--space-1); display: flex; flex-direction: column;
+        z-index: 10; transform-origin: 100% 100%; animation: forge-pop var(--dur-1) var(--ease); }
+.menu button { text-align: left; border: 0; background: none; padding: var(--space-2) var(--space-3); border-radius: var(--radius-s);
+               cursor: pointer; white-space: nowrap; }
+.menu button:hover:not(:disabled), .menu button:focus-visible { background: var(--bg); }
+.menu button:disabled { color: var(--muted); cursor: default; }
+@keyframes forge-pop { from { opacity: 0; transform: translateY(4px) scale(.98); } }
+
+/* Messages: toasts slide in at the bottom right; success goes away by itself, errors stay */
+.toasts { position: fixed; right: var(--space-5); bottom: 76px; z-index: 30; display: flex; flex-direction: column; gap: var(--space-2);
+          width: min(440px, calc(100vw - 32px)); pointer-events: none; }
+.toast { pointer-events: auto; display: flex; gap: var(--space-3); align-items: flex-start; padding: var(--space-3) var(--space-3) var(--space-3) var(--space-4);
+         background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--ok); border-radius: var(--radius-m);
+         box-shadow: var(--shadow-2); animation: forge-toast var(--dur-2) var(--ease); }
+.toast.bad { border-left-color: var(--bad); }
+.toast .tx { flex: 1; min-width: 0; }
+.toast .tt { font-weight: 600; overflow-wrap: anywhere; }
+.toast.ok .tt { color: var(--ok); } .toast.bad .tt { color: var(--bad); }
+.toast pre { margin: var(--space-1) 0 0; white-space: pre-wrap; font: 12.5px/1.45 var(--font-mono); color: var(--muted);
+             max-height: 30vh; overflow: auto; overflow-wrap: anywhere; }
+.toast .x { border: 0; background: none; color: var(--muted); cursor: pointer; padding: 2px; border-radius: var(--radius-s); line-height: 0; }
+.toast .x:hover { color: var(--text); background: var(--bg); }
+.toast.going { opacity: 0; transform: translateY(6px); transition: opacity var(--dur-1) var(--ease), transform var(--dur-1) var(--ease); }
+@keyframes forge-toast { from { opacity: 0; transform: translateY(8px); } }
+.conn { position: sticky; top: 0; z-index: 6; display: flex; gap: var(--space-3); align-items: center; margin: 0 0 var(--space-4);
+        padding: var(--space-3) var(--space-4); border-radius: var(--radius-m); background: var(--warn-soft); color: var(--text);
+        border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent); animation: forge-toast var(--dur-2) var(--ease); }
+.conn span { flex: 1; }
+.out { white-space: pre-wrap; font: 12.5px/1.45 var(--font-mono); background: var(--panel); border-radius: var(--radius-s);
+       padding: var(--space-2) var(--space-3); margin: 0; border: 1px solid var(--line); border-left: 3px solid var(--muted);
        max-height: 30vh; overflow: auto; }
 .out.ok { border-left-color: var(--ok); } .out.bad { border-left-color: var(--bad); }
 .out:empty { display: none; }
+.about { margin: 0; display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: var(--space-2) var(--space-5); padding: var(--space-3) var(--space-4);
+         border-top: 1px solid var(--line); }
+.about dt { color: var(--muted); } .about dd { margin: 0; overflow-wrap: anywhere; }
+.about code { font: var(--text-s) var(--font-mono); }
 
 /* Appearance */
-.look { margin-bottom: 30px; }
-.look-head { display: flex; align-items: baseline; gap: 10px; margin: 0 0 10px; flex-wrap: wrap; }
-.look-head h3 { font-size: 17px; margin: 0; font-weight: 650; }
+.look { margin-bottom: var(--space-6); }
+.look-head { display: flex; align-items: baseline; gap: var(--space-2); margin: 0 0 var(--space-3); flex-wrap: wrap; }
+.look-head h3 { font-size: var(--text-l); margin: 0; font-weight: 600; }
 .look-head p { margin: 0; color: var(--muted); flex-basis: 100%; }
-.look-body { display: grid; grid-template-columns: minmax(300px, 400px) minmax(0, 1fr); gap: 18px; align-items: start; }
+.look-body { display: grid; grid-template-columns: minmax(300px, 400px) minmax(0, 1fr); gap: var(--space-4); align-items: start; }
+.look-body > .prev { position: sticky; top: var(--space-4); }
 .look-body .card { margin: 0; }
-.look-foot { display: flex; gap: 8px; align-items: center; padding: 12px 18px; border-top: 1px solid var(--line); flex-wrap: wrap; }
-.look-foot .note { flex: 1; color: var(--muted); font-size: 13px; min-width: 160px; }
+.look-foot { display: flex; gap: var(--space-2); align-items: center; padding: var(--space-3) var(--space-4); border-top: 1px solid var(--line); flex-wrap: wrap; }
+.look-foot .note { flex: 1; color: var(--muted); font-size: var(--text-s); min-width: 160px; }
 .look-foot .out { flex-basis: 100%; }
 
-.fa-preview { position: relative; aspect-ratio: 16 / 10; border-radius: 10px; overflow: hidden;
-              border: 1px solid var(--line); background: #1f2b38; isolation: isolate;
-              box-shadow: 0 1px 0 rgba(0,0,0,.04), 0 10px 30px -18px rgba(0,0,0,.45); }
+.fa-preview { position: relative; aspect-ratio: 16 / 10; border-radius: var(--radius-m); overflow: hidden;
+              border: 1px solid var(--line); background: #1f2b38; isolation: isolate; box-shadow: var(--shadow-2); }
 .fa-wall { position: absolute; inset: 0; z-index: -1;
            background: linear-gradient(160deg, #47637a 0%, #2a3a4b 55%, #1d2733 100%); }
 .fa-wall img, .fa-wall video { width: 100%; height: 100%; object-fit: cover; display: block; }
@@ -1079,76 +1215,90 @@ input[type=range] { width: 200px; accent-color: var(--accent); }
 .fa-dock i:nth-child(3) { background: #8fb3d9; } .fa-dock i:nth-child(5) { background: #9fd1b0; }
 .fa-boot { position: absolute; inset: 0; background: #0d0d0f; color: #ececee; display: none; flex-direction: column;
            align-items: center; justify-content: center; gap: 14px; }
-.fa-boot b { font-size: 20px; font-weight: 650; letter-spacing: .3px; }
+.fa-boot b { font-size: 20px; font-weight: 600; letter-spacing: .3px; }
 .fa-boot b span { color: #ff7a3d; }
 .fa-boot .fa-progress { width: 28%; height: 3px; border-radius: 3px; background: rgba(255,255,255,.15); overflow: hidden; }
 .fa-boot .fa-progress i { display: block; width: 40%; height: 100%; background: #ececee; border-radius: 3px; }
 .fa-preview[data-section="boot"] .fa-boot { display: flex; }
 .fa-preview[data-section="boot"] .fa-window, .fa-preview[data-section="boot"] .fa-dock { display: none; }
-.cap { color: var(--muted); font-size: 12.5px; margin: 8px 2px 0; }
+.cap { color: var(--muted); font-size: var(--text-s); margin: var(--space-2) 2px 0; }
 
-.media-pick { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 14px; align-items: center; margin-top: 10px; }
-.thumb { position: relative; aspect-ratio: 16 / 10; border-radius: 7px; overflow: hidden; background: var(--bg);
+.media-pick { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: var(--space-3); align-items: center; margin-top: var(--space-2); }
+.thumb { position: relative; aspect-ratio: 16 / 10; border-radius: var(--radius-s); overflow: hidden; background: var(--bg);
          border: 1px solid var(--line); display: flex; align-items: center; justify-content: center;
          color: var(--muted); font-size: 12px; text-align: center; }
+.thumb.none { border-style: dashed; }
+.thumb.none svg { width: 22px; height: 22px; opacity: .7; }
 .thumb img, .thumb video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-.thumb .k { position: absolute; left: 5px; bottom: 5px; font-size: 10.5px; background: rgba(0,0,0,.6); color: #fff;
-            border-radius: 4px; padding: 0 5px; }
+.thumb .k { position: absolute; left: 5px; bottom: 5px; font-size: 11px; background: rgba(0,0,0,.6); color: #fff;
+            border-radius: var(--radius-s); padding: 0 5px; }
 .mp-name { font-weight: 600; overflow-wrap: anywhere; }
 .mp-name.none { font-weight: 400; color: var(--muted); }
 .mp-acts { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
 
-.lib-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: 14px;
-            padding: 14px 18px 18px; border-top: 1px solid var(--line); }
+.lib-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); gap: var(--space-3);
+            padding: var(--space-3) var(--space-4) var(--space-4); border-top: 1px solid var(--line); }
 .tile { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-.tile .nm { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.tile .meta { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; align-items: center; gap: 6px; }
-.lib-top { display: flex; align-items: center; gap: 14px; padding: 0 18px 14px; flex-wrap: wrap; }
+.tile .nm { font-size: var(--text-s); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile .meta { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; align-items: center; gap: 6px; min-height: 28px; }
+.tile .meta .btn { opacity: 0; transition: opacity var(--dur-1) var(--ease), color var(--dur-1) var(--ease), background-color var(--dur-1) var(--ease); }
+.tile:hover .meta .btn, .tile:focus-within .meta .btn { opacity: 1; }
+@media (hover: none) { .tile .meta .btn { opacity: 1; } }
+.lib-top { display: flex; align-items: center; gap: var(--space-3); padding: 0 var(--space-4) var(--space-3); flex-wrap: wrap; }
 .meter { flex: 1; min-width: 180px; }
 .meter .track { height: 6px; border-radius: 6px; background: var(--bg); border: 1px solid var(--line); overflow: hidden; }
 .meter .track i { display: block; height: 100%; width: 0; background: var(--accent); }
-.meter .t { font-size: 12.5px; color: var(--muted); margin-top: 4px; font-variant-numeric: tabular-nums; }
-.progress { padding: 0 18px 12px; font-size: 13px; color: var(--muted); }
+.meter .t { font-size: var(--text-s); color: var(--muted); margin-top: var(--space-1); font-variant-numeric: tabular-nums; }
+.progress { padding: 0 var(--space-4) var(--space-3); font-size: var(--text-s); color: var(--muted); }
 .progress:empty, .mp-status:empty { display: none; }
-.card > .error { color: var(--bad); padding: 0 18px 14px; font-size: 13px; overflow-wrap: anywhere; }
-.mp-status { font-size: 13px; color: var(--muted); margin-top: 6px; }
+.pbar { height: 4px; border-radius: 4px; background: var(--line); overflow: hidden; margin-top: var(--space-1); max-width: 320px; }
+.pbar i { display: block; height: 100%; background: var(--accent-fill); transform-origin: 0 50%; transform: scaleX(0);
+          transition: transform var(--dur-1) linear; }
+.card > .error { color: var(--bad); padding: 0 var(--space-4) var(--space-3); font-size: var(--text-s); overflow-wrap: anywhere; }
+.mp-status { font-size: var(--text-s); color: var(--muted); margin-top: 6px; }
 
-dialog { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); color: var(--text); padding: 0;
-         width: min(720px, calc(100vw - 32px)); }
-dialog::backdrop { background: rgba(0, 0, 0, .4); }
-dialog .in { padding: 20px 22px 18px; }
-dialog h3 { margin: 0 0 4px; font-size: 17px; }
-dialog p { margin: 0 0 12px; color: var(--muted); }
-dialog .lib-grid { padding: 4px 0 4px; border: 0; max-height: 55vh; overflow: auto; }
-dialog .pick { border: 1px solid transparent; background: none; padding: 6px; border-radius: 10px; cursor: pointer; text-align: left; }
-dialog .pick:hover, dialog .pick[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
-dialog .bar2 { display: flex; justify-content: space-between; gap: 8px; margin-top: 14px; }
+dialog { border: 1px solid var(--line); border-radius: var(--radius-m); background: var(--panel); color: var(--text); padding: 0;
+         width: min(720px, calc(100vw - 32px)); box-shadow: var(--shadow-2); }
+dialog.small { width: min(480px, calc(100vw - 32px)); }
+dialog[open] { animation: forge-dialog var(--dur-2) var(--ease); }
+dialog::backdrop { background: rgba(20, 16, 12, .32); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); }
+@keyframes forge-dialog { from { opacity: 0; transform: scale(.98); } }
+dialog .in { padding: var(--space-5) var(--space-5) var(--space-4); }
+dialog h3 { margin: 0 0 var(--space-2); font-size: var(--text-l); font-weight: 600; }
+dialog p { margin: 0 0 var(--space-3); color: var(--muted); }
+dialog .lib-grid { padding: var(--space-1) 0; border: 0; max-height: 55vh; overflow: auto; }
+dialog .pick { border: 1px solid transparent; background: none; padding: 6px; border-radius: var(--radius-m); cursor: pointer; text-align: left; }
+dialog .pick:hover { border-color: var(--line); background: var(--bg); }
+dialog .pick[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
+dialog .bar2 { display: flex; justify-content: space-between; gap: var(--space-2); margin-top: var(--space-4); }
+dialog .bar2 > span { display: flex; gap: var(--space-2); }
+dialog .field { display: flex; flex-direction: column; gap: var(--space-1); margin: 0 0 var(--space-2); }
+dialog .field input { width: 100%; }
 
-/* Thai text: taller letters with marks above and below, so a little more line height */
-:lang(th) body { line-height: 1.6; }
-:lang(th) .help, :lang(th) .ph p { line-height: 1.6; }
+/* Thai: taller letters with marks above and below; help text no smaller than body text */
+:lang(th) .help, :lang(th) .ph p, :lang(th) .card > .sub, :lang(th) .look-foot .note, :lang(th) .cap { font-size: var(--text-m); }
 
-/* Language switch in the sidebar */
-.lang { display: flex; flex-direction: column; gap: 4px; padding: 0 10px; }
+/* Language switch in the sidebar: a segmented control */
+.lang { display: flex; flex-direction: column; gap: var(--space-1); padding: 0 var(--space-2); }
 .lang .k { font-size: 12px; color: var(--muted); }
-.seg { display: flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--panel); }
-.seg button { flex: 1; border: 0; background: none; padding: 5px 4px; cursor: pointer; color: var(--muted); font-size: 12.5px;
-              white-space: nowrap; }
-.seg button + button { border-left: 1px solid var(--line); }
-.seg button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent-text); font-weight: 600; }
+.seg { display: flex; gap: 2px; padding: 2px; border-radius: var(--radius-s); background: color-mix(in srgb, var(--text) 7%, transparent); }
+.seg button { flex: 1; border: 0; background: none; padding: 3px var(--space-1); cursor: pointer; color: var(--muted); font-size: var(--text-s);
+              white-space: nowrap; border-radius: 3px; }
+.seg button:hover { color: var(--text); }
+.seg button[aria-pressed="true"] { background: var(--panel); color: var(--text); font-weight: 600; box-shadow: var(--shadow-1); }
 
 /* Presets: each saved look as a small picture of it */
-.presets { margin-bottom: 30px; }
+.presets { margin-bottom: var(--space-6); }
 .presets .card { margin: 0; }
-.ps-save { display: flex; gap: 8px; align-items: center; padding: 14px 18px; flex-wrap: wrap; }
+.ps-save { display: flex; gap: var(--space-2); align-items: center; padding: var(--space-3) var(--space-4); flex-wrap: wrap; }
 .ps-save input[type=text] { flex: 1; min-width: 200px; width: auto; }
-.ps-tools { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 0 18px 14px; color: var(--muted);
-            font-size: 13px; }
+.ps-tools { display: flex; gap: var(--space-2); align-items: center; flex-wrap: wrap; padding: 0 var(--space-4) var(--space-3); color: var(--muted);
+            font-size: var(--text-s); }
 .ps-tools .sp { flex: 1; min-width: 120px; }
-.ps-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px;
-           padding: 16px 18px 18px; border-top: 1px solid var(--line); }
-.ps { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
-.ps-mini { position: relative; aspect-ratio: 16 / 10; border-radius: 8px; overflow: hidden; border: 1px solid var(--line);
+.ps-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: var(--space-4);
+           padding: var(--space-4); border-top: 1px solid var(--line); }
+.ps { display: flex; flex-direction: column; gap: var(--space-2); min-width: 0; }
+.ps-mini { position: relative; aspect-ratio: 16 / 10; border-radius: var(--radius-m); overflow: hidden; border: 1px solid var(--line);
            background: linear-gradient(160deg, #47637a 0%, #2a3a4b 55%, #1d2733 100%); }
 .ps-mini img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
 .ps-mini .w { position: absolute; left: 14%; top: 16%; width: 52%; height: 46%; border-radius: 4px;
@@ -1160,35 +1310,58 @@ dialog .bar2 { display: flex; justify-content: space-between; gap: 8px; margin-t
 .ps-mini .d.floating { width: 34%; bottom: 7%; } .ps-mini .d.animated { width: 30%; height: 11%; border-radius: 8px; }
 .ps-mini .d.default { width: 100%; left: 0; transform: none; bottom: 0; border-radius: 0; height: 9%; background: rgba(30, 32, 36, .9); }
 .ps .nm { font-weight: 600; overflow-wrap: anywhere; }
-.ps .meta { font-size: 12.5px; color: var(--muted); }
+.ps .meta { font-size: var(--text-s); color: var(--muted); }
 .ps .acts { display: flex; gap: 2px; flex-wrap: wrap; align-items: center; }
-.ps .acts .btn.primary { margin-right: 6px; padding-left: 16px; padding-right: 16px; }
-.ps .acts .btn:not(.primary) { border-color: transparent; background: none; color: var(--muted); padding: 4px 7px; }
+.ps .acts .btn.primary { margin-right: 6px; padding-left: var(--space-4); padding-right: var(--space-4); }
+.ps .acts .btn:not(.primary) { border-color: transparent; background: none; color: var(--muted); padding: 0 7px; }
 .ps .acts .btn:not(.primary):hover { color: var(--text); background: var(--bg); }
 .ps .acts .btn.danger { color: var(--bad); }
-dialog .opt { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; margin: 10px 0 0; border-radius: 10px;
-              background: var(--accent-soft); }
+dialog .opt { display: flex; gap: var(--space-2); align-items: flex-start; padding: var(--space-2) var(--space-3); margin: var(--space-2) 0 0;
+              border-radius: var(--radius-m); background: var(--accent-soft); }
 dialog .opt input { margin-top: 4px; accent-color: var(--accent-fill); }
 dialog .opt b { display: block; }
-dialog .notes { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: 13px; }
+dialog .notes { margin: var(--space-2) 0 0; padding-left: 18px; color: var(--muted); font-size: var(--text-s); }
 
-@media (max-width: 1100px) { .look-body { grid-template-columns: minmax(0, 1fr); } .look-body .fa-preview { max-width: 520px; } }
+/* A short crossfade between pages, where the browser has View Transitions */
+::view-transition-old(root) { animation-duration: 120ms; }
+::view-transition-new(root) { animation-duration: 200ms; }
+
+@media (max-width: 1100px) {
+  .look-body { grid-template-columns: minmax(0, 1fr); }
+  .look-body > .prev { position: static; }
+  .look-body .fa-preview { max-width: 520px; }
+}
 @media (max-width: 760px) {
   .shell { grid-template-columns: minmax(0, 1fr); }
-  .rail { position: static; height: auto; padding: 14px; gap: 10px; min-width: 0; }
-  .rail nav { flex-direction: row; overflow-x: auto; }
-  .rail nav a { white-space: nowrap; }
-  main { padding: 20px 16px 0; }
-  .row { grid-template-columns: 1fr; } .ctl { justify-content: flex-start; } input[type=text] { width: 100%; }
-  .row:not(.custom) .reset { display: none; }
+  .rail { position: static; height: auto; padding: var(--space-3) var(--space-4); display: grid; min-width: 0;
+          grid-template-columns: auto minmax(0, 1fr); gap: var(--space-2) var(--space-3); align-items: center;
+          border-right: 0; border-bottom: 1px solid var(--line); }
+  .brand h1 { margin: 0; }
+  .rail nav { grid-column: 1 / -1; flex-direction: row; overflow-x: auto; scrollbar-width: none; gap: 2px; }
+  .rail nav a { flex: none; padding: 6px var(--space-2); }
+  .rail .foot { grid-column: 1 / -1; flex-direction: row; align-items: center; justify-content: space-between; margin: 0; gap: var(--space-3); }
+  .lang { flex-direction: row; align-items: center; gap: var(--space-2); padding: 0; }
+  .lang .seg { min-width: 220px; }
+  main { padding: var(--space-4) var(--space-4) 0; }
+  .row { grid-template-columns: minmax(0, 1fr); } .ctl { justify-content: flex-start; } input[type=text] { width: 100%; }
+  .num { justify-items: start; }
+  .modes-grid { table-layout: fixed; }
+  .modes-grid thead th:first-child { width: 28%; }
+  .modes-grid th, .modes-grid td { padding: var(--space-2); }
+  .cell > .in { display: flex; width: 100%; }
+  .cell select, .cell input[type=number] { width: 100%; min-width: 0; }
+  .toasts { right: var(--space-4); }
 }
-@media (prefers-reduced-motion: reduce) { .switch .knob, .switch .knob::before { transition: none; } }
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-group(*), ::view-transition-old(*), ::view-transition-new(*) { animation: none !important; }
+  .adv, .adv > .adv-in { transition: none; }
+}
 </style>
 </head>
 <body>
 <div class="shell">
   <aside class="rail">
-    <div class="brand"><h1>Forge <span data-i18n="ui.brand">Settings</span></h1></div>
+    <div class="brand"><h1 data-i18n="ui.title">Forge Settings</h1></div>
     <div class="find" role="search">
       <label class="sr" for="search" data-i18n="ui.search">Search settings</label>
       <input id="search" type="search" placeholder="Search settings" data-i18n-placeholder="ui.search" autocomplete="off" spellcheck="false">
@@ -1208,21 +1381,31 @@ dialog .notes { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-s
     </div>
   </aside>
   <main>
-    <div class="content" id="content" aria-live="polite"></div>
-    <div class="bar" id="bar">
-      <pre class="out" id="out" role="status"></pre>
-      <div class="in">
-        <div class="count"><span id="count">No unsaved changes.</span><div class="file" id="file"></div></div>
-        <button class="btn" id="export" title="Download your settings as a file, without the ones that belong to this PC only" data-i18n-title="ui.export.title" data-i18n="ui.export">Export settings</button>
-        <button class="btn" id="import" title="Load settings from a file. They show as unsaved changes first." data-i18n-title="ui.import.title" data-i18n="ui.import">Import settings</button>
-        <input type="file" id="importfile" accept=".json,application/json" hidden>
-        <button class="btn" id="undo" title="Restore the settings from before your last save" data-i18n-title="ui.undo.title" data-i18n="ui.undo">Undo last save</button>
-        <button class="btn" id="discard" disabled data-i18n="ui.discard">Discard</button>
-        <button class="btn primary" id="save" disabled data-i18n="ui.save_apply">Save and apply</button>
+    <div class="conn" id="conn" role="alert" hidden>
+      <span id="conn-text" data-i18n="ui.conn.lost">Lost the connection to Forge Settings. It closes after a while without use. Reconnect, or open it again from the app menu.</span>
+      <button class="btn small" id="reconnect" type="button" data-i18n="ui.conn.retry">Reconnect</button>
+    </div>
+    <div class="content" id="content">
+      <div aria-hidden="true"><div class="skel h"></div><div class="skel p"></div><div class="skel card"></div><div class="skel card"></div></div>
+    </div>
+    <div class="bar" id="bar" hidden>
+      <div class="count" id="count" data-i18n="ui.bar.none">No unsaved changes.</div>
+      <div class="menu-wrap">
+        <button class="btn" id="more" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="more-menu"><span data-i18n="ui.more">More</span><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
+        <div class="menu" id="more-menu" role="menu" aria-labelledby="more" hidden>
+          <button type="button" role="menuitem" id="export" title="Download your settings as a file, without the ones that belong to this PC only" data-i18n-title="ui.export.title" data-i18n="ui.export">Export settings</button>
+          <button type="button" role="menuitem" id="import" title="Load settings from a file. They show as unsaved changes first." data-i18n-title="ui.import.title" data-i18n="ui.import">Import settings</button>
+          <button type="button" role="menuitem" id="undo" title="Restore the settings from before your last save" data-i18n-title="ui.undo.title" data-i18n="ui.undo">Undo last save</button>
+        </div>
       </div>
+      <input type="file" id="importfile" accept=".json,application/json" hidden>
+      <button class="btn" id="discard" type="button" disabled data-i18n="ui.discard">Discard</button>
+      <button class="btn primary" id="save" type="button" disabled data-i18n="ui.save_apply">Save and apply</button>
     </div>
   </main>
 </div>
+<div class="sr" id="live" role="status" aria-live="polite"></div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
 
 <dialog id="picker" aria-labelledby="pk-title">
   <div class="in">
@@ -1231,12 +1414,12 @@ dialog .notes { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-s
     <div class="lib-grid" id="pk-grid" role="group" aria-labelledby="pk-title"></div>
     <div class="progress" id="pk-progress" role="status"></div>
     <div class="bar2">
-      <button class="btn" id="pk-upload" data-i18n="ui.pick.upload">Upload a file</button>
-      <span><button class="btn" id="pk-cancel" data-i18n="ui.cancel">Cancel</button> <button class="btn primary" id="pk-ok" disabled data-i18n="ui.pick.use">Use this</button></span>
+      <button class="btn" id="pk-upload" type="button" data-i18n="ui.pick.upload">Upload a file</button>
+      <span><button class="btn" id="pk-cancel" type="button" data-i18n="ui.cancel">Cancel</button> <button class="btn primary" id="pk-ok" type="button" disabled data-i18n="ui.pick.use">Use this</button></span>
     </div>
   </div>
 </dialog>
-<dialog id="ps-dialog" aria-labelledby="ps-d-title">
+<dialog id="ps-dialog" class="small" aria-labelledby="ps-d-title">
   <div class="in">
     <h3 id="ps-d-title"></h3>
     <p id="ps-d-body"></p>
@@ -1245,7 +1428,17 @@ dialog .notes { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-s
         <span data-i18n="preset.system.help">They change the whole PC, so applying asks for the admin password.</span></span></label>
     <ul class="notes" id="ps-d-notes"></ul>
     <div class="bar2"><span></span>
-      <span><button class="btn" id="ps-d-cancel" data-i18n="ui.cancel">Cancel</button> <button class="btn primary" id="ps-d-ok" data-i18n="preset.apply">Apply</button></span>
+      <span><button class="btn" id="ps-d-cancel" type="button" data-i18n="ui.cancel">Cancel</button> <button class="btn primary" id="ps-d-ok" type="button" data-i18n="preset.apply">Apply</button></span>
+    </div>
+  </div>
+</dialog>
+<dialog id="ask" class="small" aria-labelledby="ask-title" aria-describedby="ask-body">
+  <div class="in">
+    <h3 id="ask-title"></h3>
+    <div id="ask-body"></div>
+    <label class="field" id="ask-field" hidden><span id="ask-label"></span><input type="text" id="ask-input" spellcheck="false"></label>
+    <div class="bar2"><span></span>
+      <span><button class="btn" id="ask-cancel" type="button" data-i18n="ui.cancel">Cancel</button> <button class="btn primary" id="ask-ok" type="button"></button></span>
     </div>
   </div>
 </dialog>
@@ -1269,6 +1462,68 @@ const el = (tag, attrs = {}, kids = []) => {
 };
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const fmt = v => v === true ? t("ui.on") : v === false ? t("ui.off") : String(v);
+const still = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
+// Lucide icons (ISC license), built as SVG nodes: never from markup text.
+const ICONS = {x: ["M18 6 6 18", "m6 6 12 12"], chevron: ["m6 9 6 6 6-6"],
+               undo: ["M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8", "M3 3v5h5"],
+               image: ["M5 3h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z", "M9 7a2 2 0 1 1 0 4 2 2 0 0 1 0-4z",
+                       "m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"]};
+function icon(name) {
+  const NS = $("#more svg").namespaceURI, svg = document.createElementNS(NS, "svg");   // the SVG namespace, from the page's own icon
+  svg.setAttribute("viewBox", "0 0 24 24"); svg.setAttribute("class", "ic"); svg.setAttribute("aria-hidden", "true");
+  ICONS[name].forEach(d => { const path = document.createElementNS(NS, "path"); path.setAttribute("d", d); svg.append(path); });
+  return svg;
+}
+// One line for screen readers (the page itself is not a live region).
+function announce(text) { const l = $("#live"); l.textContent = ""; setTimeout(() => { l.textContent = text; }, 30); }
+
+// Messages as toasts at the bottom right. Success goes away after 4 seconds, errors stay until closed.
+function toast(ok, title, detail) {
+  if (detail === undefined) { const i = String(title).indexOf("\n"); if (i >= 0) { detail = title.slice(i + 1); title = title.slice(0, i); } }
+  const x = el("button", {type: "button", class: "x", "aria-label": t("ui.close"), title: t("ui.close")}, [icon("x")]);
+  const box = el("div", {class: "toast " + (ok ? "ok" : "bad")}, [
+    el("div", {class: "tx"}, [el("div", {class: "tt", text: title}), detail ? el("pre", {text: detail}) : null]), x]);
+  const gone = () => {
+    if (!box.isConnected || box.classList.contains("going")) return;
+    box.classList.add("going");
+    setTimeout(() => box.remove(), still() ? 0 : 130);
+  };
+  x.addEventListener("click", gone);
+  const all = $("#toasts");
+  while (all.children.length >= 3) all.firstChild.remove();
+  all.append(box);
+  if (ok) setTimeout(gone, 4000);
+  return box;
+}
+
+// A question in a page dialog, in your language (never the browser's own boxes). Resolves to true, the typed text,
+// or false when cancelled (Cancel, Esc or a click outside).
+let askDone = null, askInput = false;
+function ask({title, body, ok, danger, input}) {
+  if (askDone) askDone(false);
+  return new Promise(resolve => {
+    $("#ask-title").textContent = title;
+    $("#ask-body").replaceChildren(...[].concat(body || []).filter(Boolean).map(p => el("p", {text: p})));
+    const okb = $("#ask-ok"), inp = $("#ask-input");
+    okb.textContent = ok;
+    okb.className = "btn primary" + (danger ? " danger" : "");
+    askInput = !!input;
+    $("#ask-field").hidden = !input;
+    if (input) { $("#ask-label").textContent = input.label; inp.value = input.value || ""; inp.maxLength = input.max || 60; }
+    okb.disabled = askInput && !inp.value.trim();
+    askDone = v => { askDone = null; resolve(v); };
+    $("#ask").showModal();
+    (input ? inp : danger ? $("#ask-cancel") : okb).focus();
+  });
+}
+function askAnswer(v) { const d = askDone; askDone = null; if ($("#ask").open) $("#ask").close(); if (d) d(v); }
+$("#ask-ok").addEventListener("click", () => askAnswer(askInput ? $("#ask-input").value : true));
+$("#ask-cancel").addEventListener("click", () => askAnswer(false));
+$("#ask").addEventListener("close", () => { if (askDone) askAnswer(false); });
+$("#ask-input").addEventListener("input", () => { $("#ask-ok").disabled = !$("#ask-input").value.trim(); });
+$("#ask-input").addEventListener("keydown", e => { if (e.key === "Enter" && !$("#ask-ok").disabled) { e.preventDefault(); $("#ask-ok").click(); } });
+// Every dialog closes on Esc (the browser does that) and on a click on the dimmed page around it.
+document.querySelectorAll("dialog").forEach(d => d.addEventListener("click", e => { if (e.target === d) d.close(); }));
 
 // The six sidebar sections and which settings groups (by id) each holds.
 // A group not listed here shows under System, so nothing ever disappears. Labels: ui.nav.<id>, ui.sec.<id>.help.
@@ -1321,7 +1576,47 @@ function groupsIn(sid) {
 
 // Controls for the system settings (forge-apply, asks for your password)
 
-function control(s) {
+const hasRange = s => typeof s.min === "number" && typeof s.max === "number";
+const rangeText = s => (hasRange(s) ? t("ui.range", {min: s.min, max: s.max}) : "") + (s.unit ? " " + s.unit : "");
+
+// A number field never stores an empty or unreadable value: it says what it needs, and on leaving the field
+// an empty one goes back to the last good value and one out of range is brought into range.
+function numberControl(s, compact) {
+  const id = "err-" + s.key.replace(/[^a-z0-9_-]/gi, "-");
+  const input = el("input", {type: "number", "aria-label": setLabel(s), min: s.min, max: s.max, spellcheck: "false",
+                             "aria-describedby": id});
+  input.value = current[s.key];
+  const err = el("div", {class: "err", id, hidden: true});
+  const read = () => {
+    const raw = input.value.trim(), n = Number(raw);
+    return raw === "" || input.validity.badInput || !Number.isFinite(n) ? null : n;
+  };
+  const inRange = n => !hasRange(s) || n >= s.min && n <= s.max;
+  const mark = bad => {
+    input.setAttribute("aria-invalid", String(bad));
+    err.hidden = !bad;
+    err.textContent = bad ? (hasRange(s) ? t("ui.num.range", {min: s.min, max: s.max}) : t("ui.num.needed")) : "";
+  };
+  input.addEventListener("input", () => {
+    const n = read();
+    mark(n === null || !inRange(n));
+    if (n !== null && inRange(n)) set(s.key, n);
+  });
+  input.addEventListener("blur", () => {
+    let n = read();
+    if (n === null) n = current[s.key];
+    else if (!inRange(n)) n = Math.min(s.max, Math.max(s.min, n));
+    input.value = n;
+    mark(false);
+    if (!same(n, current[s.key])) set(s.key, n);
+  });
+  const kids = [input];
+  if (!compact && hasRange(s)) kids.push(el("span", {class: "range", text: rangeText(s)}));
+  kids.push(err);
+  return el("span", {class: "num"}, kids);
+}
+
+function control(s, compact) {
   const v = current[s.key];
   if (s.type === "toggle") {
     const input = el("input", {type: "checkbox", role: "switch", "aria-label": setLabel(s)});
@@ -1335,50 +1630,101 @@ function control(s) {
     input.addEventListener("change", () => set(s.key, input.value));
     return input;
   }
-  const input = el("input", {type: s.type === "number" ? "number" : "text", "aria-label": setLabel(s),
-                             min: s.min, max: s.max, spellcheck: "false"});
+  if (s.type === "number") return numberControl(s, compact);
+  const input = el("input", {type: "text", "aria-label": setLabel(s), spellcheck: "false"});
   input.value = v;
-  input.addEventListener("input", () => set(s.key, s.type === "number" ? Number(input.value) : input.value));
+  input.addEventListener("input", () => set(s.key, input.value));
   return input;
 }
 
 function tagButtons(tags) {
   return el("div", {class: "rtags"}, (tags || []).map(tag => {
     const b = el("button", {type: "button", text: "#" + tag, title: t("ui.tag.title", {tag})});
-    b.addEventListener("click", () => { $("#search").value = "#" + tag; render(); });
+    b.addEventListener("click", () => { $("#search").value = "#" + tag; clearTimeout(searchTimer); render(); });
     return b;
   }));
 }
 
-function settingRow(s) {
+const resetTitle = s => t("ui.reset.title", {value: s.type === "select" ? optLabel(s.default) : fmt(s.default)});
+
+function settingRow(s, q) {
   const changed = !same(current[s.key], saved[s.key]);
   const custom = !same(current[s.key], s.default);
-  const reset = el("button", {type: "button", class: "reset", title: t("ui.reset.title", {value: s.type === "select" ? optLabel(s.default) : fmt(s.default)}),
-                              text: t("ui.reset")});
+  const reset = el("button", {type: "button", class: "reset", title: resetTitle(s), text: t("ui.reset")});
   reset.addEventListener("click", () => set(s.key, s.default, true));
   const label = el("div", {class: "label"}, [el("span", {class: "dot", title: t("ui.unsaved_dot")}), el("span", {text: setLabel(s)})]);
   if (s.advanced) label.append(el("span", {class: "pill", text: t("ui.advanced")}));
   const info = el("div", {}, [label]);
   if (s.help) info.append(el("div", {class: "help", text: setHelp(s)}));
-  info.append(tagButtons(s.tags));
+  if (q) info.append(tagButtons(s.tags));      // tags only help in search results
   return el("div", {class: "row" + (changed ? " changed" : "") + (custom ? " custom" : ""), "data-key": s.key},
             [info, el("div", {class: "ctl"}, [reset, control(s)])]);
 }
 
+// The folded part of a card: opens and closes in place (no new render), by its rows' height.
+function foldAway(id, rows, n) {
+  const open = openAdv.has(id);
+  const wrap = el("div", {class: "adv" + (open ? " open" : ""), id: "adv-" + id, inert: !open}, [el("div", {class: "adv-in"}, rows)]);
+  const label = el("span", {text: open ? t("ui.adv.hide") : tn("ui.adv.show", n)});
+  const b = el("button", {type: "button", class: "more", "aria-expanded": String(open), "aria-controls": wrap.id}, [icon("chevron"), label]);
+  b.addEventListener("click", () => {
+    const now = !openAdv.has(id);
+    now ? openAdv.add(id) : openAdv.delete(id);
+    wrap.classList.toggle("open", now);
+    wrap.inert = !now;
+    b.setAttribute("aria-expanded", String(now));
+    label.textContent = now ? t("ui.adv.hide") : tn("ui.adv.show", n);
+  });
+  return [wrap, b];
+}
+
 // Advanced settings stay folded away unless you open them, search for them, or changed them.
 function groupCard(g, items, q) {
+  if (g.id === "modes" && !q) return modesCard(g, items);
   const card = el("section", {class: "card", id: "g-" + g.id, "aria-labelledby": "h-" + g.id},
                   [el("h3", {id: "h-" + g.id, text: groupLabel(g)})]);
   const shownAlways = s => !s.advanced || q || !same(current[s.key], s.default) || !same(current[s.key], saved[s.key]);
   const folded = items.filter(s => !shownAlways(s));
-  const open = openAdv.has(g.id);
-  items.forEach(s => { if (shownAlways(s) || open) card.append(settingRow(s)); });
-  if (folded.length) {
-    const b = el("button", {type: "button", class: "more", "aria-expanded": String(open),
-                            text: open ? t("ui.adv.hide") : tn("ui.adv.show", folded.length)});
-    b.addEventListener("click", () => { open ? openAdv.delete(g.id) : openAdv.add(g.id); render(); });
-    card.append(b);
+  items.forEach(s => { if (shownAlways(s)) card.append(settingRow(s, q)); });
+  if (folded.length) card.append(...foldAway(g.id, folded.map(s => settingRow(s, q)), folded.length));
+  return card;
+}
+
+// Performance modes: the same few settings for each mode, as one grid (a column per mode, a row per setting).
+// Each cell is the usual control for its own setting, so saving works exactly as for any other row.
+const MODE_KEY = /^modes\.([a-z0-9_]+)\.([a-z0-9_]+)$/;
+function modesCard(g, items) {
+  const card = el("section", {class: "card", id: "g-" + g.id, "aria-labelledby": "h-" + g.id},
+                  [el("h3", {id: "h-" + g.id, text: groupLabel(g)})]);
+  const modes = [], parts = [], cells = {};
+  items.forEach(s => {
+    const m = MODE_KEY.exec(s.key);
+    if (!m) return;
+    if (!modes.includes(m[1])) modes.push(m[1]);
+    if (!parts.includes(m[2])) parts.push(m[2]);
+    cells[m[1] + "/" + m[2]] = s;
+  });
+  if (modes.length) {
+    const head = el("tr", {}, [el("th", {scope: "col"}, [el("span", {class: "sr", text: t("ui.modes.setting")})]),
+                               ...modes.map(m => el("th", {scope: "col", text: optLabel(m)}))]);
+    const body = parts.map(part => {
+      const first = cells[modes[0] + "/" + part];
+      let name = first ? setLabel(first).replace(/^[^:]+:\s*/, "") : part;
+      name = name.charAt(0).toUpperCase() + name.slice(1);    // sentence case once the mode name is gone
+      const th = el("th", {scope: "row"}, [document.createTextNode(name)]);
+      if (first && first.type === "number" && hasRange(first)) th.append(el("span", {class: "range", text: rangeText(first)}));
+      return el("tr", {}, [th, ...modes.map(m => {
+        const s = cells[m + "/" + part];
+        if (!s) return el("td");
+        const reset = el("button", {type: "button", class: "reset", title: resetTitle(s), "aria-label": t("ui.reset") + ": " + setLabel(s)}, [icon("undo")]);
+        reset.addEventListener("click", () => set(s.key, s.default, true));
+        return el("td", {class: "cell" + (!same(current[s.key], saved[s.key]) ? " changed" : "") + (!same(current[s.key], s.default) ? " custom" : ""),
+                         "data-key": s.key}, [el("span", {class: "in"}, [el("span", {class: "dot", title: t("ui.unsaved_dot")}), control(s, true), reset])]);
+      })]);
+    });
+    card.append(el("div", {class: "grid-wrap"}, [el("table", {class: "modes-grid"}, [el("thead", {}, [head]), el("tbody", {}, body)])]));
   }
+  items.filter(s => !MODE_KEY.test(s.key)).forEach(s => card.append(settingRow(s, "")));
   return card;
 }
 
@@ -1422,7 +1768,10 @@ function size(n) {
 
 function thumb(item, label) {
   const box = el("div", {class: "thumb"});
-  if (!item) { box.textContent = label || t("ui.none"); return box; }
+  if (!item) {
+    if (label) box.textContent = label; else { box.classList.add("none"); box.append(icon("image")); }
+    return box;
+  }
   const fallback = () => { box.replaceChildren(document.createTextNode(t("ui.file_of", {format: item.format.toUpperCase()}))); };
   if (item.format === "svg") {
     box.textContent = t("ui.svg_no_preview");   // SVG can carry scripts, so it is never shown here
@@ -1441,15 +1790,23 @@ function thumb(item, label) {
   return box;
 }
 
+// One preview per section, kept from render to render: a playing video wallpaper is not started again
+// and the preview scripts keep their state.
+const PREVIEW_NODES = new Map();
 function previewEl(sid) {
   const sec = A.schema.sections.find(s => s.id === sid);
-  return el("div", {class: "fa-preview", "data-section": sid, role: "img", "aria-label": t("ui.preview_of", {name: sec ? lookSecLabel(sec) : sid})}, [
+  const label = t("ui.preview_of", {name: sec ? lookSecLabel(sec) : sid});
+  const kept = PREVIEW_NODES.get(sid);
+  if (kept) { kept.setAttribute("aria-label", label); return kept; }
+  const node = el("div", {class: "fa-preview", "data-section": sid, role: "img", "aria-label": label}, [
     el("div", {class: "fa-wall"}),
     el("div", {class: "fa-window"}, [el("i"), el("i"), el("i")]),
     el("div", {class: "fa-dock"}, [el("i"), el("i"), el("i"), el("i"), el("i"), el("i")]),
     el("div", {class: "fa-boot"}, [el("b", {}, [document.createTextNode("Forge "), el("span", {text: "OS"})]),
                                    el("div", {class: "fa-progress"}, [el("i")])]),
   ]);
+  PREVIEW_NODES.set(sid, node);
+  return node;
 }
 
 // The wallpaper in every preview comes from the Background section: its first shown media field
@@ -1536,15 +1893,38 @@ function lookControl(sid, f) {
     input.addEventListener("change", () => lookSet(sid, f.key, input.value));
     return input;
   }
-  if (f.type === "number" || f.type === "slider") {
-    const input = el("input", {type: f.type === "slider" ? "range" : "number", "aria-label": name,
-                               min: f.min, max: f.max, step: f.step || 1});
+  if (f.type === "slider") {
+    // The ends of the scale on both sides, and the value now after it.
+    const input = el("input", {type: "range", "aria-label": name, min: f.min, max: f.max, step: f.step || 1});
     input.value = v;
-    const unit = el("span", {class: "unit", text: (f.type === "slider" ? v + " " : "") + unitLabel(f.unit)});
+    const unit = el("output", {class: "unit", text: v + " " + unitLabel(f.unit)});
     input.addEventListener("input", () => {
       const n = Number(input.value);
-      if (f.type === "slider") unit.textContent = n + " " + unitLabel(f.unit);
+      unit.textContent = n + " " + unitLabel(f.unit);
       lookSet(sid, f.key, n);
+    });
+    return el("span", {class: "ctl"}, [el("span", {class: "lim", "aria-hidden": "true", text: String(f.min)}), input,
+                                       el("span", {class: "lim", "aria-hidden": "true", text: String(f.max)}), unit]);
+  }
+  if (f.type === "number") {
+    // Like the system number fields: an empty or unreadable value is never kept, out of range is brought in on leaving.
+    const input = el("input", {type: "number", "aria-label": name, min: f.min, max: f.max, step: f.step || 1});
+    input.value = v;
+    const unit = el("span", {class: "unit", text: unitLabel(f.unit)});
+    const read = () => { const raw = input.value.trim(), n = Number(raw); return raw === "" || input.validity.badInput || !Number.isFinite(n) ? null : n; };
+    const ok = n => n !== null && (f.min === undefined || n >= f.min) && (f.max === undefined || n <= f.max);
+    input.addEventListener("input", () => {
+      const n = read();
+      input.setAttribute("aria-invalid", String(!ok(n)));
+      input.title = ok(n) ? "" : t("ui.num.range", {min: f.min, max: f.max});
+      if (ok(n)) lookSet(sid, f.key, n);
+    });
+    input.addEventListener("blur", () => {
+      let n = read();
+      if (n === null) n = A.current[sid][f.key];
+      else if (!ok(n)) n = Math.min(f.max, Math.max(f.min, n));
+      input.value = n; input.setAttribute("aria-invalid", "false"); input.title = "";
+      if (!same(n, A.current[sid][f.key])) lookSet(sid, f.key, n);
     });
     return el("span", {class: "ctl"}, [input, unit]);
   }
@@ -1553,8 +1933,14 @@ function lookControl(sid, f) {
     const hex = el("input", {type: "text", class: "hex", "aria-label": t("ui.hex_of", {name}), maxlength: "7", spellcheck: "false"});
     pick.value = hex.value = v;
     pick.addEventListener("input", () => { hex.value = pick.value; lookSet(sid, f.key, pick.value); });
+    const good = () => /^#[0-9a-fA-F]{6}$/.test(hex.value);
     hex.addEventListener("input", () => {
-      if (/^#[0-9a-fA-F]{6}$/.test(hex.value)) { pick.value = hex.value.toLowerCase(); lookSet(sid, f.key, hex.value.toLowerCase()); }
+      hex.setAttribute("aria-invalid", String(!good()));
+      hex.title = good() ? "" : t("ui.hex.bad");
+      if (good()) { pick.value = hex.value.toLowerCase(); lookSet(sid, f.key, hex.value.toLowerCase()); }
+    });
+    hex.addEventListener("blur", () => {
+      if (!good()) { hex.value = A.current[sid][f.key]; hex.setAttribute("aria-invalid", "false"); hex.title = ""; }
     });
     return el("span", {class: "ctl"}, [pick, hex]);
   }
@@ -1571,7 +1957,8 @@ function lookControl(sid, f) {
     return input;
   }
   if (f.type === "text") {
-    const input = el("input", {type: "text", "aria-label": name, maxlength: String(f.max_length || 256), spellcheck: "false"});
+    const input = el("input", {type: "text", "aria-label": name, maxlength: String(f.max_length || 256), spellcheck: "false",
+                               placeholder: f.choices === "backend" ? t("ui.leave_as_is") : null});
     input.value = v;
     input.addEventListener("input", () => lookSet(sid, f.key, input.value));
     return input;
@@ -1588,7 +1975,7 @@ function lookControl(sid, f) {
   }, sid + "." + f.key));
   const clear = el("button", {type: "button", class: "btn small", text: t("ui.clear"), disabled: !item});
   clear.addEventListener("click", () => { lookSet(sid, f.key, ""); renderKeep(); });
-  return el("div", {class: "media-pick"}, [thumb(item, t("ui.nothing_chosen")),
+  return el("div", {class: "media-pick"}, [thumb(item, ""),
     el("div", {}, [nameEl, el("div", {class: "help", text: item ? kindLabel(item.kind) + ", " + size(item.size) : ""}),
                    el("div", {class: "mp-acts"}, [choose, up, clear]),
                    el("div", {class: "mp-status", role: "status", "data-status": sid + "." + f.key})])]);
@@ -1606,7 +1993,7 @@ function lookRow(sid, f) {
   if (f.help) info.append(el("div", {class: "help", text: fHelp(sid, f)}));
   const ch = f.choices === "backend" ? (A.choices[sid] || {})[f.key] : null;
   if (ch && ch.note) info.append(el("div", {class: "help", text: tr(ch.note)}));
-  if (f.tags) info.append(tagButtons(f.tags));
+  if (f.tags && query()) info.append(tagButtons(f.tags));
   const media = f.type === "media";
   const row = el("div", {class: "row" + (media ? " stack" : "") + (!same(vals[f.key], A.saved[sid][f.key]) ? " changed" : "")
                          + (!same(vals[f.key], f.default) ? " custom" : ""), "data-look": sid, "data-key": f.key,
@@ -1638,6 +2025,8 @@ function lookFooter(sid) {
 
 async function lookSave(sid, apply, out) {
   out.className = "out"; out.textContent = apply ? t("ui.saving_applying") : t("ui.saving");
+  const foot = out.closest(".look-foot");
+  if (foot) foot.querySelectorAll("button").forEach(b => { b.disabled = true; b.setAttribute("aria-busy", "true"); });
   try {
     const r = await (await fetch("/api/appearance/save", {method: "POST", headers: H,
                                  body: JSON.stringify({values: {[sid]: A.current[sid]}})})).json();
@@ -1662,25 +2051,22 @@ async function lookSave(sid, apply, out) {
 }
 
 function lookSection(sec, fields) {
+  // Whether it can be applied yet is said once, next to the Save button (lookFooter).
   const head = el("div", {class: "look-head"}, [el("h3", {id: "lh-" + sec.id, text: lookSecLabel(sec)})]);
-  if (!A.backends[sec.id]) head.append(el("span", {class: "pill", text: t("ui.look.no_apply")}));
   if (sec.help) head.append(el("p", {text: lookSecHelp(sec)}));
   const card = el("div", {class: "card"});
   const q = query();
   const always = f => !f.advanced || q || !same(A.current[sec.id][f.key], f.default) || lookDirty(sec.id) && !same(A.current[sec.id][f.key], A.saved[sec.id][f.key]);
-  const advKey = "look-" + sec.id, open = openAdv.has(advKey);
-  const folded = fields.filter(f => !always(f) && looksVisible(f, A.current[sec.id]));
+  const advKey = "look-" + sec.id;
+  const rest = fields.filter(f => !always(f));
+  const folded = rest.filter(f => looksVisible(f, A.current[sec.id]));
   if (!sec.fields.length) card.append(el("div", {class: "empty", text: t("ui.look.empty", {name: lookSecLabel(sec)})}));
-  fields.forEach(f => { if (always(f) || open) card.append(lookRow(sec.id, f)); });
+  fields.forEach(f => { if (always(f)) card.append(lookRow(sec.id, f)); });
   if (fields.length && card.firstChild) card.firstChild.style.borderTop = "0";
-  if (folded.length) {
-    const b = el("button", {type: "button", class: "more", "aria-expanded": String(open),
-                            text: open ? t("ui.adv.hide") : tn("ui.adv.show", folded.length)});
-    b.addEventListener("click", () => { open ? openAdv.delete(advKey) : openAdv.add(advKey); renderKeep(); });
-    card.append(b);
-  }
+  if (folded.length) card.append(...foldAway(advKey, rest.map(f => lookRow(sec.id, f)), folded.length));
+  else rest.forEach(f => card.append(lookRow(sec.id, f)));   // only hidden ones: they show when what they depend on changes
   if (sec.fields.length) card.append(lookFooter(sec.id));
-  const prev = el("div", {}, [previewEl(sec.id), el("p", {class: "cap", text: t("ui.look.preview_cap")})]);
+  const prev = el("div", {class: "prev"}, [previewEl(sec.id), el("p", {class: "cap", text: t("ui.look.preview_cap")})]);
   return el("section", {class: "look", id: "look-" + sec.id, "aria-labelledby": "lh-" + sec.id},
             [head, el("div", {class: "look-body"}, [prev, card])]);
 }
@@ -1715,7 +2101,7 @@ function libraryCard() {
 }
 
 async function removeMedia(m) {
-  if (!confirm(t("ui.lib.remove_confirm", {name: m.name}))) return;
+  if (!await ask({title: t("ui.remove_name", {name: m.name}), body: t("ui.lib.remove_confirm", {name: m.name}), ok: t("ui.remove"), danger: true})) return;
   const r = await (await fetch("/api/appearance/media/remove", {method: "POST", headers: H, body: JSON.stringify({id: m.id})})).json();
   A.status = {text: r.ok ? t("ui.lib.removed", {name: m.name}) : t("ui.lib.not_removed", {why: r.media_problem ? tr(r.media_problem) : t("ui.lib.gone")}),
               where: null};
@@ -1759,14 +2145,26 @@ $("#mediafile").addEventListener("change", async () => {
   if ($("#picker").open) fillPicker(); else renderKeep();
 });
 
-function status(text) {
+// The upload message, with a progress bar for the file being sent (pct is null when none is on the way).
+function status(text, pct) {
   A.status.text = text;
+  A.status.pct = pct === undefined ? null : pct;
   drawStatus();
 }
+function statusKids() {
+  if (!A.status.text) return [];
+  const kids = [document.createTextNode(A.status.text)];
+  if (A.status.pct !== null && A.status.pct !== undefined) {
+    const bar = el("i");
+    bar.style.transform = "scaleX(" + Math.max(0, Math.min(100, A.status.pct)) / 100 + ")";
+    kids.push(el("div", {class: "pbar", "aria-hidden": "true"}, [bar]));
+  }
+  return kids;
+}
 function drawStatus() {
-  [$("#lib-progress"), $("#pk-progress")].forEach(p => { if (p) p.textContent = A.status.text; });
+  [$("#lib-progress"), $("#pk-progress")].forEach(p => { if (p) p.replaceChildren(...statusKids()); });
   document.querySelectorAll(".mp-status").forEach(p => {
-    p.textContent = p.dataset.status === A.status.where ? A.status.text : "";
+    p.replaceChildren(...(p.dataset.status === A.status.where ? statusKids() : []));
   });
 }
 
@@ -1778,7 +2176,7 @@ function uploadOne(file) {
     x.setRequestHeader("X-Forge-Token", TOKEN);
     x.setRequestHeader("Content-Type", "application/octet-stream");
     x.upload.addEventListener("progress", e => {
-      if (e.lengthComputable) status(t("ui.up.progress", {name: file.name, pct: Math.floor(e.loaded / e.total * 100)}));
+      if (e.lengthComputable) { const pct = Math.floor(e.loaded / e.total * 100); status(t("ui.up.progress", {name: file.name, pct}), pct); }
     });
     x.addEventListener("load", () => {
       let d = {};
@@ -1787,7 +2185,7 @@ function uploadOne(file) {
       resolve(d.ok ? d.item : null);
     });
     x.addEventListener("error", () => { status(t("ui.up.not_sent", {name: file.name})); resolve(null); });
-    status(t("ui.up.adding", {name: file.name}));
+    status(t("ui.up.adding", {name: file.name}), 0);
     x.send(file);
   });
 }
@@ -1859,8 +2257,9 @@ function presetTile(p) {
   apply.addEventListener("click", () => askApply(p));
   const ren = el("button", {type: "button", class: "btn small", text: t("preset.rename"), "aria-label": t("preset.rename_name", {name: p.name})});
   ren.addEventListener("click", async () => {
-    const name = prompt(t("preset.rename.prompt"), p.name);
-    if (name === null) return;
+    const name = await ask({title: t("preset.rename_name", {name: p.name}), ok: t("preset.rename"),
+                            input: {label: t("preset.rename.prompt"), value: p.name, max: 60}});
+    if (name === false) return;
     const r = await presetPost("rename", {id: p.id, name});
     if (r.ok) presetOut(true, t("preset.renamed", {name: r.preset.name}));
   });
@@ -1868,7 +2267,8 @@ function presetTile(p) {
   exp.addEventListener("click", () => exportPreset(p));
   const del = el("button", {type: "button", class: "btn small danger", text: t("preset.delete"), "aria-label": t("preset.delete_name", {name: p.name})});
   del.addEventListener("click", async () => {
-    if (!confirm(t(p.origin === "sync" ? "preset.delete.confirm_synced" : "preset.delete.confirm", {name: p.name}))) return;
+    if (!await ask({title: t("preset.delete_name", {name: p.name}), ok: t("preset.delete"), danger: true,
+                    body: t(p.origin === "sync" ? "preset.delete.confirm_synced" : "preset.delete.confirm", {name: p.name})})) return;
     const r = await presetPost("delete", {id: p.id});
     if (r.ok) presetOut(true, t("preset.deleted", {name: p.name}));
   });
@@ -1880,8 +2280,12 @@ function presetTile(p) {
 function presetsCard() {
   const name = el("input", {type: "text", id: "ps-name", maxlength: "60", spellcheck: "false", "aria-label": t("preset.name.aria"),
                             placeholder: t("preset.name.placeholder")});
-  const save = el("button", {type: "button", class: "btn primary", text: t("preset.save")});
+  const save = el("button", {type: "button", class: "btn primary", text: t("preset.save"), disabled: true});
+  const named = () => !!name.value.trim();
+  name.addEventListener("input", () => { save.disabled = !named(); });
   const doSave = async () => {
+    if (!named()) return;
+    save.disabled = true; save.classList.add("busy"); save.setAttribute("aria-busy", "true");
     const r = await presetPost("save", {name: name.value});
     if (r.ok) presetOut(true, t("preset.saved", {name: r.preset.name}));
   };
@@ -2049,7 +2453,7 @@ function updateNav() {
   SECTIONS.forEach(S => {
     const dirty = S.id === "appearance" ? A.schema.sections.some(s => lookDirty(s.id))
       : groupsIn(S.id).some(g => schema.settings.some(s => s.group === g.id && !same(current[s.key], saved[s.key])));
-    const a = el("a", {href: "#" + S.id, class: q && c[S.id] ? "hit" : null,
+    const a = el("a", {href: "#" + S.id, class: q && c[S.id] ? "hit" : null, title: secLabel(S),
                        "aria-current": !q && page === S.id ? "page" : null},
                  [el("span", {class: "n", text: secLabel(S)})]);
     if (q) a.append(el("span", {class: "cnt", text: String(c[S.id]), "aria-label": tn("ui.nav.matches", c[S.id])}));
@@ -2057,13 +2461,22 @@ function updateNav() {
     a.addEventListener("click", e => {
       if (!query()) return;
       $("#search").value = "";
+      clearTimeout(searchTimer);
       if (location.hash === "#" + S.id) {          // no hashchange will come: show the page now
-        e.preventDefault(); go();
-        const h = $("#page-title"); if (h) h.focus();
+        e.preventDefault(); switchPage();
       }
     });
     nav.append(a);
   });
+}
+
+// Where the system settings live and which Forge OS this is: on the Data page, out of the way of the save bar.
+const INFO = {file: "", version: ""};
+function aboutCard() {
+  const rows = [el("dt", {text: t("ui.about.file")}), el("dd", {}, [el("code", {id: "file", text: INFO.file})])];
+  if (INFO.version) rows.push(el("dt", {text: t("ui.about.version")}), el("dd", {text: "Forge OS " + tr(INFO.version)}));
+  return el("section", {class: "card", id: "about", "aria-labelledby": "about-h"},
+            [el("h3", {id: "about-h", text: t("ui.about.title")}), el("dl", {class: "about"}, rows)]);
 }
 
 function render(keepScroll) {
@@ -2076,6 +2489,7 @@ function render(keepScroll) {
   else {
     const S = SECTIONS.find(s => s.id === page);
     kids = [header(secLabel(S), secHelp(S)), ...groupsIn(page).map(g => groupCard(g, schema.settings.filter(s => s.group === g.id), ""))];
+    if (page === "data") kids.push(aboutCard());
   }
   content.replaceChildren(...kids);
   updateNav(); updatePreviews(); updateBar(); drawStatus();
@@ -2090,7 +2504,14 @@ function go() {
   render();
   window.scrollTo(0, 0);
 }
-window.addEventListener("hashchange", () => { go(); const h = $("#page-title"); if (h) h.focus(); });
+// A new page: a short crossfade where the browser can (and you did not ask for less motion), back to the top,
+// and the keyboard focus on its heading, shown, so you know where you are.
+function switchPage() {
+  if (!schema) return;
+  const run = () => { go(); const h = $("#page-title"); if (h) h.focus({focusVisible: true}); };
+  if (document.startViewTransition && !still()) document.startViewTransition(run); else run();
+}
+window.addEventListener("hashchange", switchPage);
 
 // System settings: unsaved changes, save, undo, import and export (unchanged behaviour)
 
@@ -2098,7 +2519,7 @@ function set(key, value, rerender) {
   current[key] = value;
   if (rerender) return renderKeep();
   const s = schema.settings.find(x => x.key === key);
-  document.querySelectorAll(`.row[data-key="${CSS.escape(key)}"]:not([data-look])`).forEach(r => {
+  document.querySelectorAll(`.row[data-key="${CSS.escape(key)}"]:not([data-look]), .cell[data-key="${CSS.escape(key)}"]`).forEach(r => {
     r.classList.toggle("changed", !same(value, saved[key]));
     r.classList.toggle("custom", !same(value, s.default));
   });
@@ -2109,23 +2530,23 @@ function changes() { return Object.keys(current).filter(k => !same(current[k], s
 
 function updateBar() {
   const n = changes().length;
-  $("#save").disabled = $("#discard").disabled = n === 0;
+  const busy = $("#save").classList.contains("busy");
+  $("#save").disabled = n === 0 || busy;
+  $("#discard").disabled = n === 0 || busy;
   $("#count").replaceChildren(n ? el("b", {text: tn("ui.bar.changes", n)}) : document.createTextNode(t("ui.bar.none")));
   // Appearance saves on its own, so the bar only shows there when system settings wait to be saved.
-  $("#bar").hidden = page === "appearance" && !query() && n === 0 && !$("#out").textContent;
+  $("#bar").hidden = page === "appearance" && !query() && n === 0;
 }
 
-function show(ok, text) {
-  const o = $("#out"); o.className = "out " + (ok ? "ok" : "bad");
-  o.textContent = (ok ? t("ui.saved_applied") : t("ui.not_applied")) + "\n" + (text ? tr(text) : "");
-}
-function note(ok, text) { const o = $("#out"); o.className = "out " + (ok ? "ok" : "bad"); o.textContent = text; updateBar(); }
+function show(ok, text) { toast(ok, ok ? t("ui.saved_applied") : t("ui.not_applied"), text ? tr(text) : ""); }
+function note(ok, text) { toast(ok, text); updateBar(); }
 
 async function load() {
   const r = await fetch("/api/settings", {headers: H});
+  if (!r.ok) throw new Error("HTTP " + r.status);
   const d = await r.json();
   schema = d.schema; saved = {...d.values}; current = {...d.values};
-  $("#file").textContent = t("ui.bar.file", {path: d.file}) + (d.forge_version ? ". Forge OS " + tr(d.forge_version) : "");
+  INFO.file = d.file || ""; INFO.version = d.forge_version || "";
   $("#undo").disabled = !d.can_undo;
 }
 
@@ -2149,38 +2570,69 @@ async function loadChoices(sid) {
   } catch (e) { /* keep the text box */ }
 }
 
+// Save shows that it is working (a spinner, aria-busy) and says "Saved" only once forge-apply answered.
 async function post(path, body) {
-  $("#save").disabled = true; $("#save").textContent = t("ui.applying");
+  const b = $("#save");
+  b.classList.add("busy"); b.setAttribute("aria-busy", "true"); b.disabled = true; $("#discard").disabled = true;
+  b.textContent = t("ui.applying");
   try {
     const r = await fetch(path, {method: "POST", headers: H, body: JSON.stringify(body || {})});
-    const d = await r.json(); show(d.ok, d.output); if (d.ok) { await load(); renderKeep(); } else updateBar();
+    const d = await r.json(); show(d.ok, d.output); if (d.ok) await load();
   } catch (e) { show(false, String(e)); }
-  $("#save").textContent = t("ui.save_apply");
+  b.classList.remove("busy"); b.removeAttribute("aria-busy");
+  b.textContent = t("ui.save_apply");
+  renderKeep();
 }
 
 // Changing the update channel switches the system image (forge-apply does it, as root). Never without a yes here.
-function channelConfirmed() {
+async function channelConfirmed() {
   const ch = current["updates.channel"];
   if (ch === saved["updates.channel"]) return null;
   const back = ch === "testing" ? "stable" : "testing";
-  const ok = window.confirm(t("ui.channel.ask", {channel: optLabel(ch)}) + "\n\n" +
-    (ch === "testing" ? t("ui.channel.testing") + "\n\n" : "") + t("ui.channel.download") + "\n\n" +
-    t("ui.channel.back", {channel: optLabel(back)}));
+  const ok = await ask({title: t("ui.channel.ask", {channel: optLabel(ch)}), ok: t("ui.channel.switch"),
+                        body: [ch === "testing" ? t("ui.channel.testing") : "", t("ui.channel.download"),
+                               t("ui.channel.back", {channel: optLabel(back)})]});
   return ok ? ch : false;
 }
-$("#save").addEventListener("click", () => {
-  const sw = channelConfirmed();
+$("#save").addEventListener("click", async () => {
+  const sw = await channelConfirmed();
   if (sw === false) return note(false, t("ui.channel.cancelled"));
   post("/api/save", sw ? {values: current, switch_channel: sw} : {values: current});
 });
-$("#undo").addEventListener("click", () => post("/api/undo"));
 $("#discard").addEventListener("click", () => { current = {...saved}; renderKeep(); });
+
+// Export, import and undo live in the "More" menu of the save bar.
+const menu = $("#more-menu"), more = $("#more");
+function menuOpen(open) {
+  menu.hidden = !open;
+  more.setAttribute("aria-expanded", String(open));
+  if (open) { const first = menu.querySelector("button:not(:disabled)"); if (first) first.focus(); }
+}
+more.addEventListener("click", () => menuOpen(menu.hidden));
+document.addEventListener("click", e => { if (!menu.hidden && !e.target.closest(".menu-wrap")) menuOpen(false); });
+menu.addEventListener("keydown", e => {
+  const items = [...menu.querySelectorAll("button:not(:disabled)")], i = items.indexOf(document.activeElement);
+  if (e.key === "Escape") { e.preventDefault(); menuOpen(false); more.focus(); }
+  else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+    e.preventDefault();
+    const next = items[(i + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length];
+    if (next) next.focus();
+  } else if (e.key === "Tab") menuOpen(false);
+});
+menu.querySelectorAll("button").forEach(b => b.addEventListener("click", () => menuOpen(false)));
+
+$("#undo").addEventListener("click", async () => {
+  if (await ask({title: t("ui.undo.ask"), body: t("ui.undo.ask_body"), ok: t("ui.undo")})) post("/api/undo");
+});
 $("#export").addEventListener("click", async () => {
-  const d = await (await fetch("/api/export?portable=1", {headers: H})).json();
+  let d;
+  try { d = await (await fetch("/api/export?portable=1", {headers: H})).json(); }
+  catch (e) { return note(false, t("ui.not_exported") + "\n" + t("ui.closed")); }
   if (d.error) return note(false, t("ui.not_exported") + "\n" + tr(d.error));
-  const a = el("a", {href: URL.createObjectURL(new Blob([JSON.stringify(d, null, 2)], {type: "application/json"})),
-                     download: "forge-settings-" + d.from_host + ".json"});
+  const name = "forge-settings-" + d.from_host + ".json";
+  const a = el("a", {href: URL.createObjectURL(new Blob([JSON.stringify(d, null, 2)], {type: "application/json"})), download: name});
   document.body.append(a); a.click(); a.remove();
+  toast(true, t("ui.exported", {name}));
 });
 $("#import").addEventListener("click", () => $("#importfile").click());
 $("#importfile").addEventListener("change", async () => {
@@ -2192,16 +2644,28 @@ $("#importfile").addEventListener("change", async () => {
   Object.assign(current, d.values); renderKeep();
   note(true, tn("ui.import.loaded", changes().length, {name: f.name}) + (d.notes.length ? "\n" + d.notes.map(tr).join("\n") : ""));
 });
-$("#search").addEventListener("input", () => render());
-$("#search").addEventListener("keydown", e => { if (e.key === "Escape") { $("#search").value = ""; render(); } });
+
+// Search runs a moment after you stop typing (120 ms), not on every key.
+let searchTimer = 0;
+function searchNow() {
+  clearTimeout(searchTimer);
+  render();
+  const q = query();
+  if (q) announce($("#page-title") && $("#page-title").nextSibling ? $("#page-title").nextSibling.textContent : "");
+}
+$("#search").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(searchNow, 120); });
+$("#search").addEventListener("keydown", e => { if (e.key === "Escape") { $("#search").value = ""; searchNow(); } });
 document.addEventListener("keydown", e => {
-  if (e.key === "/" && !/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName) && !$("#picker").open && !$("#ps-dialog").open) {
+  if (e.key === "/" && !/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName) && !document.querySelector("dialog[open]")) {
     e.preventDefault(); $("#search").focus();
   }
 });
+let dashTimer = 0;
 $("#dash").addEventListener("click", async () => {
   const r = await fetch("/api/open-dashboard", {method: "POST", headers: H, body: "{}"}).catch(() => null);
   $("#dash").textContent = r && r.ok && (await r.json()).ok ? t("ui.dash.opening") : t("ui.dash.failed");
+  clearTimeout(dashTimer);
+  dashTimer = setTimeout(() => { $("#dash").textContent = t("ui.dash.open"); }, 3000);
 });
 
 // The language switch: saved per user (no password). The page changes at once, unsaved changes stay.
@@ -2212,15 +2676,51 @@ document.querySelectorAll("#lang button").forEach(b => b.addEventListener("click
   try {
     const d = await (await fetch("/api/ui/language", {method: "POST", headers: H, body: JSON.stringify({language: b.dataset.lang})})).json();
     if (!d.ok) return;
-    setI18n(d.i18n); applyStatic(); drawLang(); renderKeep();
+    setI18n(d.i18n); applyStatic(); drawLang(); if (schema) renderKeep(); else if ($("#content .load-error")) loadFailed();
   } catch (e) { /* keep the current language */ }
 }));
 applyStatic(); drawLang();
-setInterval(() => fetch("/api/ping", {headers: H}), 30000);
-window.addEventListener("beforeunload", e => {
-  if (changes().length || A.schema.sections.some(s => lookDirty(s.id))) e.preventDefault();
+
+// Forge Settings closes itself after a while without this page (for example while the PC slept). Say so
+// instead of failing quietly, and offer to try again.
+async function ping() {
+  let ok = false;
+  try { ok = (await fetch("/api/ping", {headers: H})).ok; } catch (e) { ok = false; }
+  $("#conn").hidden = ok;
+  return ok;
+}
+setInterval(ping, 30000);
+window.addEventListener("focus", ping);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) ping(); });
+$("#reconnect").addEventListener("click", async () => {
+  $("#reconnect").disabled = true;
+  if (!await ping()) $("#conn-text").textContent = t("ui.conn.gone");
+  $("#reconnect").disabled = false;
 });
-Promise.all([load(), loadLook()]).then(go);
+
+window.addEventListener("beforeunload", e => {
+  if (schema && changes().length || A.schema.sections.some(s => lookDirty(s.id))) e.preventDefault();
+});
+
+// Loading: placeholder cards first, then the page; if the settings can't be read, say so with a way to retry.
+function loadFailed() {
+  $("#bar").hidden = true;
+  const retry = el("button", {type: "button", class: "btn primary", text: t("ui.retry")});
+  retry.addEventListener("click", () => {
+    $("#content").replaceChildren(el("div", {"aria-hidden": "true"}, [el("div", {class: "skel h"}), el("div", {class: "skel p"}),
+                                                                       el("div", {class: "skel card"}), el("div", {class: "skel card"})]));
+    start();
+  });
+  $("#content").replaceChildren(el("section", {class: "card load-error", role: "alert"}, [
+    el("h3", {text: t("ui.load.failed")}), el("p", {text: t("ui.load.failed_help")}), retry]));
+}
+async function start() {
+  announce(t("ui.loading"));
+  try { await Promise.all([load(), loadLook()]); }
+  catch (e) { schema = null; return loadFailed(); }
+  go();
+}
+start();
 </script>
 <!--__PREVIEW_HOOKS__-->
 </body>
@@ -2233,88 +2733,169 @@ WELCOME_PAGE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%23c2541f'/%3E%3Cpath d='M5 4h6v2H7v1.5h3v2H7V12H5z' fill='%23fff'/%3E%3C/svg%3E">
 <title data-i18n="welcome.title">Welcome to Forge OS</title>
 <style nonce="__NONCE__">
-:root {
-  --bg: #f6f6f4; --panel: #ffffff; --text: #1c1c1e; --muted: #6b6b70; --line: #e4e4e0;
-  --accent: #d9622b; --ok: #2f8f5b; --bad: #c0392b;
-}
-@media (prefers-color-scheme: dark) {
-  :root { --bg: #141416; --panel: #1d1d20; --text: #ececee; --muted: #9a9aa2; --line: #2c2c31; --accent: #ff7a3d; }
-}
+/*__TEMPERED__*/
+/* The first-boot Welcome page on the shared "Tempered" tokens above: numbered steps, quiet motion. */
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--text);
-       font: 14px/1.5 system-ui, "Noto Sans", "Noto Sans Thai", sans-serif; }
-main { max-width: 760px; margin: 0 auto; padding: 32px 24px 64px; }
-h1 { font-size: 24px; margin: 0 0 4px; }
-h1 span { color: var(--accent); }
-.lead { color: var(--muted); margin: 0 0 24px; }
-section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; margin-bottom: 16px; }
-h2 { font-size: 16px; margin: 0 0 6px; }
-p { margin: 6px 0; }
-.muted { color: var(--muted); font-size: 13px; }
-code { font: 13px ui-monospace, monospace; background: var(--bg); border: 1px solid var(--line);
-       border-radius: 6px; padding: 2px 6px; }
-.cmd { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
-.cmd code { flex: 1; padding: 8px 10px; }
-label.opt { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; border-top: 1px solid var(--line); }
-label.opt:first-of-type { border-top: 0; }
-button { font: inherit; padding: 7px 12px; border-radius: 8px; border: 1px solid var(--line);
-         background: var(--bg); color: var(--text); cursor: pointer; }
-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
-button:disabled { opacity: .45; cursor: default; }
-.rep h3 { font-size: 14px; margin: 12px 0 2px; }
-.rep ul { margin: 0; padding-left: 20px; }
-.ok { color: var(--ok); } .warn { color: var(--bad); } .info, .unknown { color: var(--muted); }
-#out { white-space: pre-wrap; font: 12px/1.4 ui-monospace, monospace; display: none; margin-top: 8px; }
-:lang(th) body { line-height: 1.65; }
+body { margin: 0; background: var(--bg); color: var(--text); font: var(--text-m)/var(--leading) var(--font); }
+button, input { font: inherit; color: inherit; }
+[hidden] { display: none !important; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+main { max-width: 780px; margin: 0 auto; padding: var(--space-7) var(--space-5) var(--space-7); }
+h1 { font-size: 28px; margin: 0 0 var(--space-2); font-weight: 600; letter-spacing: -.2px; }
+h1 .brand { color: var(--accent-text); }
+.lead { color: var(--muted); margin: 0 0 var(--space-6); max-width: 64ch; }
+.steps { list-style: none; margin: 0; padding: 0; }
+.step { display: grid; grid-template-columns: 32px minmax(0, 1fr); gap: var(--space-3); margin-bottom: var(--space-4); }
+.step-n { width: 28px; height: 28px; margin-top: var(--space-3); border-radius: 50%; display: grid; place-items: center;
+          font-weight: 600; font-size: var(--text-s); color: var(--muted); background: var(--panel); border: 1px solid var(--line);
+          font-variant-numeric: tabular-nums; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-m); box-shadow: var(--edge), var(--shadow-1);
+        min-width: 0; }
+.card > .hd { padding: var(--space-4) var(--space-4) 0; }
+.card > .bd { padding: var(--space-2) var(--space-4) var(--space-4); }
+h2 { font-size: 16px; margin: 0 0 var(--space-1); font-weight: 600; display: flex; gap: var(--space-2); align-items: center; flex-wrap: wrap; }
+p { margin: var(--space-2) 0; }
+.muted { color: var(--muted); font-size: var(--text-s); }
+:lang(th) .muted { font-size: var(--text-m); }
+.pill { display: inline-block; font-size: 12px; font-weight: 500; padding: 0 var(--space-2); border-radius: var(--radius-pill); background: var(--bg);
+        color: var(--muted); border: 1px solid var(--line); white-space: nowrap; line-height: 20px; }
+.pill.ok { background: var(--ok-soft); color: var(--ok); border-color: transparent; }
+.pill.warn { background: var(--warn-soft); color: var(--warn); border-color: transparent; }
+.pill.info { background: var(--info-soft); color: var(--info); border-color: transparent; }
+code { font: var(--text-s) var(--font-mono); background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius-s); padding: 1px 6px; }
+.cmd { display: flex; gap: var(--space-2); align-items: center; margin: var(--space-2) 0; }
+.cmd code { flex: 1; min-width: 0; padding: 7px var(--space-3); overflow-x: auto; white-space: nowrap; }
+/* Rows like the Dashboard's: text on the left, its control or state on the right */
+.rows { border: 1px solid var(--line); border-radius: var(--radius-m); overflow: hidden; margin-top: var(--space-3); }
+.row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-4); align-items: center; padding: var(--space-3) var(--space-4);
+       border-top: 1px solid var(--line); }
+.row:first-child { border-top: 0; }
+label.row { cursor: pointer; transition: background-color var(--dur-1) var(--ease); }
+label.row:hover { background: color-mix(in srgb, var(--bg) 60%, transparent); }
+.row .t { font-weight: 600; overflow-wrap: anywhere; }
+.row .d { color: var(--muted); font-size: var(--text-s); overflow-wrap: anywhere; }
+:lang(th) .row .d { font-size: var(--text-m); }
+.row ul.d { margin: var(--space-1) 0 0; padding-left: 18px; }
+.summary { margin: var(--space-3) 0 0; font-weight: 600; }
+.switch { position: relative; width: 36px; height: 20px; display: inline-block; flex: none; }
+.switch input { position: absolute; inset: 0; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+.switch .knob { position: absolute; inset: 0; background: var(--field); border-radius: var(--radius-pill); pointer-events: none;
+                box-shadow: inset 0 0 0 1px var(--border); transition: background-color var(--dur-1) var(--ease), box-shadow var(--dur-1) var(--ease); }
+.switch .knob::before { content: ""; position: absolute; width: 14px; height: 14px; left: 3px; top: 3px; border-radius: 50%;
+                        background: var(--border); transition: transform var(--dur-2) var(--ease), background-color var(--dur-1) var(--ease); }
+.switch input:checked + .knob { background: var(--accent-fill); box-shadow: inset 0 0 0 1px var(--accent-fill); }
+.switch input:checked + .knob::before { transform: translateX(16px); background: var(--on-accent); }
+.switch input:focus-visible + .knob { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent); }
+.btn { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 var(--space-3); border-radius: var(--radius-s);
+       border: 1px solid var(--line); background: var(--panel); cursor: pointer; white-space: nowrap;
+       transition: color var(--dur-1) var(--ease), background-color var(--dur-1) var(--ease), border-color var(--dur-1) var(--ease),
+                   box-shadow var(--dur-1) var(--ease), transform var(--dur-1) var(--ease); }
+.btn:hover:not(:disabled) { border-color: var(--border); background: var(--bg); }
+.btn:active:not(:disabled) { transform: scale(.98); }
+.btn.primary { background: var(--accent-fill); border-color: var(--accent-fill); color: var(--on-accent); font-weight: 600; }
+.btn.primary:hover:not(:disabled) { background: color-mix(in srgb, var(--accent-fill) 86%, var(--text)); }
+.btn:disabled { cursor: default; color: var(--muted); background: transparent; border-color: var(--line); }
+.btn.primary:disabled { background: var(--line); border-color: var(--line); color: var(--muted); }
+.btn.busy:disabled { background: var(--accent-fill); border-color: var(--accent-fill); color: var(--on-accent); cursor: progress; }
+.btn.busy::before { content: ""; width: 12px; height: 12px; border-radius: 50%; border: 2px solid currentColor; border-right-color: transparent;
+                    animation: forge-spin 700ms linear infinite; }
+@keyframes forge-spin { to { transform: rotate(360deg); } }
+.foot { display: flex; gap: var(--space-3); align-items: center; flex-wrap: wrap; margin-top: var(--space-3); }
+.result { flex: 1; min-width: 200px; font-weight: 600; padding: var(--space-2) var(--space-3); border-radius: var(--radius-s);
+          animation: forge-in var(--dur-2) var(--ease); }
+.result:empty { display: none; }
+.result.ok { background: var(--ok-soft); color: var(--ok); }
+.result.bad { background: var(--bad-soft); color: var(--bad); }
+.result pre { margin: var(--space-1) 0 0; font: 12px/1.4 var(--font-mono); white-space: pre-wrap; font-weight: 400; color: var(--text); }
+@keyframes forge-in { from { opacity: 0; transform: translateY(4px); } }
+.skel { height: 44px; border-radius: var(--radius-s); background: var(--line); margin-top: var(--space-2);
+        animation: forge-pulse 1.2s var(--ease) infinite alternate; }
+@keyframes forge-pulse { from { opacity: 1; } to { opacity: .55; } }
+.done { display: flex; gap: var(--space-4); align-items: center; flex-wrap: wrap; margin: var(--space-5) 0 0 44px; }
+.done p { flex: 1; min-width: 240px; margin: 0; }
+#done-note:empty { display: none; }
+@media (max-width: 600px) {
+  main { padding: var(--space-5) var(--space-4); }
+  .step { grid-template-columns: minmax(0, 1fr); gap: var(--space-2); }
+  .step-n { margin: 0; }
+  .done { margin-left: 0; }
+}
 </style>
 </head>
 <body>
 <main>
-<h1><span data-i18n="welcome.h1">Welcome to</span> <span>Forge OS</span></h1>
+<h1><span data-i18n="welcome.h1">Welcome to</span> <span class="brand">Forge OS</span></h1>
 <p class="lead" data-i18n="welcome.lead">A few things to check and set up. Everything here can be changed later in Forge Settings (in the app menu).</p>
 
-<section>
-  <h2 data-i18n="welcome.fit.title">1. How well this PC fits</h2>
-  <p class="muted" data-i18n="welcome.fit.help">Checks the image, graphics, AI, security, virtual machines and storage. Nothing is changed.</p>
-  <div id="report" class="rep" data-i18n="welcome.checking">Checking...</div>
-</section>
+<ol class="steps">
+<li class="step">
+  <div class="step-n" aria-hidden="true">1</div>
+  <section class="card" aria-labelledby="h-fit">
+    <div class="hd"><h2 id="h-fit" data-i18n="welcome.step.fit">How well this PC fits</h2>
+      <p class="muted" data-i18n="welcome.fit.help">Checks the image, graphics, AI, security, virtual machines and storage. Nothing is changed.</p></div>
+    <div class="bd"><div id="report" aria-busy="true"><span class="sr" data-i18n="welcome.checking">Checking...</span>
+      <div class="skel"></div><div class="skel"></div><div class="skel"></div></div></div>
+  </section>
+</li>
+<li class="step">
+  <div class="step-n" aria-hidden="true">2</div>
+  <section class="card" aria-labelledby="h-loc">
+    <div class="hd"><h2 id="h-loc" data-i18n="welcome.step.loc">Location</h2>
+      <p class="muted" data-i18n="welcome.loc.help">Used for the time zone and for apps that ask. Saving asks for your password.</p></div>
+    <div class="bd">
+      <div class="rows">
+        <label class="row"><span><span class="t" data-i18n="welcome.loc.services">Location services</span><br><span class="d" data-i18n="welcome.loc.services.help">Apps can ask where you are (city level).</span></span>
+          <span class="switch"><input type="checkbox" role="switch" data-key="location.services"><span class="knob"></span></span></label>
+        <label class="row"><span><span class="t" data-i18n="welcome.loc.tz">Set the time zone automatically</span><br><span class="d" data-i18n="welcome.loc.tz.help">Follows your location when you travel.</span></span>
+          <span class="switch"><input type="checkbox" role="switch" data-key="location.auto_timezone"><span class="knob"></span></span></label>
+        <label class="row"><span><span class="t" data-i18n="welcome.loc.wifi">Precise location from nearby Wi-Fi</span><br><span class="d" data-i18n="welcome.loc.wifi.help">Street level instead of city level, by sending nearby Wi-Fi network IDs to beaconDB.</span></span>
+          <span class="switch"><input type="checkbox" role="switch" data-key="location.wifi_lookup"><span class="knob"></span></span></label>
+      </div>
+      <div class="foot"><button class="btn primary" id="save" type="button" disabled data-i18n="ui.save">Save</button>
+        <div id="out" class="result" role="status"></div></div>
+    </div>
+  </section>
+</li>
+<li class="step">
+  <div class="step-n" aria-hidden="true">3</div>
+  <section class="card" aria-labelledby="h-usb">
+    <div class="hd"><h2 id="h-usb"><span data-i18n="welcome.step.usb">Unlock the disk with a USB stick</span> <span class="pill" data-i18n="welcome.optional">Optional</span></h2>
+      <p class="muted" data-i18n="welcome.usb.help">Only if you installed with disk encryption. Your password always keeps working.</p></div>
+    <div class="bd">
+      <p><span data-i18n="welcome.usb.name">Name the stick's drive</span> <code>FORGEKEY</code><span data-i18n="welcome.usb.run">, plug it in, then run this in a terminal:</span></p>
+      <div class="cmd"><code>sudo forge-usbkey create home</code><button class="btn" type="button" data-copy="sudo forge-usbkey create home" data-i18n="welcome.copy">Copy</button></div>
+      <p class="muted"><span data-i18n="welcome.usb.then">Then restart with the stick plugged in.</span> <code>sudo forge-usbkey list</code> <span data-i18n="welcome.usb.list">shows your keys.</span></p>
+    </div>
+  </section>
+</li>
+<li class="step">
+  <div class="step-n" aria-hidden="true">4</div>
+  <section class="card" aria-labelledby="h-ts">
+    <div class="hd"><h2 id="h-ts"><span data-i18n="welcome.step.ts">Remote access with Tailscale</span> <span class="pill" data-i18n="welcome.optional">Optional</span></h2></div>
+    <div class="bd">
+      <p data-i18n="welcome.ts.help">Reach this PC from your phone or other computers. Run this, then open the sign-in link it shows:</p>
+      <div class="cmd"><code>sudo tailscale up</code><button class="btn" type="button" data-copy="sudo tailscale up" data-i18n="welcome.copy">Copy</button></div>
+    </div>
+  </section>
+</li>
+<li class="step">
+  <div class="step-n" aria-hidden="true">5</div>
+  <section class="card" aria-labelledby="h-home">
+    <div class="hd"><h2 id="h-home" data-i18n="welcome.home.title">Your home screen</h2>
+      <p class="muted" data-i18n="welcome.home.help">Forge Dashboard shows health, agents, backups and updates at a glance. It is "Forge Dashboard" in the app menu.</p></div>
+    <div class="bd"><button class="btn" id="dash" type="button" data-i18n="ui.dash.open">Open Forge Dashboard</button></div>
+  </section>
+</li>
+</ol>
 
-<section>
-  <h2 data-i18n="welcome.loc.title">2. Location</h2>
-  <p class="muted" data-i18n="welcome.loc.help">Used for the time zone and for apps that ask. Saving asks for your password.</p>
-  <label class="opt"><input type="checkbox" data-key="location.services">
-    <span><b data-i18n="welcome.loc.services">Location services</b><br><span class="muted" data-i18n="welcome.loc.services.help">Apps can ask where you are (city level).</span></span></label>
-  <label class="opt"><input type="checkbox" data-key="location.auto_timezone">
-    <span><b data-i18n="welcome.loc.tz">Set the time zone automatically</b><br><span class="muted" data-i18n="welcome.loc.tz.help">Follows your location when you travel.</span></span></label>
-  <label class="opt"><input type="checkbox" data-key="location.wifi_lookup">
-    <span><b data-i18n="welcome.loc.wifi">Precise location from nearby Wi-Fi</b><br><span class="muted" data-i18n="welcome.loc.wifi.help">Street level instead of city level, by sending nearby Wi-Fi network IDs to beaconDB.</span></span></label>
-  <button class="primary" id="save" disabled data-i18n="ui.save">Save</button>
-  <div id="out"></div>
-</section>
-
-<section>
-  <h2 data-i18n="welcome.usb.title">3. Unlock the disk with a USB stick (optional)</h2>
-  <p class="muted" data-i18n="welcome.usb.help">Only if you installed with disk encryption. Your password always keeps working.</p>
-  <p><span data-i18n="welcome.usb.name">Name the stick's drive</span> <code>FORGEKEY</code><span data-i18n="welcome.usb.run">, plug it in, then run this in a terminal:</span></p>
-  <div class="cmd"><code>sudo forge-usbkey create home</code><button data-copy="sudo forge-usbkey create home" data-i18n="welcome.copy">Copy</button></div>
-  <p class="muted"><span data-i18n="welcome.usb.then">Then restart with the stick plugged in.</span> <code>sudo forge-usbkey list</code> <span data-i18n="welcome.usb.list">shows your keys.</span></p>
-</section>
-
-<section>
-  <h2 data-i18n="welcome.ts.title">4. Remote access with Tailscale (optional)</h2>
-  <p data-i18n="welcome.ts.help">Reach this PC from your phone or other computers. Run this, then open the sign-in link it shows:</p>
-  <div class="cmd"><code>sudo tailscale up</code><button data-copy="sudo tailscale up" data-i18n="welcome.copy">Copy</button></div>
-</section>
-
-<section>
-  <h2 data-i18n="welcome.home.title">Your home screen</h2>
-  <p class="muted" data-i18n="welcome.home.help">Forge Dashboard shows health, agents, backups and updates at a glance. It is "Forge Dashboard" in the app menu.</p>
-  <button id="dash" data-i18n="ui.dash.open">Open Forge Dashboard</button>
-</section>
-
-<p class="muted" data-i18n="welcome.again">Show this page again any time: "Forge Welcome" in the app menu. You can close this tab now.</p>
+<div class="done">
+  <p class="muted" data-i18n="welcome.again">Show this page again any time: "Forge Welcome" in the app menu. You can close this tab now.</p>
+  <button class="btn primary" id="done" type="button" data-i18n="welcome.done">Done</button>
+</div>
+<p class="muted done-note" id="done-note" role="status"></p>
 </main>
 <!--__I18N__-->
 <script nonce="__NONCE__">
@@ -2323,63 +2904,100 @@ const H = {"X-Forge-Token": TOKEN, "Content-Type": "application/json"};
 const $ = q => document.querySelector(q);
 function el(tag, text, cls) { const e = document.createElement(tag); if (text) e.textContent = text; if (cls) e.className = cls; return e; }
 applyStatic();
-const MARK = {ok: "dash.mark.ok", warn: "dash.mark.warn", info: "dash.mark.info", unknown: "dash.mark.unknown"};
+const MARK = {ok: ["dash.mark.ok", "ok"], warn: ["dash.mark.warn", "warn"], info: ["dash.mark.info", "info"], unknown: ["dash.mark.unknown", ""]};
 
+// The report comes from forge-doctor in English. Section names have their own entries in the tables;
+// lines are translated where the tables know them (tr) and otherwise shown as they are.
+const secName = name => tl("welcome.rep." + String(name).toLowerCase().replace(/[^a-z0-9]+/g, "_"), tr(name));
 async function report() {
   const box = $("#report");
   try {
     const r = await fetch("/api/doctor", {headers: H});
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || "failed");
-    box.textContent = "";
-    for (const s of d.sections) {
-      const h = el("h3", tr(s.name) + ": ");
-      h.appendChild(el("span", MARK[s.status] ? t(MARK[s.status]) : s.status, s.status));
-      box.appendChild(h);
-      const ul = el("ul");
-      for (const item of s.items) ul.appendChild(el("li", tr(item)));
-      box.appendChild(ul);
+    const s = d.summary || {};
+    const rows = el("div", "", "rows");
+    for (const sec of d.sections) {
+      // Lines with nothing to say (empty, or a name with no value after it) are left out.
+      const items = (sec.items || []).map(i => String(i).trim()).filter(i => i && !/:$/.test(i));
+      const left = el("div");
+      left.append(el("div", secName(sec.name), "t"));
+      if (items.length) { const ul = el("ul", "", "d"); items.forEach(i => ul.append(el("li", tr(i)))); left.append(ul); }
+      const m = MARK[sec.status] || [null, ""];
+      const row = el("div", "", "row");
+      row.append(left, el("span", m[0] ? t(m[0]) : String(sec.status), "pill " + m[1]));
+      rows.append(row);
     }
+    box.replaceChildren(el("p", t("dash.diag.head", {ok: s.ok || 0, warn: s.warn || 0, unknown: s.unknown || 0}), "summary"), rows);
   } catch (e) {
-    box.textContent = t("welcome.report_failed");
+    box.replaceChildren(el("p", t("welcome.report_failed"), "muted"));
   }
+  box.setAttribute("aria-busy", "false");
 }
 
+// Save is offered only once something differs from what is saved, and says "Saved" only after forge-apply answered.
 let values = null;
+const switches = () => [...document.querySelectorAll("[data-key]")];
+const changed = () => values !== null && switches().some(c => c.checked !== !!values[c.dataset.key]);
+const sync = () => { if (!$("#save").classList.contains("busy")) $("#save").disabled = !changed(); };
 async function load() {
-  const r = await fetch("/api/settings", {headers: H});
-  values = (await r.json()).values;
-  document.querySelectorAll("[data-key]").forEach(c => { c.checked = !!values[c.dataset.key]; });
-  $("#save").disabled = false;
+  try {
+    const r = await fetch("/api/settings", {headers: H});
+    values = (await r.json()).values;
+  } catch (e) { return; }
+  switches().forEach(c => { c.checked = !!values[c.dataset.key]; c.addEventListener("change", sync); });
+  sync();
 }
 
+function result(ok, title, detail) {
+  const out = $("#out");
+  out.className = "result " + (ok ? "ok" : "bad");
+  out.replaceChildren(document.createTextNode(title));
+  if (detail) out.append(el("pre", detail));
+}
 $("#save").onclick = async () => {
   // Only these settings are sent, as a merge, so a change made elsewhere meanwhile is kept.
   const next = {};
-  document.querySelectorAll("[data-key]").forEach(c => { next[c.dataset.key] = c.checked; });
-  $("#save").disabled = true; $("#save").textContent = t("ui.saving");
-  const out = $("#out"); out.style.display = "block";
+  switches().forEach(c => { next[c.dataset.key] = c.checked; });
+  const b = $("#save");
+  b.disabled = true; b.classList.add("busy"); b.setAttribute("aria-busy", "true"); b.textContent = t("ui.saving");
   try {
     const r = await fetch("/api/save", {method: "POST", headers: H, body: JSON.stringify({values: next, merge: true})});
     const d = await r.json();
-    out.textContent = (d.ok ? t("ui.saved") : t("ui.not_saved")) + "\n" + (d.output ? tr(d.output) : "");
+    if (d.ok) values = Object.assign({}, values, next);
+    result(d.ok, d.ok ? t("ui.saved") : t("ui.not_saved"), d.output ? tr(d.output) : "");
   } catch (e) {
-    out.textContent = t("welcome.closed");
+    result(false, t("welcome.closed"));
   }
-  $("#save").disabled = false; $("#save").textContent = t("ui.save");
+  b.classList.remove("busy"); b.removeAttribute("aria-busy"); b.textContent = t("ui.save");
+  sync();
 };
 
-document.querySelectorAll("[data-copy]").forEach(b => b.onclick = async () => {
-  try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = t("welcome.copied"); }
-  catch (e) { b.textContent = t("welcome.select_copy"); }
+document.querySelectorAll("[data-copy]").forEach(b => {
+  let timer = 0;
+  b.onclick = async () => {
+    try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = t("welcome.copied"); }
+    catch (e) { b.textContent = t("welcome.select_copy"); }
+    clearTimeout(timer);
+    timer = setTimeout(() => { b.textContent = t("welcome.copy"); }, 2000);
+  };
 });
 
+let dashTimer = 0;
 $("#dash").onclick = async () => {
   const r = await fetch("/api/open-dashboard", {method: "POST", headers: H, body: "{}"}).catch(() => null);
   $("#dash").textContent = r && r.ok && (await r.json()).ok ? t("ui.dash.opening") : t("ui.dash.failed");
+  clearTimeout(dashTimer);
+  dashTimer = setTimeout(() => { $("#dash").textContent = t("ui.dash.open"); }, 3000);
 };
 
-setInterval(() => fetch("/api/ping", {headers: H}), 30000);
+// Done: closes the tab where the browser allows a page to do that, and otherwise says it can be closed.
+$("#done").onclick = () => {
+  $("#done-note").textContent = t("welcome.done.note");
+  window.close();
+};
+
+setInterval(() => fetch("/api/ping", {headers: H}).catch(() => null), 30000);
 report(); load();
 </script>
 </body>

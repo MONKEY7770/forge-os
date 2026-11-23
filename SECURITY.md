@@ -282,12 +282,42 @@ Accepted and open (this round):
 - A network that itself hands out 100.64.0.0/10 (some ISPs, hotspots) counts as Tailscale for Ollama's port. Virtual machines and containers can no longer reach Ollama.
 - Not sure: NoNewPrivileges on forge-virt.service under SELinux (domain changes for groupadd, usermod, restorecon); BlueBuild's "Flatpaks installed" notice may go to the login screen's session.
 
+### Fifth round (11-24): Tempered design, AI storage reserve, polish
+
+New parts and their threat notes:
+- **AI storage reserve.** Model downloads stop (HTTP 507) when they would eat into the space kept for normal use (by default 30% of the disk, 128 to 600 GB). forge-model-guard runs as root every 30 s, writes only to /run/forge (never following links), and restarts Ollama at most once per 5 minutes. It fails open: if it cannot read the disk, downloads are not blocked.
+- **Setup page for the reserve.** Plasma Setup's user (UID 967) writes an INI file to /var/lib/forge-setup (0700, owned by that user); a root service reads it once, deletes it, and accepts only a [storage] section with a mode and one number in range (plain text, size-capped, never followed as a link). Anything else is refused. The choice is saved through forge-apply's normal import, like a change made in Settings.
+- **Notifications.** Every Forge notice now names "Forge OS" and has an icon. Agent approval requests are no longer critical and are shown once when new ones arrive, not every 10 minutes. Notice bodies are HTML-escaped.
+- **Sound.** In virtual machines only, PipeWire uses larger buffers (min quantum 2048) to stop crackling notification sounds. Real PCs keep their defaults except a cap of 2048.
+- **Fonts and colours.** IBM Plex Sans, Plex Sans Thai and Plex Mono (Fedora packages, checked in this image with a dry-run install), Forge's own KDE colour schemes. Added key by key to Bazzite's /etc/xdg files, never replacing them.
+- **Prism Launcher** (Flatpak, Flathub) is preinstalled.
+
+Independent review of this round (no High findings; the root-run parts held up):
+
+| Sev. | Area | Finding | Status |
+|---|---|---|---|
+| Medium | AI storage | An unfinished download counted at its full planned size, even after it was refused or stopped: the PC then stayed "over budget", every later download was refused, and Ollama was restarted | Fixed: only bytes written so far count; the rest is kept free only while the download is still going (changed in the last 2 minutes) |
+| Medium | Setup page | It could not have worked: in Plasma Setup 6.8.3 nextRequested is a signal, not a method (the page did not even load: "Duplicate method name"), contentItem is required, and the page is not a visual item | Fixed against the module's real type description from this image. It now loads and saves in a real Qt 6.12 QML engine with stand-ins for the wizard, and its output passes the strict parser. Its metadata names the wizard as parent app, like the built-in pages |
+| Low | AI storage | Ollama was restarted after a download had already finished | Fixed: only a download still going counts |
+| Low | Doctor | "0 GB is kept for normal use" for users who can't read the model folder | Fixed |
+| Low (security) | AI storage | Root followed a "blobs" link, which could publish the size of a root-only folder | Fixed: never followed; a link means "not sure" (downloads are not blocked) |
+| Low | Setup | A folder in place of the wizard's file crashed the service and made it start again and again | Fixed: refused and removed (without following links) |
+| Low | Setup | The tmpfiles line for /var/lib/forge-setup could fail if Plasma Setup's user is missing | Not a problem here: Plasma Setup's own sysusers file creates that user at every boot, before tmpfiles runs (checked in this image) |
+| Low | Logs | The 30 s timer adds start and finish lines to the journal | Accepted: hiding them would also hide the guard's own messages |
+
+bandit (11-24): no High findings; 15 Medium, all from earlier rounds and checked by hand (the patterns listed under Scanners, plus 0755 on public folders and launchers).
+
+Accepted and open (this round):
+- **Ollama on 127.0.0.1 has no password.** Any program on the PC can use it directly, around the gateway's limits and logs. Planned: make the gateway the only way in.
+- **The setup page is not tested in the real wizard yet** (only in a QML engine with stand-ins). If it fails, the reserve keeps its default (30%) and can be changed in Forge Settings. The first-boot CI test will look for its errors.
+- **The sound fix is not tested on real hardware.**
+
 ### Scanners (11-19)
 
 - bandit: production code has no High findings. Medium patterns were checked by hand: SQL built only from fixed column names (not injectable), urlopen only on 127.0.0.1 or the system's OLLAMA_HOST, "0.0.0.0" is a comparison, not a bind. Accepted.
 - shellcheck: every shell script clean at warning level.
 - detect-secrets (all files): 26 hits, all false positives (public Universal Blue enrollment password, public Ollama checksum, environment variable names, a folder path, fake test values and ids, a key header with no key in it). An earlier run reported 0 because it scanned nothing outside git; that result was wrong and was replaced.
-- Unit tests: 1809, all passing (11-23, full merged branch; 18 skipped need tools or root features not available here), with the real-tool tests run (restic 0.16.4, PowerShell 7, QEMU with OVMF for the boot test). Workflows pass actionlint (with its shellcheck checks).
+- Unit tests: 1933, all passing (11-24, full merged branch; 18 skipped need tools or root features not available here), with the real-tool tests run (restic 0.16.4, PowerShell 7, QEMU with OVMF for the boot test). Workflows pass actionlint (with its shellcheck checks).
 - gitleaks: not available in this environment.
 
 ### Could not verify here (needs real hardware)

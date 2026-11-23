@@ -212,6 +212,13 @@ class BackendTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout)
         self.assertIn({"tool": "plasma-apply-colorscheme", "argv": ["BreezeDark"]}, self.f.calls())
 
+    def test_light_and_dark_prefer_forge_tempered_when_installed(self):
+        s = self.f.share
+        self.f.write(f"{s}/color-schemes/ForgeTemperedDark.colors", "[General]\nName=Forge Tempered Dark\n")
+        r = self.f.run({"scheme_mode": "dark"})
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn({"tool": "plasma-apply-colorscheme", "argv": ["ForgeTemperedDark"]}, self.f.calls())
+
     def test_custom_scheme_must_be_installed_and_safe(self):
         r = self.f.run({"scheme_mode": "custom", "scheme": "VGUI"})
         self.assertEqual(r.returncode, 0, r.stdout)

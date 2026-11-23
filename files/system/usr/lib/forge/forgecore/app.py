@@ -31,6 +31,7 @@ from forgecore import policy as P  # noqa: E402
 from forgecore import doctor as D  # noqa: E402
 from forgecore import updates as U  # noqa: E402
 from forgecore import timeline as T  # noqa: E402
+from forgecore import storage as S  # noqa: E402
 import ipaddress  # noqa: E402
 import socket  # noqa: E402
 import time  # noqa: E402
@@ -516,13 +517,35 @@ def create_app(token=None, collector=None, ollama=None, start_collector=True,
             raise HTTPException(422, str(e))
         if not ollama.available():
             raise HTTPException(503, "Ollama is not running")
+        # AI model storage limit (Forge Settings): refuse up front only when there is no room at
+        # all, then check the real size from Ollama's first progress line for each layer.
+        room, limit = S.room_for_pull()
+        guard = S.PullGuard(name, room, limit)
+        first = guard.before()
+        if first and first[0] == "error":
+            raise HTTPException(507, first[1])
 
         def stream():
+            if first:
+                yield json.dumps({"warning": first[1]}) + "\n"
+            steps = ollama.pull(name)
             try:
-                for step in ollama.pull(name):
+                for step in steps:
+                    verdict = guard.observe(step)
+                    if verdict and verdict[0] == "error":
+                        # The connection to Ollama is closed below, which ends the request. If Ollama
+                        # keeps downloading anyway, forge-model-guard stops it (block only).
+                        yield json.dumps({"error": verdict[1]}) + "\n"
+                        return
+                    if verdict:
+                        yield json.dumps({"warning": verdict[1]}) + "\n"
                     yield json.dumps(step) + "\n"
             except M.OllamaError as e:
                 yield json.dumps({"error": str(e)}) + "\n"
+            finally:
+                close = getattr(steps, "close", None)
+                if close:
+                    close()
 
         return StreamingResponse(stream(), media_type="application/x-ndjson")
 

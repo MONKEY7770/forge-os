@@ -183,8 +183,12 @@ class OllamaClient:
     def show(self, name: str) -> dict:
         return self._json("POST", "/api/show", {"model": name})
 
-    def pull(self, name: str):
-        """Download a model. Yields progress dicts as Ollama sends them."""
+    def pull(self, name: str, guard=None):
+        """Download a model. Yields progress dicts as Ollama sends them.
+
+        guard (optional, a forgecore.storage.PullGuard) sees every progress line. When it says
+        "error" (the model does not fit in the room left for AI models) the download stops with
+        that message and the connection is closed; a "warning" is passed on as {"warning": text}."""
         parts = urllib.parse.urlsplit(self.base_url)
         conn_cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
         conn = conn_cls(parts.hostname, parts.port, timeout=self.timeout_s)
@@ -213,6 +217,11 @@ class OllamaClient:
                     continue
                 if "error" in item:
                     raise OllamaError(f"Download failed: {item['error']}")
+                verdict = guard.observe(item) if guard is not None else None
+                if verdict and verdict[0] == "error":
+                    raise OllamaError(verdict[1])
+                if verdict and verdict[0] == "warning":
+                    yield {"warning": verdict[1]}
                 total, done = item.get("total"), item.get("completed")
                 if total and done is not None:
                     item["percent"] = max(0, min(100, int(done * 100 / total)))

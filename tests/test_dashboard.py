@@ -27,6 +27,7 @@ from test_settings_page import (APP, LIB, OTHER, OWNER, ROOT, SCHEMA, as_uid, re
                                 request_headers, token_of)
 
 PAGE = os.path.join(LIB, "dashboard.html")
+TEMPERED = os.path.join(ROOT, "files/system/usr/share/forge/tempered.css")
 DESKTOP = os.path.join(ROOT, "files/system/usr/share/applications/forge-dashboard.desktop")
 FIX_HELPER = os.path.join(ROOT, "files/system/usr/libexec/forge-doctor-fix")
 VIEWER = "viewer-token-for-tests-only"
@@ -104,6 +105,14 @@ VIRSH = (" Id   Name          State\n"
          "------------------------------\n"
          " 1    win11         running\n"
          " -    fedora test   shut off\n\n")
+
+
+def forgedash_module():
+    if LIB not in sys.path:
+        sys.path.insert(0, LIB)
+    os.environ.setdefault("FORGE_SCHEMA", SCHEMA)
+    import forgedash
+    return forgedash
 
 
 class FakeCore(http.server.ThreadingHTTPServer):
@@ -196,7 +205,7 @@ class DashboardTest(unittest.TestCase):
         self.env = dict(os.environ, FORGE_LIB=LIB, FORGE_SCHEMA=SCHEMA, FORGE_CONF=self.conf,
                         FORGE_NO_BROWSER="1", FORGE_PORT="0", XDG_STATE_HOME=state,
                         FORGE_DASH_TEST="1", FORGE_DASH_CORE_UID="0",
-                        FORGE_VIEWER_TOKEN=os.path.join(self.tmp, "viewer.token"),
+                        FORGE_VIEWER_TOKEN=os.path.join(self.tmp, "viewer.token"), FORGE_TEMPERED_CSS=TEMPERED,
                         PATH=self.bin + os.pathsep + os.environ.get("PATH", ""))
         self.proc = None
 
@@ -737,8 +746,13 @@ class PageStaticTest(unittest.TestCase):
         self.assertNotRegex(self.page, r"\sstyle=\"")    # inline style attributes would break the CSP
 
     def test_matches_forge_settings_look(self):
+        # The colours come from the shared tempered.css, put in when the page is served (forgedash.page_template).
+        self.assertIn("/*__TEMPERED__*/", self.page)
+        self.assertIn("prefers-color-scheme: dark", self.page)
+        with mock.patch.object(forgedash_module(), "TEMPERED_CSS", TEMPERED):
+            page = forgedash_module().page_template()
         for token in ("--accent: #d9622b", "--accent: #ff7a3d", "prefers-color-scheme: dark", "Noto Sans Thai"):
-            self.assertIn(token, self.page)
+            self.assertIn(token, page)
 
     def test_live_metrics_pause_when_hidden(self):
         self.assertIn("visibilitychange", self.script)

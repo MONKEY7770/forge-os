@@ -1,0 +1,366 @@
+#!/usr/bin/env python3
+"""forge-model-guard: keep AI model downloads inside the AI model storage limit.
+
+  forge-model-guard                one check (forge-model-guard.timer runs it every 30 s, as root)
+  forge-model-guard --apply-setup  save the choice from the first-boot wizard's page
+                                   (/var/lib/forge-setup/storage.ini) into Forge Settings
+
+The rule is in /usr/lib/forge/forgecore/storage.py. Each check:
+  - writes /run/forge/ai-storage.json (the numbers and the status, for the Dashboard, forge-health
+    and Forge Core) and /run/forge/disk.ini (disk size, for the first-boot wizard);
+  - with the limit on Block, when AI models are over their room (room left below 0), Ollama is
+    running and a download is going on, restarts ollama.service: that ends every running download.
+    At most once every RESTART_MIN_S. Models already downloaded are never touched;
+  - with Block or Warn, tells the people logged in to the desktop once per problem (and again
+    after each restart).
+It never deletes a file. When the settings file can't be read or has problems, it does nothing
+but say so in the state file (fail open: a guess never stops Ollama).
+"""
+import contextlib
+import html
+import json
+import os
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.environ.get("FORGE_LIB", "/usr/lib/forge"))
+from forgecore import storage as S  # noqa: E402
+
+SCHEMA = "/usr/share/forge/settings.json"
+CONF = "/etc/forge/settings.json"
+STATE_DIR = "/run/forge"
+STATE_NAME = "ai-storage.json"
+DISK_NAME = "disk.ini"
+SPOOL_DIR = "/var/lib/forge-setup"
+SPOOL_NAME = "storage.ini"
+SPOOL_MAX = 4096
+APPLY_CMD = ["/usr/libexec/forge-apply"]
+RESTART_MIN_S = 300        # at most one Ollama restart every 5 minutes
+SESSION_ID = re.compile(r"[A-Za-z0-9]{1,32}")
+
+
+def run_cmd(cmd, timeout=60):
+    """(returncode, stdout). Never raises: a missing tool or a timeout is returncode 127."""
+    try:
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return 127, ""
+    return r.returncode, r.stdout or ""
+
+
+def ollama_active():
+    return run_cmd(["systemctl", "is-active", "--quiet", "ollama.service"], timeout=20)[0] == 0
+
+
+def models_path(vals):
+    return vals["ai.models_dir"]
+
+
+# The decision (pure, so it can be tested)
+
+def decide(r, prev, now, ollama_active, downloading):
+    """Returns (actions, new_state). r is the rule's result with "limit", or None when not sure.
+    actions: "restart" (Ollama), "notify" (the desktop users)."""
+    st = {k: prev[k] for k in ("last_restart", "notified") if k in prev}
+    if r is None or r["limit"] == "off":
+        st.pop("notified", None)
+        return [], st
+    actions = []
+    if r["room"] >= 0:
+        st.pop("notified", None)
+        return [], st
+    if r["limit"] == "block" and ollama_active and downloading:
+        last = st.get("last_restart")
+        # A last restart in the future means the clock went back: don't wait for it.
+        if not isinstance(last, (int, float)) or not (0 <= now - last < RESTART_MIN_S):
+            actions.append("restart")
+            st["last_restart"] = now
+    if "restart" in actions or st.get("notified") != "over":
+        actions.append("notify")
+        st["notified"] = "over"
+    return actions, st
+
+
+def message(r, restarted):
+    over = S.gb_text(-r["room"])
+    if restarted:
+        return ("Forge OS: AI model download stopped",
+                f"AI models are {over} GB over the space they may use on this disk, so Ollama was restarted "
+                "to stop the download. Delete a model you no longer use (ollama rm NAME), or raise the limit "
+                "in Forge Settings, AI and local models.")
+    if r["limit"] == "block":
+        return ("Forge OS: no room left for AI models",
+                f"AI models are {over} GB over the space they may use on this disk. New downloads will be "
+                "stopped. Delete a model you no longer use (ollama rm NAME), or raise the limit in Forge "
+                "Settings, AI and local models.")
+    return ("Forge OS: AI models are over their limit",
+            f"AI models are {over} GB over the space they may use on this disk. Downloads are not stopped "
+            "because the limit is set to Warn. Delete a model you no longer use (ollama rm NAME), or change "
+            "the limit in Forge Settings, AI and local models.")
+
+
+# Telling the desktop users
+
+def desktop_users():
+    """(uid, name) of every active, local, graphical session's user (no system users)."""
+    rc, out = run_cmd(["loginctl", "list-sessions", "--no-legend"], timeout=10)
+    if rc != 0:
+        return []
+    users = {}
+    for line in out.splitlines()[:64]:
+        sid = (line.split() or [""])[0]
+        if not SESSION_ID.fullmatch(sid):
+            continue
+        rc, props_text = run_cmd(["loginctl", "show-session", sid, "--property=User", "--property=Remote",
+                                  "--property=Active", "--property=Type", "--property=Class",
+                                  "--property=State"], timeout=10)
+        props = {}
+        for p in props_text.splitlines()[:20]:
+            k, sep, v = p.partition("=")
+            if sep:
+                props[k] = v.strip()
+        uid = props.get("User", "")
+        if not (rc == 0 and uid.isdigit() and int(uid) >= 1000 and props.get("Remote") == "no"
+                and props.get("Active") == "yes" and props.get("Type") in ("wayland", "x11")
+                and props.get("Class") == "user" and props.get("State") == "active"):
+            continue
+        try:
+            users[int(uid)] = pwd.getpwuid(int(uid)).pw_name
+        except KeyError:
+            continue
+    return sorted(users.items())
+
+
+def notify_users(summary, body):
+    """Like forge-health: escaped text (no links or formatting), and "--" ends the options."""
+    for uid, name in desktop_users():
+        run_cmd(["runuser", "-u", name, "--", "env", f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+                 "notify-send", "-u", "critical", "-a", "Forge OS", "--", html.escape(summary), html.escape(body)],
+                timeout=15)
+
+
+# Files in /run/forge
+
+def state_dir_fd():
+    """/run/forge, owned by root and not a link (tmpfiles.d makes it; made here if missing)."""
+    with contextlib.suppress(FileExistsError):
+        os.makedirs(STATE_DIR, mode=0o755)
+    try:
+        fd = os.open(STATE_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    st = os.fstat(fd)
+    if st.st_uid != os.geteuid() or st.st_mode & 0o022:
+        os.close(fd)
+        return None
+    return fd
+
+
+def write_public(dfd, name, text):
+    """Written whole under a new name, then swapped in. Readable by everyone (no secrets)."""
+    tmp = f".{name}-{os.urandom(6).hex()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644, dir_fd=dfd)
+    try:
+        with os.fdopen(fd, "w") as f:
+            os.fchmod(f.fileno(), 0o644)
+            f.write(text)
+        os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp, dir_fd=dfd)
+        raise
+
+
+def read_prev(dfd):
+    try:
+        fd = os.open(STATE_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+    except OSError:
+        return {}
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            return {}
+        try:
+            doc = json.loads(f.read(64 * 1024))
+        except (ValueError, RecursionError):
+            return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def disk_ini(r):
+    """For the first-boot wizard's page (QML reads it as an INI file). Numbers only."""
+    return ("[disk]\n"
+            f"total_gb={S.gb_int(r['total'])}\n"
+            f"free_gb={S.gb_int(r['free'])}\n"
+            f"auto_reserve_gb={S.gb_int(S.auto_reserve_bytes(r['total']))}\n"
+            f"models_gb={S.gb_int(r['models'])}\n")
+
+
+def check():
+    dfd = state_dir_fd()
+    if dfd is None:
+        print(f"{STATE_DIR} is missing, a link, or not owned by root: nothing done", file=sys.stderr)
+        return 1
+    try:
+        now = time.time()
+        prev = read_prev(dfd)
+        # The restart rate limit survives a check that is not sure.
+        keep = {"last_restart": prev["last_restart"]} if isinstance(prev.get("last_restart"), (int, float)) else {}
+        vals = S.load_settings(SCHEMA, CONF)
+        if vals is None:
+            write_public(dfd, STATE_NAME, json.dumps(dict(keep, ts=int(now), status="unknown",
+                                                          reason="the settings file can't be read or has problems")))
+            return 0
+        models_dir = models_path(vals)
+        r = S.report(vals, models_dir)
+        if r is None:
+            write_public(dfd, STATE_NAME, json.dumps(dict(keep, ts=int(now), status="unknown",
+                                                          reason="the model folder or its disk can't be read")))
+            return 0
+        r["limit"] = vals["ai.storage_limit"]
+        write_public(dfd, DISK_NAME, disk_ini(r))
+        # Only an unfinished download that is still going counts (a finished one needs no restart).
+        downloading = r.get("partials", 0) > 0
+        active = ollama_active() if r["limit"] == "block" and r["room"] < 0 else False
+        actions, st = decide(r, prev, now, active, downloading)
+        last_action = prev.get("last_action")
+        if "restart" in actions:
+            rc, _ = run_cmd(["systemctl", "restart", "ollama.service"], timeout=120)
+            last_action = "restart" if rc == 0 else "restart_failed"
+            print(f"AI models are over their room by {S.gb_text(-r['room'])} GB during a download: "
+                  f"restarted ollama.service ({'ok' if rc == 0 else 'failed'})", flush=True)
+        if "notify" in actions and vals.get("monitor.notify", True):
+            notify_users(*message(r, "restart" in actions))
+        doc = S.state_doc(r, models_dir, now)
+        doc.update(st, models_bytes=int(r["models"]), last_action=last_action)
+        write_public(dfd, STATE_NAME, json.dumps(doc, sort_keys=True))
+        return 0
+    finally:
+        os.close(dfd)
+
+
+# The first-boot wizard's choice
+
+SETUP_LINE = re.compile(r"(mode)=(auto|percent|gb)|(pct)=(0|[1-9][0-9]?)|(gb)=(0|[1-9][0-9]{0,5})")
+
+
+def parse_setup(text):
+    """The wizard's file, checked strictly: a [storage] section with mode, and pct or gb when
+    the mode needs it. Anything else (other lines, sections, repeated keys, numbers out of the
+    settings' range) means None."""
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    lines = [x for x in lines if x != ""]
+    if not lines or lines[0] != "[storage]":
+        return None
+    got = {}
+    for line in lines[1:]:
+        m = SETUP_LINE.fullmatch(line)
+        if not m:
+            return None
+        key = m.group(1) or m.group(3) or m.group(5)
+        value = m.group(2) or m.group(4) or m.group(6)
+        if key in got:
+            return None
+        got[key] = value
+    if "mode" not in got:
+        return None
+    if "pct" in got and int(got["pct"]) > 95 or "gb" in got and int(got["gb"]) > 100000:
+        return None
+    out = {"ai.storage_reserve_mode": got["mode"]}
+    if got["mode"] == "percent":
+        if "pct" not in got:
+            return None
+        out["ai.storage_reserve_pct"] = int(got["pct"])
+    elif got["mode"] == "gb":
+        if "gb" not in got:
+            return None
+        out["ai.storage_reserve_gb"] = int(got["gb"])
+    return out
+
+
+def read_spool():
+    """(text, problem). The file is removed after reading, whatever it holds (never followed)."""
+    try:
+        dfd = os.open(SPOOL_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None, None
+    except OSError as e:
+        return None, f"cannot open {SPOOL_DIR} ({e.strerror})"
+    try:
+        try:
+            fd = os.open(SPOOL_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+        except FileNotFoundError:
+            return None, None
+        except OSError as e:
+            return None, f"{SPOOL_NAME} can't be opened safely ({e.strerror})"
+        finally:
+            try:
+                os.unlink(SPOOL_NAME, dir_fd=dfd)
+            except IsADirectoryError:
+                # A folder in its place (made by the wizard's user) goes too, or the path unit
+                # would keep starting this. rmtree with dir_fd never follows links.
+                shutil.rmtree(SPOOL_NAME, dir_fd=dfd, ignore_errors=True)
+            except OSError:
+                pass
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None, f"{SPOOL_NAME} is not a regular file"
+        with os.fdopen(fd, "rb") as f:
+            data = f.read(SPOOL_MAX + 1)
+        if len(data) > SPOOL_MAX:
+            return None, f"{SPOOL_NAME} is too large"
+        try:
+            return data.decode("ascii"), None
+        except UnicodeDecodeError:
+            return None, f"{SPOOL_NAME} is not plain text"
+    finally:
+        os.close(dfd)
+
+
+def apply_setup():
+    text, problem = read_spool()
+    if problem:
+        print("Not saved: " + problem, file=sys.stderr)
+        return 2
+    if text is None:
+        return 0
+    changes = parse_setup(text)
+    if changes is None:
+        print(f"Not saved: {SPOOL_NAME} does not hold a valid choice", file=sys.stderr)
+        return 2
+    dfd = state_dir_fd()
+    if dfd is None:
+        print(f"Not saved: {STATE_DIR} is missing, a link, or not owned by root", file=sys.stderr)
+        return 1
+    name = f"setup-{os.urandom(6).hex()}.json"
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+        with os.fdopen(fd, "w") as f:
+            json.dump(changes, f)
+        rc, out = run_cmd(APPLY_CMD + ["--import", os.path.join(STATE_DIR, name), "--merge"], timeout=600)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(name, dir_fd=dfd)
+        os.close(dfd)
+    print(f"Saved the first-boot choice for AI model storage: {json.dumps(changes, sort_keys=True)}"
+          if rc == 0 else "Not saved: forge-apply failed", flush=True)
+    return 0 if rc == 0 else 1
+
+
+def main(argv):
+    if argv == ["--apply-setup"]:
+        return apply_setup()
+    if argv:
+        print(__doc__.strip().splitlines()[2], file=sys.stderr)
+        return 2
+    return check()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,4 @@
+module org.kde.kirigami
+singleton Units 1.0 Units.qml
+Heading 1.0 Heading.qml
+Separator 1.0 Separator.qml

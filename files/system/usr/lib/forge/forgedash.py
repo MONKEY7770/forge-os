@@ -57,7 +57,28 @@ LOG_GROUPS = ("wheel", "adm", "systemd-journal")   # groups that may read the wh
 # Test seams: only read when FORGE_DASH_TEST=1, and the Forge Core user only when no forge user exists.
 TEST = os.environ.get("FORGE_DASH_TEST") == "1"
 VIEWER_TOKEN = (os.environ.get("FORGE_VIEWER_TOKEN") if TEST else None) or "/etc/forge/viewer.token"
+TEMPERED_CSS = (os.environ.get("FORGE_TEMPERED_CSS") if TEST else None) or "/usr/share/forge/tempered.css"
 PROC_NET = "/proc/net"
+
+PAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+TEMPERED_MARK = "/*__TEMPERED__*/"      # where the page's <style> takes the shared tokens
+TEMPERED_MAX = 64 * 1024
+# Used only when tempered.css is missing or unusable: the few colours the page needs to stay readable.
+TEMPERED_FALLBACK = """:root { color-scheme: light dark; --bg: #f7f6f3; --panel: #ffffff; --rail: #efede9; --field: #fbfaf8;
+  --text: #1c1b19; --muted: #64605a; --line: #d6d2cb; --border: #8a857d; --accent: #d9622b; --accent-fill: #c2541f;
+  --accent-text: #a9461a; --on-accent: #ffffff; --accent-soft: #f7e6dc; --glow: #ff9a5c; --ok: #276b45; --ok-soft: #e1f0e7;
+  --warn: #8f5a07; --warn-soft: #f6ebd6; --bad: #b3261e; --bad-soft: #f7e0dd; --info: #3f6383; --info-soft: #e3ebf3;
+  --radius-s: 4px; --radius-m: 8px; --radius-pill: 999px; --edge: none; --shadow-1: none; --shadow-2: none;
+  --font: system-ui, "Noto Sans", "Noto Sans Thai", sans-serif; --font-mono: "Noto Sans Mono", monospace;
+  --text-s: 13px; --text-m: 14px; --text-l: 18px; --leading: 1.45; --ease: ease; --dur-1: 120ms; --dur-2: 200ms;
+  --dur-3: 320ms; --dur-cool: 0ms; }
+@media (prefers-color-scheme: dark) { :root { --bg: #141312; --panel: #1e1d1b; --rail: #181715; --field: #191816;
+  --text: #ecebe8; --muted: #a39e96; --line: #34312d; --border: #6e6962; --accent: #ff7a3d; --accent-fill: #ff7a3d;
+  --accent-text: #ff7a3d; --on-accent: #1c1b19; --accent-soft: #3a2418; --ok: #5cc98d; --ok-soft: #16301f; --warn: #e8b04a;
+  --warn-soft: #362a14; --bad: #ff7b6e; --bad-soft: #3b1d1a; --info: #8fb3d6; --info-soft: #1a2633; } }
+:lang(th) { --leading: 1.6; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: 0ms !important; } }"""
 
 FORGE_API = "/usr/bin/forge-api"
 DOCTOR_FIX = "/usr/libexec/forge-doctor-fix"
@@ -386,6 +407,35 @@ def disks():
     if not isinstance(devs, list):
         return None, "lsblk gave no usable answer."
     return [one(d, 0) for d in devs[:64] if isinstance(d, dict) and d.get("type") in ("disk", "rom")], None
+
+
+# ---------- the page ----------
+
+def tempered_css():
+    """The shared Forge "Tempered" tokens (tempered.css), as text that is safe inside the page's <style>.
+    A missing, oversized or odd file gives the small built-in fallback, so the page always has its colours."""
+    try:
+        fd = os.open(TEMPERED_CSS, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb") as f:
+            data = f.read(TEMPERED_MAX + 1)
+        text = data.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return TEMPERED_FALLBACK
+    # Never anything that could end the <style> element or load something from elsewhere.
+    if len(data) > TEMPERED_MAX or "<" in text or "@import" in text or "url(" in text or not text.strip():
+        return TEMPERED_FALLBACK
+    return text
+
+
+def inline_tempered(page):
+    """The page with tempered.css put in at its /*__TEMPERED__*/ mark (once)."""
+    return page.replace(TEMPERED_MARK, tempered_css(), 1)
+
+
+def page_template():
+    """dashboard.html with the shared tokens inlined, ready for the token, nonce and string tables."""
+    with open(PAGE_FILE, encoding="utf-8") as f:
+        return inline_tempered(f.read())
 
 
 # ---------- the dashboard ----------

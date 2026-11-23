@@ -16,6 +16,8 @@ import shutil
 import subprocess
 import time
 
+from forgecore import storage as S
+
 # Rough rule for quantized (Q4) models fully on the GPU: about 0.6 GB per billion
 # parameters, plus about 1.5 GB for the context. An estimate, not a promise.
 COMMON_SIZES_B = (1, 3, 4, 7, 8, 12, 14, 24, 27, 32, 70)
@@ -245,6 +247,24 @@ def storage(root, run=subprocess.run):
         if free_pct < 10:
             warn.append("How to fix: delete big files you don't need, empty the trash, or remove AI models "
                         "you no longer use (ollama rm NAME).")
+    # AI model storage limit (Forge Settings, AI and local models). Never fails the report.
+    try:
+        ai = S.current(root)
+    except Exception:   # noqa: BLE001 (the report must always be built)
+        ai = None
+    if ai is None:
+        items.append("AI model storage: not sure (the model folder or the settings could not be read)")
+    else:
+        g = S.gb_int
+        line = (f"AI models: {g(ai['models'])} GB used, {g(max(0, ai['room']))} GB left of {g(ai['budget'])} GB "
+                f"(keeps {g(ai['reserve'])} GB for games, apps and files and {g(ai['min_free'])} GB free for "
+                f"updates; limit: {ai['limit']})")
+        problems = S.problem_lines(ai)
+        if problems and ai["limit"] != "off":
+            warn.extend(problems)
+            warn.append("How to fix: delete AI models you no longer use (ollama rm NAME), or change the limit "
+                        "in Forge Settings, AI and local models.")
+        items.append(line)
     # Shared drive with Windows: one line, from the tool's own read-only status.
     out = _cmd(run, "forge-shared-drive", "status", "--json")
     try:

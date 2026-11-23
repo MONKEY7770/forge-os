@@ -230,7 +230,7 @@ def notify(summary, body):
     print(f"{summary}. {body}")
     try:
         # Escaped, so nothing in the text can add links or formatting.
-        subprocess.run(["notify-send", "-a", "Forge OS", "-u", "normal", "--",
+        subprocess.run(["notify-send", "-a", "Forge OS", "-i", "emblem-synchronizing", "-u", "normal", "--",
                         html.escape(summary), html.escape(body)], timeout=15, check=False)
     except (OSError, subprocess.SubprocessError):
         pass

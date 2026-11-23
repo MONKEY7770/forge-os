@@ -256,7 +256,8 @@ def notify(summary, body, key):
         boot = ""
     if st.get("notified") == [key, boot]:
         return
-    run(["notify-send", "-u", "critical", "-a", "Forge OS", "--", html.escape(summary), html.escape(body)], 15)
+    run(["notify-send", "-u", "normal", "-a", "Forge OS", "-i", "folder-remote", "--",
+         html.escape(summary), html.escape(body)], 15)
     st["notified"] = [key, boot]
     save_state(st)
 

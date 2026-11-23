@@ -1,0 +1,11 @@
+[Unit]
+Description=Check the AI model storage limit every 30 seconds
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=30s
+# The default accuracy (1 minute) would make the checks much rarer than every 30 seconds.
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

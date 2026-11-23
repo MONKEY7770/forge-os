@@ -71,7 +71,6 @@ with sync_playwright() as p:
     elif scenario == "remove-in-use":
         good = os.path.join(os.environ["HOME"], "pic.png")
         open(good, "wb").write(bytes.fromhex(sys.argv[5]))
-        pg.on("dialog", lambda d: d.accept())
         pg.evaluate("location.hash = '#appearance'")
         pg.wait_for_selector("#library")
         pg.select_option('[data-look="background"][data-key="type"] select', "image")
@@ -82,6 +81,7 @@ with sync_playwright() as p:
         pg.wait_for_timeout(500)
         out["before"] = pg.inner_text('[data-look="background"][data-key="image"] .mp-status')
         pg.click("#library button:has-text('Remove')")
+        pg.click("#ask-ok")          # the page's own dialog asks first
         pg.wait_for_timeout(800)
         out["field"] = pg.inner_text('[data-look="background"][data-key="image"]')
         out["library"] = pg.inner_text("#lib-progress")

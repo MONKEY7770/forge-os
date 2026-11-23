@@ -189,3 +189,12 @@ class SystemUserTests(unittest.TestCase):
             self.assertIn("Requires=forge-sysusers.service\n", head, path)
             self.assertIn("After=forge-sysusers.service\n", head, path)
             self.assertNotIn("systemd-sysusers", text.split("[Service]", 1)[1], path)
+
+
+class PreinstalledAppTests(unittest.TestCase):
+    def test_prism_launcher_is_preinstalled(self):
+        # Minecraft Java Edition (and mods), next to the Bedrock launcher.
+        apps = [a for m in modules() if m.get("type") == "default-flatpaks"
+                for c in m.get("configurations", []) for a in c.get("install", [])]
+        self.assertIn("org.prismlauncher.PrismLauncher", apps)
+        self.assertIn("io.mrarm.mcpelauncher", apps)

@@ -1,0 +1,82 @@
+/* Forge OS "Tempered" design tokens, shared by every Forge app (Settings, Dashboard, Welcome).
+   Cool by default, warm on purpose: neutrals carry the screen, the ember accent marks the one
+   thing that needs attention. Contrast ratios are against --bg and pass WCAG AA for text.
+   Variable names match the ones the apps already use, so an app only swaps its own :root block
+   for this file. Do not lock anything: every value here is a default. */
+:root {
+  color-scheme: light dark;
+  /* surfaces */
+  --bg: #f7f6f3; --panel: #ffffff; --rail: #efede9; --field: #fbfaf8;
+  /* text */
+  --text: #1c1b19;            /* 15.9:1 */
+  --muted: #64605a;           /* 5.8:1 */
+  /* lines: --line is decoration only; --border outlines controls (3:1, WCAG 1.4.11) */
+  --line: #d6d2cb; --border: #8a857d;
+  /* ember */
+  --accent: #d9622b;          /* focus ring and marks, not text */
+  --accent-fill: #c2541f;     /* filled buttons, white text 4.6:1 */
+  --accent-text: #a9461a;     /* accent text 5.9:1 */
+  --on-accent: #ffffff;
+  --accent-soft: #f7e6dc;
+  --glow: #ff9a5c;            /* the "cooling" focus start */
+  /* states: warn stays yellow-brown so it never reads as ember */
+  --ok: #276b45; --ok-soft: #e1f0e7;
+  --warn: #8f5a07; --warn-soft: #f6ebd6;
+  --bad: #b3261e; --bad-soft: #f7e0dd;
+  --info: #3f6383; --info-soft: #e3ebf3;
+  /* shape */
+  --radius-s: 4px; --radius-m: 8px; --radius-pill: 999px;
+  --radius: var(--radius-m);
+  --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px;
+  --space-5: 24px; --space-6: 32px; --space-7: 48px;
+  --gap: var(--space-4);
+  /* the polished edge: a 1px highlight on raised surfaces */
+  --edge: inset 0 1px 0 rgba(255, 255, 255, .7);
+  --shadow-1: 0 1px 2px rgba(40, 30, 20, .06), 0 1px 1px rgba(40, 30, 20, .04);
+  --shadow-2: 0 8px 24px rgba(40, 30, 20, .12), 0 2px 6px rgba(40, 30, 20, .06);
+  /* type: IBM Plex for both scripts, Noto as fallback */
+  --font: "IBM Plex Sans", "IBM Plex Sans Thai", "Noto Sans", "Noto Sans Thai", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", "Noto Sans Mono", "DejaVu Sans Mono", monospace;
+  --text-s: 13px; --text-m: 14px; --text-l: 18px; --text-xl: 24px;
+  --leading: 1.45;
+  /* motion: one curve, "temper"; exits run a little faster */
+  --ease: cubic-bezier(.3, 0, .1, 1);
+  --dur-1: 120ms; --dur-2: 200ms; --dur-3: 320ms; --dur-cool: 240ms;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141312; --panel: #1e1d1b; --rail: #181715; --field: #191816;
+    --text: #ecebe8;          /* 15.6:1 */
+    --muted: #a39e96;         /* 6.3:1 */
+    --line: #34312d; --border: #6e6962;
+    --accent: #ff7a3d;        /* 6.5:1 as text on --bg */
+    --accent-fill: #ff7a3d; --accent-text: #ff7a3d; --on-accent: #1c1b19;
+    --accent-soft: #3a2418; --glow: #ffb07f;
+    --ok: #5cc98d; --ok-soft: #16301f;
+    --warn: #e8b04a; --warn-soft: #362a14;
+    --bad: #ff7b6e; --bad-soft: #3b1d1a;
+    --info: #8fb3d6; --info-soft: #1a2633;
+    --edge: inset 0 1px 0 rgba(255, 255, 255, .06);
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, .4);
+    --shadow-2: 0 10px 30px rgba(0, 0, 0, .5), 0 2px 6px rgba(0, 0, 0, .3);
+  }
+}
+/* Thai needs room for its marks */
+:lang(th) { --leading: 1.6; }
+:lang(th) body { font-family: "IBM Plex Sans Thai", "Noto Sans Thai", var(--font); }
+
+/* The Forge moment, "cooling": keyboard focus starts as a soft ember glow and settles. */
+@keyframes forge-cool {
+  from { box-shadow: 0 0 0 2px var(--glow), 0 0 10px 2px var(--glow); }
+  to   { box-shadow: 0 0 0 2px var(--accent); }
+}
+:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent);
+  animation: forge-cool var(--dur-cool) var(--ease);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --dur-1: 0ms; --dur-2: 0ms; --dur-3: 0ms; --dur-cool: 0ms; }
+  *, *::before, *::after { animation-duration: 0ms !important; transition-duration: 0ms !important; }
+}

@@ -51,7 +51,8 @@ MODES = ("keep", "light", "dark", "custom")
 ACCENTS = ("keep", "wallpaper", "custom")
 CURSOR_SIZES = ("24", "32", "36", "48", "64", "72", "96")
 FONT_SIZES = ("8", "9", "10", "11", "12", "13", "14", "16", "18")
-SCHEME_FOR = {"light": "BreezeLight", "dark": "BreezeDark"}
+# Forge's own Tempered schemes first, KDE's Breeze if they are not installed.
+SCHEME_FOR = {"light": ("ForgeTempered", "BreezeLight"), "dark": ("ForgeTemperedDark", "BreezeDark")}
 DECO_GROUP = "org.kde.kdecoration2"
 DECO_PLUGINS = {"org.kde.breeze": "Breeze", "org.kde.oxygen": "Oxygen"}
 AURORAE = ("org.kde.kwin.aurorae", "org.kde.kwin.aurorae.v2")   # the first one installed is used
@@ -356,9 +357,10 @@ def apply_colors(values, out):
         return False
     scheme = None
     if mode in SCHEME_FOR:
-        scheme = SCHEME_FOR[mode]
-        if scheme not in color_schemes():
-            raise Refused(f"the {scheme} color scheme is not installed")
+        installed = color_schemes()
+        scheme = next((n for n in SCHEME_FOR[mode] if n in installed), None)
+        if scheme is None:
+            raise Refused(f"the {SCHEME_FOR[mode][-1]} color scheme is not installed")
     elif mode == "custom":
         scheme = name_in(values, "scheme", color_schemes())
         if not scheme:

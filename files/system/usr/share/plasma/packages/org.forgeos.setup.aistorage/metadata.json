@@ -1,0 +1,15 @@
+{
+    "KPlugin": {
+        "Id": "org.forgeos.setup.aistorage",
+        "Name": "AI model storage",
+        "Name[th]": "พื้นที่เก็บโมเดล AI",
+        "Description": "Choose how much of the disk stays free for games, apps and files. AI models may use the rest.",
+        "Description[th]": "เลือกว่าจะกันพื้นที่ดิสก์ไว้ให้เกม แอป และไฟล์เท่าใด ส่วนที่เหลือให้โมเดล AI ใช้ได้",
+        "License": "Apache-2.0",
+        "Version": "1.0"
+    },
+    "KPackageStructure": "KDE/PlasmaSetup",
+    "X-KDE-Weight": 45,
+    "NoDisplay": true,
+    "X-KDE-ParentApp": "org.kde.plasmasetup"
+}

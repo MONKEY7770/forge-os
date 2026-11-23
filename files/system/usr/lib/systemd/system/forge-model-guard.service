@@ -1,0 +1,13 @@
+[Unit]
+Description=Forge OS AI model storage limit check
+Documentation=file:///usr/libexec/forge-model-guard
+After=ollama.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/forge-model-guard
+# Light and in the background: one folder listing and one statvfs every 30 seconds.
+Nice=10
+IOSchedulingClass=idle
+ProtectSystem=full
+PrivateTmp=yes

@@ -1,6 +1,6 @@
 name: diag
-# Temporary, test branch only: read-only checks of the built image, and the Krema / Wallpaper Engine
-# COPR keys and versions (to pin them). No secrets.
+# Temporary, test branch only: do the pinned Krema and Wallpaper Engine builds install into the image
+# (dry run, signatures checked against the pinned keys), and the video plugin's config keys. No secrets.
 on:
   push:
     branches: [forge-test]
@@ -12,51 +12,22 @@ jobs:
       contents: read
       packages: read
     steps:
-      - name: Inspect the image
+      - name: Dry-run installs in the image
         env:
           REGISTRY_TOKEN: ${{ github.token }}
         run: |
           printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           docker run --rm --entrypoint bash ghcr.io/monkey7770/forge-os-universal:br-forge-test-candidate-45 -c '
             set +e
-            echo "== rpm"; rpm -q plasma-setup greenboot greenboot-default-health-checks tuned-ppd power-profiles-daemon plasma-login-manager
-            echo "== plasma-setup files"; rpm -ql plasma-setup | grep -vE "/locale/|/icons/|\.qml$|/doc/|/licenses/"
-            echo "== plasma-setup unit"; systemctl cat plasma-setup.service
-            echo "== plasma-setup enabled: $(systemctl is-enabled plasma-setup.service 2>&1)"
-            echo "== plasma-setup sysusers"; cat /usr/lib/sysusers.d/*plasma*setup* 2>/dev/null
-            echo "== groups"; grep -E "^(wheel|libvirt):" /etc/group /usr/lib/group
-            echo "== greenboot"; systemctl cat greenboot-healthcheck.service 2>&1 | grep -iE "timeout|ExecStart|Type"; grep -iE "boot_counter|greenboot" /boot/grub2/grub.cfg /usr/lib/bootupd/grub2-static/*.cfg 2>/dev/null | head
-            echo "== sysusers service"; systemctl cat systemd-sysusers.service | grep -E "Condition|Before|After"
-            echo "== firewall"; grep -E "^DefaultZone" /etc/firewalld/firewalld.conf; z=$(sed -n "s/^DefaultZone=//p" /etc/firewalld/firewalld.conf); cat /etc/firewalld/zones/$z.xml /usr/lib/firewalld/zones/$z.xml 2>/dev/null
-            echo "== power"; command -v powerprofilesctl; command -v tuned-adm
-            echo "== plasmalogin conf.d"; for f in /usr/bin/plasmalogin /usr/libexec/plasmalogin* /usr/lib64/libplasmalogin*; do [ -f "$f" ] && grep -ac "plasmalogin.conf.d" "$f" | sed "s|^|$f: |"; done
-            echo "== plymouth two-step"; ls /usr/lib64/plymouth/two-step.so
-            echo "== video plugin keys"; grep -rhoE "dayNight[A-Za-z]*" /usr/share/plasma/wallpapers/ 2>/dev/null | sort | uniq -c
-            echo "== skel autostart"; ls -la /etc/skel/.config/autostart 2>&1
-            echo "== XDG"; grep -rhE "XDG_(DATA|CONFIG)_DIRS" /etc/profile.d /etc/environment /usr/lib/environment.d /etc/environment.d 2>/dev/null
-            echo "== heif"; ls /usr/lib64/qt6/plugins/imageformats | grep -iE "heif|avif|jxl"
-            echo "== os-release"; cat /usr/lib/os-release; cat /etc/system-release
-            echo "== repos"; grep -H "^enabled" /etc/yum.repos.d/forge-*.repo
+            K=https://download.copr.fedorainfracloud.org/results/isac322/krema
+            W=https://download.copr.fedorainfracloud.org/results/captsilver666/wallpaper-engine-kde-plugin
+            curl -fsSL $K/pubkey.gpg -o /tmp/krema.gpg; curl -fsSL $W/pubkey.gpg -o /tmp/we.gpg
+            gpg --batch --with-colons --show-keys /tmp/krema.gpg /tmp/we.gpg | grep ^fpr
+            echo "== krema"
+            dnf5 -y --assumeno --repofrompath=k,$K/fedora-45-x86_64/ --setopt=k.gpgkey=file:///tmp/krema.gpg --setopt=k.gpgcheck=1 install krema-0.13.0-1.fc45 2>&1 | tail -25
+            echo "== wallpaper engine"
+            dnf5 -y --assumeno --repofrompath=w,$W/fedora-45-x86_64/ --setopt=w.gpgkey=file:///tmp/we.gpg --setopt=w.gpgcheck=1 install "wallpaper-engine-kde-plugin-qt6-1.5^20261108.192.g8173e09-1.fc45" 2>&1 | tail -25
+            echo "== video plugin keys"
+            grep -rn "dayNightCycleAssignment\|VideoUrls\|videoUrls" /usr/share/plasma/wallpapers/ 2>/dev/null | head -20
+            grep -rn "dayNightPhase" /usr/share/plasma/wallpapers/ 2>/dev/null | grep -iE "json|parse|stringify|url" | head -10
           '
-      - name: Krema and Wallpaper Engine (COPR) keys and versions
-        run: |
-          docker run --rm fedora:45 bash -c '
-            set +e
-            dnf -y -q install gnupg2 > /dev/null 2>&1
-            for p in isac322/krema captsilver666/wallpaper-engine-kde-plugin; do
-              echo "== $p key"
-              curl -fsSL "https://download.copr.fedorainfracloud.org/results/$p/pubkey.gpg" -o /tmp/k.gpg && gpg --batch --with-colons --show-keys /tmp/k.gpg | grep -E "^(pub|fpr|uid)"
-              sha256sum /tmp/k.gpg
-            done
-            echo "== krema versions"
-            dnf -q --repofrompath=k,https://download.copr.fedorainfracloud.org/results/isac322/krema/fedora-45-x86_64/ --repo=k list --showduplicates krema 2>&1 | tail -8
-            echo "== wallpaper engine versions"
-            dnf -q --repofrompath=w,https://download.copr.fedorainfracloud.org/results/captsilver666/wallpaper-engine-kde-plugin/fedora-45-x86_64/ --repo=w list --showduplicates wallpaper-engine-kde-plugin-qt6 2>&1 | tail -8
-          '
-          for p in isac322/krema captsilver666/wallpaper-engine-kde-plugin; do
-            echo "== $p builds"
-            curl -fsSL "https://copr.fedorainfracloud.org/api_3/build/list?ownername=${p%%/*}&projectname=${p##*/}&limit=6" | python3 -c '
-          import json, sys
-          for b in json.load(sys.stdin)["items"]:
-              print(b["id"], b["state"], (b.get("source_package") or {}).get("version"), b.get("chroots"), b.get("ended_on"))'
-          done

@@ -1,5 +1,5 @@
 name: diag
-# Temporary, test branch only: checks the new image (fonts, desktop keys, the wizard page with the
+# Temporary, test branch only (installs a QML runner inside the throwaway container): checks the new image (fonts, desktop keys, the wizard page with the
 # real Plasma Setup modules). No secrets.
 on:
   push:
@@ -19,14 +19,10 @@ jobs:
           printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           docker run --rm --entrypoint bash ghcr.io/monkey7770/forge-os-universal:br-forge-test-candidate-45 -c '
             set +e
-            echo "== fonts"; rpm -q ibm-plex-sans-fonts ibm-plex-sans-thai-fonts ibm-plex-mono-fonts
-            fc-match "IBM Plex Sans"; fc-match "IBM Plex Sans:lang=th"; fc-match "IBM Plex Mono"
-            echo "== kdeglobals"; cat /etc/xdg/kdeglobals; echo "== kwinrc"; grep -A3 "Plugins" /etc/xdg/kwinrc
-            echo "== schemes"; ls /usr/share/color-schemes/ | grep -i forge
-            echo "== guard"; ls -l /usr/libexec/forge-model-guard; systemctl is-enabled forge-model-guard.timer forge-setup-storage.path
-            echo "== flatpaks"; grep -rl PrismLauncher /usr/share/bluebuild 2>/dev/null | head -3
-            echo "== page"; ls -R /usr/share/plasma/packages/org.forgeos.setup.aistorage
-            Q=$(ls /usr/lib64/qt6/bin/qml 2>/dev/null || command -v qml6 || command -v qml); echo "qml=$Q"
+            echo "== thai fallback order"; fc-match -s "IBM Plex Sans:lang=th" | head -4
+            echo "== kcm lock"; grep -n "Restrictions\|kcm_updates" /etc/xdg/kdeglobals
+            dnf5 -q -y install qt6-qtdeclarative-devel >/dev/null 2>&1; echo "install rc=$?"
+            Q=$(ls /usr/lib64/qt6/bin/qml /usr/bin/qml6 /usr/bin/qml 2>/dev/null | head -1); echo "qml=$Q"
             mkdir -p /tmp/t && cat > /tmp/t/load.qml <<QML
           import QtQuick
           Item {

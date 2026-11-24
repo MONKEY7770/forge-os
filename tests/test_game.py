@@ -342,6 +342,37 @@ class DetectTest(Base):
         self.add_proc(300, "RobloxStudioBet", ["C:\\users\\u\\RobloxStudioBeta.exe"])
         self.assertEqual(load_tool().find_games(self.proc), [])
 
+    # Minecraft (Forge Settings, Gaming: "Minecraft counts as a game", off by default).
+
+    def test_minecraft_java_through_prism_or_the_official_launcher(self):
+        self.add_proc(500, "java", ["/usr/lib/jvm/jre/bin/java", "-Xmx4G", "-cp", "NewLaunch.jar",
+                                    "org.prismlauncher.EntryPoint"])
+        self.add_proc(501, "java", ["java", "-cp", "client.jar", "net.minecraft.client.main.Main", "--username", "x"])
+        found = load_tool().find_games(self.proc, minecraft=True)
+        self.assertEqual([(g["pid"], g["kind"]) for g in found], [(500, "minecraft"), (501, "minecraft")])
+
+    def test_minecraft_bedrock_through_mcpelauncher(self):
+        self.add_proc(510, "mcpelauncher-cl", ["/app/bin/mcpelauncher-client", "-dg", "/x"])
+        self.assertEqual([g["kind"] for g in load_tool().find_games(self.proc, minecraft=True)], ["minecraft"])
+
+    def test_minecraft_is_not_a_game_unless_turned_on(self):
+        self.add_proc(500, "java", ["java", "org.prismlauncher.EntryPoint"])
+        self.add_proc(510, "mcpelauncher-cl", ["mcpelauncher-client"])
+        self.assertEqual(load_tool().find_games(self.proc), [])
+
+    def test_other_java_programs_and_the_launcher_window_are_not_games(self):
+        self.add_proc(520, "java", ["java", "-jar", "idea.jar", "--note", "net.minecraft.client.main.Main is mentioned"])
+        self.add_proc(521, "java", ["java", "-cp", "x", "com.example.Server"])
+        self.add_proc(522, "prismlauncher", ["/app/bin/prismlauncher"])
+        self.assertEqual(load_tool().find_games(self.proc, minecraft=True), [])
+
+    def test_the_watcher_follows_the_minecraft_setting(self):
+        with open(os.path.join(ROOT, "files/system/usr/share/forge/settings.json")) as f:
+            schema = {x["key"]: x for x in json.load(f)["settings"]}
+        self.assertIs(schema["gaming.detect_minecraft"]["default"], False)
+        text = open(os.path.join(ROOT, "files/system/usr/bin/forge-game")).read()
+        self.assertEqual(text.count('minecraft=vals["gaming.detect_minecraft"] is True'), 2, "watch and restore")
+
     def test_other_users_and_ended_processes_do_not_count(self):
         self.steam_game(pid=4242)
         os.chown(os.path.join(self.proc, "4242"), 65534, 65534)

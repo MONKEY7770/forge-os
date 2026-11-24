@@ -38,7 +38,13 @@ POLL_S = 5            # seconds between looks at /proc
 EXIT_POLLS = 3        # the game must be gone this many looks in a row (15 s) before switching back
 CMDLINE_MAX = 65536
 GAME_COMMS = ("reaper", "sober")
-KEYS = ("gaming.overlay", "gaming.auto_mode", "modes.gaming.power", "modes.gaming.unload_models")
+# Minecraft, when turned on (gaming.detect_minecraft): Java Edition is a "java" process whose command
+# line names Prism Launcher's or the official launcher's entry class as a whole argument; Bedrock
+# runs as mcpelauncher-client ("comm" keeps 15 characters).
+MINECRAFT_COMMS = ("java", "mcpelauncher-cl")
+MINECRAFT_JAVA_CLASSES = ("org.prismlauncher.EntryPoint", "net.minecraft.client.main.Main")
+KEYS = ("gaming.overlay", "gaming.auto_mode", "gaming.detect_minecraft", "modes.gaming.power",
+        "modes.gaming.unload_models")
 
 MARKER = "# forge-managed: MangoHud overlay (Forge Settings, Gaming, Game overlay)"
 OVERLAY = {
@@ -188,7 +194,7 @@ def _proc_text(d, name, limit):
     return read_small(os.path.join(d, name), limit, follow=False).decode("utf-8", "replace")
 
 
-def find_games(proc=None):
+def find_games(proc=None, minecraft=False):
     """Your running games, from /proc. Cheap: only `comm` is read for most processes."""
     proc = proc or PROC
     me = os.getuid()
@@ -205,7 +211,7 @@ def find_games(proc=None):
             if os.lstat(d).st_uid != me:
                 continue
             comm = _proc_text(d, "comm", 64).strip()
-            if comm not in GAME_COMMS:
+            if comm not in GAME_COMMS and not (minecraft and comm in MINECRAFT_COMMS):
                 continue
             st = _proc_text(d, "stat", 1024)
             state = st[st.rfind(")") + 2:][:1] if ")" in st else ""
@@ -214,8 +220,15 @@ def find_games(proc=None):
             if comm == "sober":
                 found.append({"pid": int(pid), "kind": "roblox", "appid": None})
                 continue
+            if comm == "mcpelauncher-cl":
+                found.append({"pid": int(pid), "kind": "minecraft", "appid": None})
+                continue
             args = read_small(os.path.join(d, "cmdline"), CMDLINE_MAX, follow=False).split(b"\0")
             args = [a.decode("utf-8", "replace") for a in args]
+            if comm == "java":
+                if any(a in MINECRAFT_JAVA_CLASSES for a in args[1:]):
+                    found.append({"pid": int(pid), "kind": "minecraft", "appid": None})
+                continue
             if not args or os.path.basename(args[0]) != "reaper" or "SteamLaunch" not in args[1:3]:
                 continue
             for a in args[1:8]:
@@ -447,7 +460,7 @@ class Watcher:
         vals = settings()
         enabled = bool(vals and vals["gaming.auto_mode"] is True)
         st = load_state()
-        games = find_games(self.proc) if enabled else []
+        games = find_games(self.proc, minecraft=vals["gaming.detect_minecraft"] is True) if enabled else []
         if games:
             self.misses = 0
             if st is None:
@@ -467,7 +480,8 @@ def restore(force=False, proc=None):
     if st is None:
         return 0
     vals = settings()
-    if not force and vals and vals["gaming.auto_mode"] is True and find_games(proc):
+    if (not force and vals and vals["gaming.auto_mode"] is True
+            and find_games(proc, minecraft=vals["gaming.detect_minecraft"] is True)):
         print("A game is still running: gaming mode stays on until it ends.")
         return 0
     leave(st)

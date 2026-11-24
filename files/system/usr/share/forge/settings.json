@@ -272,6 +272,9 @@
     {"key": "gaming.overlay", "group": "gaming", "type": "select", "default": "off", "options": ["off", "minimal", "full"],
      "label": "Game overlay (MangoHud)", "tags": ["gaming", "overlay", "fps", "performance"],
      "help": "Minimal is an FPS counter. Full adds frame times, CPU and GPU load and temperature, VRAM and RAM. It shows only in games you start with MangoHud (in Steam: Properties, Launch options: mangohud %command%), never in other apps. Right Shift+F12 shows or hides it in a game. Saved per user in ~/.config/MangoHud/MangoHud.conf; a MangoHud.conf you made yourself is never changed."},
+    {"key": "gaming.detect_minecraft", "group": "gaming", "type": "toggle", "default": false,
+     "label": "Minecraft counts as a game", "tags": ["gaming", "modes", "minecraft", "prism"],
+     "help": "Gaming mode also starts for Minecraft: Java Edition from Prism Launcher or the official launcher, and Bedrock from its launcher. Off by default, so Java development tools that run Minecraft for testing don't switch modes."},
     {"key": "gaming.auto_mode", "group": "gaming", "type": "toggle", "default": true,
      "label": "Gaming mode while a game runs", "tags": ["gaming", "modes", "ai", "vram"],
      "help": "When a Steam game or Roblox (Sober) starts, Forge switches to gaming mode (see Performance modes: AI models unloaded, agents slowed down) and back to your mode about 15 seconds after it ends. If anything crashes, it switches back at the next check or login. A mode you pick during the game is kept."}

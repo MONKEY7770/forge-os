@@ -1180,6 +1180,8 @@
   "set.devices.printing.label": "การพิมพ์",
   "set.gaming.auto_mode.help": "เมื่อเกม Steam หรือ Roblox (Sober) เริ่ม Forge จะสลับไปโหมดเล่นเกม (ดูโหมดประสิทธิภาพ: เลิกโหลดโมเดล AI และลดความเร็วเอเจนต์) แล้วกลับไปโหมดเดิมของคุณประมาณ 15 วินาทีหลังเกมจบ ถ้ามีอะไรค้างหรือล่ม จะสลับกลับในการตรวจครั้งถัดไปหรือเมื่อเข้าสู่ระบบ โหมดที่คุณเลือกเองระหว่างเล่นจะคงไว้",
   "set.gaming.auto_mode.label": "โหมดเล่นเกมขณะเกมทำงาน",
+  "set.gaming.detect_minecraft.help": "เปิดโหมดเกมเมื่อเล่น Minecraft ด้วย: Java Edition จาก Prism Launcher หรือตัวเปิดเกมทางการ และ Bedrock จากตัวเปิดเกมของมัน ปิดไว้เป็นค่าเริ่มต้น เพื่อไม่ให้เครื่องมือพัฒนา Java ที่เปิด Minecraft เพื่อทดสอบสลับโหมดโดยไม่ตั้งใจ",
+  "set.gaming.detect_minecraft.label": "นับ Minecraft เป็นเกม",
   "set.gaming.overlay.help": "แบบน้อยที่สุดคือตัวนับ FPS ส่วนแบบเต็มจะเพิ่มเวลาเฟรม, ภาระและอุณหภูมิของ CPU และ GPU, VRAM และ RAM จะแสดงเฉพาะในเกมที่เปิดผ่าน MangoHud (ใน Steam: Properties, Launch options: mangohud %command%) ไม่แสดงในแอปอื่น กด Shift ขวา+F12 ในเกมเพื่อแสดงหรือซ่อน บันทึกแยกสำหรับผู้ใช้แต่ละคนใน ~/.config/MangoHud/MangoHud.conf ไฟล์ MangoHud.conf ที่คุณเขียนเองจะไม่ถูกแก้ไข",
   "set.gaming.overlay.label": "โอเวอร์เลย์ในเกม (MangoHud)",
   "set.group.agents": "ขีดจำกัดทรัพยากรของเอเจนต์",

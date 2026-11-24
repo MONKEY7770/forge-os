@@ -28,17 +28,17 @@ jobs:
           Item {
               Component.onCompleted: {
                   var c = Qt.createComponent("file:///usr/share/plasma/packages/org.forgeos.setup.aistorage/contents/ui/main.qml")
-                  console.log("FORGE status", c.status, "errors:", c.errorString())
+                  console.warn("FORGE status", c.status, "errors:", c.errorString())
                   if (c.status === Component.Ready) {
                       var o = c.createObject(null)
-                      console.log("FORGE created", o !== null, o ? o.contentItem : "none", o ? o.cardWidth : "")
+                      console.warn("FORGE created", o !== null, o ? o.contentItem : "none", o ? o.cardWidth : "")
                   }
                   Qt.quit()
               }
           }
           QML
-            QT_QPA_PLATFORM=offscreen timeout 60 "$Q" /tmp/t/load.qml 2>&1 | grep -v "^qt\.\|propagateSizeHints" | head -30
+            QT_QPA_PLATFORM=offscreen QT_LOGGING_RULES="*.debug=true;qt.*.debug=false" timeout 60 "$Q" /tmp/t/load.qml > /tmp/t/out 2>&1; echo "rc=$?"; grep -v "^qt\.\|propagateSizeHints" /tmp/t/out | head -30
             echo "== built-in page loads the same way (control)"
             sed -i "s#org.forgeos.setup.aistorage#org.kde.plasmasetup.hostname#" /tmp/t/load.qml
-            QT_QPA_PLATFORM=offscreen timeout 60 "$Q" /tmp/t/load.qml 2>&1 | grep -v "^qt\.\|propagateSizeHints" | head -10
+            QT_QPA_PLATFORM=offscreen QT_LOGGING_RULES="*.debug=true;qt.*.debug=false" timeout 60 "$Q" /tmp/t/load.qml > /tmp/t/out 2>&1; echo "rc=$?"; grep -v "^qt\.\|propagateSizeHints" /tmp/t/out | head -10
           '

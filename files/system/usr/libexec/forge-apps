@@ -1,0 +1,468 @@
+#!/usr/bin/python3
+"""Forge OS optional apps (root, forge-apps.service and its timer).
+
+  forge-apps                 install the apps whose switch is on, delete the ones turned off
+  forge-apps --apply-setup   save the choice made in the setup wizard (forge-setup-apps.path)
+
+Each optional app in /usr/share/forge/apps.json is one switch (Forge Settings, Apps; the setup
+wizard's Apps page). The rules:
+- Nothing optional is installed until setup is finished (a choice was saved in the wizard, or a
+  person's account exists), so nothing is downloaded that you are about to untick.
+- A switch that is on installs its app (tried again later if offline).
+- Turning a switch from on to off deletes its app once. Your files and the app's own saved data
+  in your home folder stay.
+- An app you install yourself while its switch is off is never deleted. An app you delete
+  yourself while its switch is on is not put back: its switch is turned off instead.
+Virtual machines (virt.enabled) are set up by forge-virt; Android (apps.android) by this tool.
+"""
+import contextlib
+import html
+import json
+import os
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, "/usr/lib/forge")
+import forgecfg  # noqa: E402
+
+CATALOG = "/usr/share/forge/apps.json"
+STATE_DIR = "/var/lib/forge-apps"          # root only (StateDirectory=forge-apps)
+TMP_DIR = "/run/forge"
+SPOOL_DIR = "/var/lib/forge-setup"         # written by the wizard's user (plasma-setup)
+SPOOL_NAME = "apps.ini"
+SPOOL_MAX = 4096
+APPLY_CMD = ["/usr/libexec/forge-apply"]
+WAYDROID_DIR = "/var/lib/waydroid"
+OTA = ["-c", "https://ota.waydro.id/system", "-v", "https://ota.waydro.id/vendor"]
+FIRST_UID, LAST_UID = 1000, 60513
+CHOICE_WINDOW_S = 2 * 3600      # the wizard may change its choice (Back, Next) for this long
+RESETUP_WAIT_S = 6 * 3600       # a failed Android re-setup is tried again after this
+MAX_VANISHED = 2                # more apps gone at once: the list is not trusted this time
+SESSION_ID = re.compile(r"[A-Za-z0-9]{1,32}")
+
+
+def now():
+    return time.time()
+
+
+def mounted_under(path):
+    """Mount points at or under path (from /proc/self/mountinfo)."""
+    out = []
+    try:
+        with open("/proc/self/mountinfo") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) > 4:
+                    mp = parts[4].replace("\\040", " ")
+                    if mp == path or mp.startswith(path + "/"):
+                        out.append(mp)
+    except OSError:
+        out.append("(mounts can't be read)")
+    return out
+
+
+def run_cmd(cmd, timeout=60):
+    try:
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout + r.stderr
+    except (OSError, subprocess.SubprocessError) as e:
+        return -1, str(e)
+
+
+def settings():
+    vals, errors = forgecfg.validate(forgecfg.values())
+    return None if errors else vals
+
+
+def load_catalog():
+    with open(CATALOG) as f:
+        return json.load(f)
+
+
+def short_name(key):
+    """The name used in the wizard's file: apps.discord is "discord", virt.enabled is "vms"."""
+    return "vms" if key == "virt.enabled" else key.split(".", 1)[1]
+
+
+def regular_users():
+    return [p.pw_uid for p in pwd.getpwall() if FIRST_UID <= p.pw_uid <= LAST_UID]
+
+
+# ---------- state (root only) ----------
+
+def load_state():
+    try:
+        fd = os.open(os.path.join(STATE_DIR, "state.json"), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        with os.fdopen(fd) as f:
+            st = json.load(f)
+        if isinstance(st, dict):
+            return {"applied": dict(st.get("applied") or {}), "installed": dict(st.get("installed") or {}),
+                    "android_versions": st.get("android_versions"), "android_try": st.get("android_try"),
+                    "new": False}
+    except (OSError, ValueError):
+        pass
+    return {"applied": {}, "installed": {}, "android_versions": None, "android_try": None, "new": True}
+
+
+def save_state(st):
+    st = {k: v for k, v in st.items() if k != "new"}
+    tmp = os.path.join(STATE_DIR, f".state-{os.urandom(6).hex()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(st, f, sort_keys=True)
+    os.replace(tmp, os.path.join(STATE_DIR, "state.json"))
+
+
+def setup_done():
+    return os.path.lexists(os.path.join(STATE_DIR, "chosen")) or bool(regular_users())
+
+
+def set_switches(changes):
+    """Saves switch changes the normal way (forge-apply --import --merge), so Settings shows them."""
+    name = os.path.join(TMP_DIR, f"apps-{os.urandom(6).hex()}.json")
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(changes, f)
+        rc, _ = run_cmd(APPLY_CMD + ["--import", name, "--merge"], timeout=600)
+        return rc == 0
+    except OSError:
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(name)
+
+
+# ---------- telling the desktop users ----------
+
+def notify_users(summary, body):
+    rc, out = run_cmd(["loginctl", "list-sessions", "--no-legend"], timeout=10)
+    if rc != 0:
+        return
+    for line in out.splitlines()[:64]:
+        sid = (line.split() or [""])[0]
+        if not SESSION_ID.fullmatch(sid):
+            continue
+        rc, text = run_cmd(["loginctl", "show-session", sid, "--property=User", "--property=Remote",
+                            "--property=Active", "--property=Class"], timeout=10)
+        p = dict(x.split("=", 1) for x in text.splitlines()[:10] if "=" in x)
+        uid = p.get("User", "")
+        if rc != 0 or not uid.isdigit() or int(uid) < FIRST_UID or p.get("Remote") != "no" \
+                or p.get("Active") != "yes" or p.get("Class") != "user":
+            continue
+        try:
+            name = pwd.getpwuid(int(uid)).pw_name
+        except KeyError:
+            continue
+        run_cmd(["runuser", "-u", name, "--", "env", f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+                 "notify-send", "-a", "Forge OS", "-i", "system-software-install", "--",
+                 html.escape(summary), html.escape(body)], timeout=15)
+
+
+# ---------- Flatpak apps ----------
+
+def installed_flatpaks():
+    rc, out = run_cmd(["flatpak", "list", "--system", "--app", "--columns=application"], timeout=120)
+    return {line.strip() for line in out.splitlines() if line.strip()} if rc == 0 else None
+
+
+def flatpak_item(it, want, st, have, report):
+    key, app = it["key"], it["flatpak"]
+    prev = st["applied"].get(key)
+    present = app in have
+    if want:
+        if st["installed"].get(key) and not present:
+            # Deleted by you (for example in Discover): not put back; its switch is turned off below
+            # (all such switches in one save), unless too many vanished at once.
+            report["vanished"][key] = it["name"]
+            return
+        if not present:
+            rc, out = run_cmd(["flatpak", "install", "--system", "--noninteractive", "--or-update", "flathub", app],
+                              timeout=3600)
+            if rc != 0:
+                report["failed"].append(it["name"])
+                print(f"{it['name']}: not installed yet, will try again ({out.strip()[-200:]})", flush=True)
+                st["applied"][key] = True
+                return
+            report["installed"].append(it["name"])
+        st["applied"][key], st["installed"][key] = True, True
+        return
+    if prev is True and present:
+        rc, _ = run_cmd(["flatpak", "uninstall", "--system", "--noninteractive", app], timeout=1800)
+        if rc == 0:
+            report["removed"].append(it["name"])
+        else:
+            report["failed"].append(it["name"])
+            return          # tried again next time (still "on" in the state)
+    st["applied"][key], st["installed"][key] = False, False
+
+
+# ---------- Android (Waydroid) ----------
+
+def has_nvidia_setup():
+    return os.access("/usr/bin/waydroid-nvidia-setup", os.X_OK)
+
+
+def driver_versions():
+    """Kernel and NVIDIA driver: Waydroid's NVIDIA image must be set up again when either changes."""
+    try:
+        with open("/sys/module/nvidia/version") as f:
+            nv = f.read().strip()
+    except OSError:
+        nv = ""
+    return f"{os.uname().release}|{nv}"
+
+
+def android_ready():
+    return os.path.isdir(os.path.join(WAYDROID_DIR, "images")) and not os.path.islink(WAYDROID_DIR)
+
+
+def remove_waydroid_dir():
+    """Deletes /var/lib/waydroid (the Android system). A link there is removed, never followed."""
+    if os.path.islink(WAYDROID_DIR):
+        os.unlink(WAYDROID_DIR)
+    elif os.path.isdir(WAYDROID_DIR):
+        shutil.rmtree(WAYDROID_DIR)     # does not follow links inside it
+
+
+def android_item(it, want, st, report):
+    key = it["key"]
+    prev = st["applied"].get(key)
+    if want:
+        nvidia = has_nvidia_setup()
+        versions = driver_versions() if nvidia else None
+        was_set_up = bool(st["installed"].get(key)) and android_ready()
+        if was_set_up and (not nvidia or st.get("android_versions") == versions):
+            st["applied"][key] = True
+            return
+        tried = st.get("android_try") or {}
+        if tried.get("versions") == versions and now() - float(tried.get("at", 0)) < RESETUP_WAIT_S:
+            st["applied"][key] = True
+            return          # failed a short while ago with this kernel and driver: wait
+        if nvidia:
+            # Bazzite's default NVIDIA mode; setup fails while the container runs. Again after each
+            # kernel or driver update (its image is tied to the NVIDIA kernel module).
+            run_cmd(["systemctl", "stop", "waydroid-container.service"], timeout=120)
+            rc, out = run_cmd(["waydroid-nvidia-setup", "--mode", "nvidia-prolapse"], timeout=7200)
+            if rc == 0:
+                run_cmd(["systemctl", "enable", "--now", "waydroid-container.service"], timeout=120)
+            elif was_set_up or st["installed"].get(key):
+                run_cmd(["systemctl", "start", "waydroid-container.service"], timeout=120)
+        else:
+            run_cmd(["systemctl", "enable", "--now", "waydroid-container.service"], timeout=120)
+            rc, out = run_cmd(["waydroid", "init"] + OTA, timeout=7200) if not android_ready() else (0, "")
+        st["applied"][key] = True
+        if rc != 0:
+            st["android_try"] = {"versions": versions, "at": now()}
+            report["failed"].append(it["name"])
+            print(f"Android: not set up yet, will try again later ({out.strip()[-200:]})", flush=True)
+            return
+        run_cmd(["restorecon", "-R", WAYDROID_DIR], timeout=600)
+        if not st["installed"].get(key):
+            report["installed"].append(it["name"])
+        st["installed"][key] = True
+        st["android_versions"] = versions
+        st["android_try"] = None
+        return
+    if prev is True and st["installed"].get(key):
+        rc, out = run_cmd(["systemctl", "disable", "--now", "waydroid-container.service"], timeout=300)
+        busy = mounted_under(WAYDROID_DIR)
+        if rc != 0 or busy:
+            # Never delete while Android's files are still mounted (rmtree would walk into them).
+            report["failed"].append(it["name"])
+            print(f"Android: not deleted yet, still in use ({', '.join(busy) or out.strip()[-200:]})", flush=True)
+            return
+        try:
+            remove_waydroid_dir()
+            report["removed"].append(it["name"])
+        except OSError as e:
+            report["failed"].append(it["name"])
+            print(f"Android: could not delete {WAYDROID_DIR} ({e.strerror})", flush=True)
+            return
+    st["applied"][key], st["installed"][key] = False, False
+    st["android_versions"] = None
+    st["android_try"] = None
+
+
+# ---------- the run ----------
+
+def retry_pending():
+    """A wizard choice that forge-apply could not save yet."""
+    path = os.path.join(STATE_DIR, "pending.json")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        with os.fdopen(fd) as f:
+            changes = json.load(f)
+    except (OSError, ValueError):
+        return
+    if isinstance(changes, dict) and set_switches(changes):
+        os.unlink(path)
+        print(f"Saved the first-boot choice of apps: {json.dumps(changes, sort_keys=True)}", flush=True)
+
+
+def apply_all():
+    retry_pending()
+    vals = settings()
+    if vals is None:
+        print("Not changed: the settings file has problems (see forge-doctor).", file=sys.stderr)
+        return 1
+    if not setup_done():
+        print("Waiting until setup is finished.", flush=True)
+        return 0
+    cat = load_catalog()
+    have = installed_flatpaks()
+    if have is None:
+        print("Not changed: flatpak list failed.", file=sys.stderr)
+        return 1
+    st = load_state()
+    report = {"installed": [], "removed": [], "failed": [], "vanished": {}}
+    flatpaks = [it for it in cat["optional"] if it["kind"] == "flatpak"]
+    if st["new"] and not os.path.lexists(os.path.join(STATE_DIR, "chosen")) \
+            and any(it["flatpak"] in have for it in flatpaks):
+        # An update from an older Forge OS, which installed every app: the apps you had deleted stay
+        # deleted (their switches are turned off), the others are kept.
+        gone = {it["key"]: False for it in flatpaks if vals.get(it["key"]) is True and it["flatpak"] not in have}
+        if gone and not set_switches(gone):
+            print("Not changed: could not save the switches of the apps you had deleted.", file=sys.stderr)
+            return 1
+        vals.update(gone)
+        for it in flatpaks:
+            if it["flatpak"] in have and vals.get(it["key"]) is True:
+                st["applied"][it["key"]], st["installed"][it["key"]] = True, True
+        print(f"Updated from an older Forge OS: kept the installed apps, switched off {len(gone)} you had deleted.",
+              flush=True)
+    for it in cat["optional"]:
+        want = vals.get(it["key"]) is True
+        if it["kind"] == "flatpak":
+            flatpak_item(it, want, st, have, report)
+        elif it["kind"] == "waydroid":
+            android_item(it, want, st, report)
+        save_state(st)
+    vanished = report.pop("vanished")
+    if len(vanished) > MAX_VANISHED:
+        print(f"{len(vanished)} apps seem gone at once: not trusted this time (nothing changed for them).", flush=True)
+    elif vanished and set_switches(dict.fromkeys(vanished, False)):
+        for key in vanished:
+            st["applied"][key], st["installed"][key] = False, False
+        save_state(st)
+        print("Deleted by you, switched off: " + ", ".join(vanished.values()) + ".", flush=True)
+    if report["removed"]:
+        run_cmd(["flatpak", "uninstall", "--system", "--noninteractive", "--unused"], timeout=1800)
+    parts = []
+    if report["installed"]:
+        parts.append("Installed: " + ", ".join(report["installed"]) + ".")
+    if report["removed"]:
+        parts.append("Deleted: " + ", ".join(report["removed"]) + ".")
+    if report["failed"]:
+        parts.append("Not done yet (tried again later): " + ", ".join(report["failed"]) + ".")
+    if report["installed"] or report["removed"]:
+        notify_users("Forge OS: apps updated", " ".join(parts) + " Change them in Forge Settings, Apps.")
+    for p in parts:
+        print(p, flush=True)
+    return 0
+
+
+# ---------- the wizard's choice ----------
+
+def read_spool():
+    """(text, problem). The file is removed after reading, whatever it holds (never followed)."""
+    try:
+        dfd = os.open(SPOOL_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None, None
+    except OSError as e:
+        return None, f"cannot open {SPOOL_DIR} ({e.strerror})"
+    try:
+        try:
+            fd = os.open(SPOOL_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+        except FileNotFoundError:
+            return None, None
+        except OSError as e:
+            return None, f"{SPOOL_NAME} can't be opened safely ({e.strerror})"
+        finally:
+            try:
+                os.unlink(SPOOL_NAME, dir_fd=dfd)
+            except IsADirectoryError:
+                shutil.rmtree(SPOOL_NAME, dir_fd=dfd, ignore_errors=True)
+            except OSError:
+                pass
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None, f"{SPOOL_NAME} is not a regular file"
+        with os.fdopen(fd, "rb") as f:
+            data = f.read(SPOOL_MAX + 1)
+        if len(data) > SPOOL_MAX:
+            return None, f"{SPOOL_NAME} is too large"
+        try:
+            return data.decode("ascii"), None
+        except UnicodeDecodeError:
+            return None, f"{SPOOL_NAME} is not plain text"
+    finally:
+        os.close(dfd)
+
+
+def parse_setup(text, cat):
+    """{settings key: bool}, or None if the file holds anything else."""
+    names = {short_name(it["key"]): it["key"] for it in cat["optional"]}
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines or lines[0] != "[apps]":
+        return None
+    out = {}
+    for ln in lines[1:]:
+        m = re.fullmatch(r"([a-z_]{1,32})=(true|false)", ln)
+        if not m or m.group(1) not in names or names[m.group(1)] in out:
+            return None
+        out[names[m.group(1)]] = m.group(2) == "true"
+    return out or None
+
+
+def apply_setup():
+    text, problem = read_spool()
+    if problem:
+        print("Not saved: " + problem, file=sys.stderr)
+        return 2
+    if text is None:
+        return 0
+    changes = parse_setup(text, load_catalog())
+    if changes is None:
+        print(f"Not saved: {SPOOL_NAME} does not hold a valid choice", file=sys.stderr)
+        return 2
+    marker = os.path.join(STATE_DIR, "chosen")
+    try:
+        age = now() - os.lstat(marker).st_mtime
+    except FileNotFoundError:
+        age = None
+    if age is not None and age > CHOICE_WINDOW_S:
+        # Only the setup wizard may choose (and change its mind for a while); not its user later.
+        print(f"Not saved: {SPOOL_NAME} came long after setup (change apps in Forge Settings).", file=sys.stderr)
+        return 2
+    # Marked first: forge-apply starts forge-apps, which must see that the choice was made.
+    fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    os.close(fd)
+    if not set_switches(changes):
+        pending = os.path.join(STATE_DIR, "pending.json")
+        fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(changes, f)
+        print("Not saved yet: forge-apply failed (forge-apps tries again).", file=sys.stderr)
+        return 1
+    print(f"Saved the first-boot choice of apps: {json.dumps(changes, sort_keys=True)}", flush=True)
+    return 0
+
+
+def main(argv):
+    if argv == ["--apply-setup"]:
+        return apply_setup()
+    if argv:
+        print(__doc__.strip().splitlines()[2], file=sys.stderr)
+        return 2
+    return apply_all()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

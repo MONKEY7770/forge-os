@@ -1,0 +1,34 @@
+{
+  "_comment": "Forge OS apps. 'always' is installed by BlueBuild at every boot (recipe). Each 'optional' entry is one checkbox in the setup wizard and one switch in Forge Settings, Apps (its settings key). forge-apps installs it while the switch is on and deletes it once when you turn the switch off. kind: flatpak (one Flathub app), waydroid (Android, set up by forge-apps), virt (virtual machines, set up by forge-virt).",
+  "always": ["org.mozilla.firefox", "com.github.tchx84.Flatseal", "io.missioncenter.MissionCenter"],
+  "sections": [
+    {"id": "gaming", "label": "Gaming"},
+    {"id": "create", "label": "Creating"},
+    {"id": "work", "label": "Work and tools"}
+  ],
+  "optional": [
+    {"key": "apps.discord", "section": "gaming", "kind": "flatpak", "flatpak": "com.discordapp.Discord", "name": "Discord"},
+    {"key": "apps.sober", "section": "gaming", "kind": "flatpak", "flatpak": "org.vinegarhq.Sober", "name": "Roblox (Sober)"},
+    {"key": "apps.vinegar", "section": "gaming", "kind": "flatpak", "flatpak": "org.vinegarhq.Vinegar", "name": "Roblox Studio (Vinegar)"},
+    {"key": "apps.prism", "section": "gaming", "kind": "flatpak", "flatpak": "org.prismlauncher.PrismLauncher", "name": "Minecraft Java (Prism Launcher)"},
+    {"key": "apps.mcpelauncher", "section": "gaming", "kind": "flatpak", "flatpak": "io.mrarm.mcpelauncher", "name": "Minecraft Bedrock"},
+    {"key": "apps.moonlight", "section": "gaming", "kind": "flatpak", "flatpak": "com.moonlight_stream.Moonlight", "name": "Moonlight (play games from another PC)"},
+    {"key": "apps.gpu_recorder", "section": "gaming", "kind": "flatpak", "flatpak": "com.dec05eba.gpu_screen_recorder", "name": "GPU Screen Recorder"},
+    {"key": "apps.retrodeck", "section": "gaming", "kind": "flatpak", "flatpak": "net.retrodeck.retrodeck", "name": "Retro gaming (RetroDECK)"},
+    {"key": "apps.android", "section": "gaming", "kind": "waydroid", "name": "Android apps (Waydroid)"},
+    {"key": "virt.enabled", "section": "gaming", "kind": "virt", "name": "Virtual machines (Windows gaming ready)"},
+    {"key": "apps.blender", "section": "create", "kind": "flatpak", "flatpak": "org.blender.Blender", "name": "Blender"},
+    {"key": "apps.blockbench", "section": "create", "kind": "flatpak", "flatpak": "net.blockbench.Blockbench", "name": "Blockbench"},
+    {"key": "apps.krita", "section": "create", "kind": "flatpak", "flatpak": "org.kde.krita", "name": "Krita"},
+    {"key": "apps.audacity", "section": "create", "kind": "flatpak", "flatpak": "org.audacityteam.Audacity", "name": "Audacity"},
+    {"key": "apps.pixelorama", "section": "create", "kind": "flatpak", "flatpak": "com.orama_interactive.Pixelorama", "name": "Pixelorama"},
+    {"key": "apps.kdenlive", "section": "create", "kind": "flatpak", "flatpak": "org.kde.kdenlive", "name": "Kdenlive (video editing)"},
+    {"key": "apps.obs", "section": "create", "kind": "flatpak", "flatpak": "com.obsproject.Studio", "name": "OBS Studio (recording and streaming)"},
+    {"key": "apps.vscode", "section": "work", "kind": "flatpak", "flatpak": "com.visualstudio.code", "name": "Visual Studio Code"},
+    {"key": "apps.github_desktop", "section": "work", "kind": "flatpak", "flatpak": "io.github.shiftey.Desktop", "name": "GitHub Desktop"},
+    {"key": "apps.vlc", "section": "work", "kind": "flatpak", "flatpak": "org.videolan.VLC", "name": "VLC (videos and music)"},
+    {"key": "apps.localsend", "section": "work", "kind": "flatpak", "flatpak": "org.localsend.localsend_app", "name": "LocalSend (send files to your phone)"},
+    {"key": "apps.bitwarden", "section": "work", "kind": "flatpak", "flatpak": "com.bitwarden.desktop", "name": "Bitwarden (passwords)"},
+    {"key": "apps.rustdesk", "section": "work", "kind": "flatpak", "flatpak": "com.rustdesk.RustDesk", "name": "RustDesk (remote desktop)"}
+  ]
+}

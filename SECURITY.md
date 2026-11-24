@@ -293,6 +293,26 @@ New parts and their threat notes:
 - **Prism Launcher** (Flatpak, Flathub) is preinstalled.
 - **AI while you play** (Settings, Modes; default Wait). The root mode service (forge-mode-switch) now also stops Ollama during a game and starts it after (Wait), or restarts it with the graphics card hidden (CPU). Its sandbox gains write access to one root-owned folder, /run/forge/gaming, and nothing else; it still only acts for an administrator at this PC's own screen. While paused, the gateway answers 503 with a plain reason, and health checks and the doctor do not report the stop as a problem.
 
+- **Optional apps (forge-apps, root).** Installs the Flathub apps whose switch is on and deletes an app only when its switch goes from on to off. An app installed by hand while its switch is off is never touched; once its switch is on, it is treated like the others (so switching it off deletes it). After an update from an older Forge OS, apps you had deleted stay deleted (their switches are turned off). If many apps seem to vanish at once, the list is not trusted and nothing is switched off. The wizard's file is accepted only until about 2 hours after the first choice. The wizard's Apps page writes /var/lib/forge-setup/apps.ini as Plasma Setup's user; a root service reads it once without following links, accepts only "[apps]" and known names set to true or false (ASCII, size-capped), deletes it, and saves the choice through forge-apply's normal import. Android: turning it on downloads Waydroid's Android images from ota.waydro.id (the same source as Bazzite's own setup), or runs Bazzite's waydroid-nvidia-setup on NVIDIA; turning it off deletes /var/lib/waydroid only after Waydroid stopped and nothing is mounted there (a link there is removed, never followed). Its own record is in /var/lib/forge-apps (root only).
+- **forge-vm (your user).** Edits only VMs your user may manage (Virtual Machine Manager's own virsh; your session first, then the system connection if one exists), only Windows VMs, refuses XML with declarations, saves a backup first (with display passwords, readable only by you), and never changes disks, networks, the TPM or the display.
+- **BlueBuild's boot-time installer** now lists only Firefox, Flatseal and Mission Center: it installs its whole list again at every boot, so optional apps could not be deleted while they were in it.
+
+Independent review of optional apps and forge-vm (no High findings; the root-side file handling held up):
+
+| Sev. | Finding | Status |
+|---|---|---|
+| Medium | After an update from an older Forge OS, apps you had deleted would be installed again | Fixed: on the first run after such an update, absent apps get their switch turned off |
+| Medium | The wizard's choice could wait up to 30 minutes (the installer started before the choice was marked) | Fixed: marked first |
+| Medium | An empty or partial app list could turn many switches off | Fixed: more than 2 apps gone at once is not trusted; switch changes are saved together |
+| Medium | A failed NVIDIA Android re-setup left Android stopped and retried every 30 minutes | Fixed: Android is started again and the re-setup waits 6 hours; a re-setup is not reported as new |
+| Medium (suspected) | Android could be deleted while its files were still mounted | Fixed: deleted only after Waydroid stopped and nothing is mounted there |
+| Medium (suspected) | forge-vm handed the sandboxed virsh a file it can't see | Fixed: the XML goes through standard input |
+| Medium (suspected) | forge-vm looked only at your own VMs | Fixed: then the system connection, if one exists |
+| Low | A wizard choice was lost if saving failed | Fixed: kept and saved at the next run |
+| Low | SECURITY.md said apps not installed by forge-apps are never deleted | Fixed wording (an app is handled once its switch is on) |
+| Low | forge-vm dropped display passwords | Fixed: read with --security-info; backups are readable only by you |
+| Low | The wizard's user could change switches long after setup | Fixed: its file is accepted only for about 2 hours after the first choice |
+
 Independent review of this round (no High findings; the root-run parts held up):
 
 | Sev. | Area | Finding | Status |

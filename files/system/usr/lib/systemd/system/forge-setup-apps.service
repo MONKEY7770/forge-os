@@ -1,0 +1,11 @@
+[Unit]
+Description=Save the first-boot wizard's choice of apps in Forge Settings
+After=forge-apply-firstboot.service
+
+[Service]
+Type=oneshot
+# Checks the file strictly (known apps, true or false, nothing else), removes it, then saves the
+# choice through forge-apply --import --merge (which starts forge-apps).
+ExecStart=/usr/libexec/forge-apps --apply-setup
+StateDirectory=forge-apps
+StateDirectoryMode=0700

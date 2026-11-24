@@ -1,0 +1,17 @@
+[Unit]
+Description=Forge OS optional apps (install the ones switched on, delete the ones switched off)
+Documentation=file:///usr/libexec/forge-apps
+Wants=network-online.target
+After=network-online.target forge-apply-firstboot.service system-flatpak-setup.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/forge-apps
+# Root-only state (what was installed and chosen), made by systemd.
+StateDirectory=forge-apps
+StateDirectoryMode=0700
+# Big downloads (Android is about 1 GB) in the background.
+TimeoutStartSec=3h
+Nice=10
+IOSchedulingClass=idle
+PrivateTmp=yes

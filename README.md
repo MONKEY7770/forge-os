@@ -17,7 +17,7 @@ Both have the same apps and Forge tools. Not sure: on AMD, local AI models run o
 2. **VM settings (VirtualBox):** Type Linux, Version Fedora (64-bit), tick "Skip Unattended Installation", turn on **EFI** (System), at least 8 GB memory, 4 CPUs and a 64 GB disk, Graphics Controller VMSVGA (try VBoxSVGA if the screen is black). Attach the ISO in Storage.
 3. **Real PC:** write the ISO to a USB stick (for example with Fedora Media Writer), boot it in UEFI mode.
 4. **Install:** choose Install (skip the media check if you like), pick the disk, Erase and install. Check that the plan shows `/boot/efi`: if it shows `biosboot`, the PC or VM started in BIOS mode.
-5. **First start:** if a blue "MOK management" screen appears, choose Enroll MOK and type `universalblue`. Then the **setup wizard** creates your account (username and password) and asks how much space to keep free for normal use next to AI models.
+5. **First start:** if a blue "MOK management" screen appears, choose Enroll MOK and type `universalblue`. Then the **setup wizard** creates your account (username and password), asks how much space to keep free for normal use next to AI models, and lets you tick the apps you want (see below).
 6. **Sound in a VM:** if notification sounds crackle, Forge already uses a larger audio buffer inside VMs; switching the VM's audio controller (Intel HD Audio or ICH AC97) can also help. Real PCs are not affected.
 
 ## Hardware changes
@@ -35,17 +35,23 @@ Forge OS adapts when you change parts:
 
 On first login, a **Forge Welcome** page shows this report and helps with location, USB key unlock and Tailscale. Open it again any time from the app menu.
 
-## What's preinstalled
+## Apps (always on, and optional)
 
-| Area | Apps |
+**Always installed:** Firefox, Flatseal and Mission Center. Built into the image: Steam (from Bazzite), Claude Desktop, Ollama, Tailscale, KDE Connect, disk health and temperature sensors.
+
+**Optional:** the setup wizard's **Apps** page lists the rest with a checkbox each, and Forge Settings, **Apps** has the same switches for later. Ticked apps download in the background after setup (nothing optional is downloaded before you choose). Turning a switch off **deletes** that app; your own files and the app's saved data in your home folder stay. An app you install yourself (for example from Discover) is never deleted unless you turn its switch from on to off, and an app you delete yourself is not put back (its switch turns off).
+
+| Area | Optional apps (ticked at first unless noted) |
 |---|---|
-| Essentials | Firefox, Discord, Claude Desktop, VS Code, GitHub Desktop, VLC |
-| Gaming | Steam (from Bazzite), Sober (Roblox Player), Vinegar (Roblox Studio), Minecraft Bedrock launcher, Prism Launcher (Minecraft Java Edition and mods) |
-| Creative | Blender, Blockbench, Krita, Pixelorama, Audacity, OBS, Kdenlive, GPU Screen Recorder |
-| AI | Ollama (CUDA), agent resource limits |
-| Remote access | Tailscale, Moonlight, RustDesk, LocalSend, KDE Connect (built in), Sunshine (one click in Bazzite Portal) |
-| Privacy | Bitwarden, Flatseal |
-| System | Mission Center, disk health (smartd), temperature sensors |
+| Gaming | Discord, Sober (Roblox), Vinegar (Roblox Studio), Prism Launcher (Minecraft Java), Minecraft Bedrock launcher, Moonlight, GPU Screen Recorder; **unticked at first:** Retro gaming (RetroDECK), Android apps (Waydroid), Virtual machines |
+| Creating | Blender, Blockbench, Krita, Audacity, Pixelorama, Kdenlive, OBS Studio |
+| Work and tools | VS Code, GitHub Desktop, VLC, LocalSend, Bitwarden, RustDesk |
+
+- **Retro gaming (RetroDECK):** emulators for older consoles in one app with a controller-friendly menu. Add your own games (ROMs) and, for some consoles, BIOS files you own.
+- **Android apps (Waydroid):** turning it on downloads Android (about 1 GB) and sets it up (on NVIDIA, with Bazzite's `waydroid-nvidia` in its default mode, set up again by itself after kernel or driver updates). Some apps and games won't run. Turning it off deletes the Android system (`/var/lib/waydroid`); each user's Android data in their home folder stays.
+- **Virtual machines:** see [Virtual machines](#virtual-machines).
+
+How it works: the list is in `/usr/share/forge/apps.json`; `forge-apps` (root, after boot, every 30 minutes and after each settings change) installs and deletes. Its record of what it installed is in `/var/lib/forge-apps` (root only). `journalctl -u forge-apps` shows what it did.
 
 ## Forge Settings (everything is changeable)
 
@@ -159,7 +165,11 @@ On a laptop, Forge can switch modes by itself when you plug the charger in or ou
 
 ## Virtual machines
 
-Off by default. Turn on "Virtual machines (KVM)" in Forge Settings, under Virtual machines. Forge then does what Bazzite's `ujust setup-virtualization` does (libvirt, virt-manager from Flathub, two kernel options), and gives VM rights to administrators. Restart when it says so, then open Virtual Machine Manager. Turning it off removes only what Forge set up. The same section has a memory cap and CPU priority for all VMs together. `forge-doctor` shows whether your GPU could be passed through to a VM.
+Off by default (tick it in the setup wizard's Apps page, or turn on "Virtual machines (KVM)" in Forge Settings, under Virtual machines). Forge then does what Bazzite's `ujust setup-virtualization` does: Virtual Machine Manager from Flathub (with its own QEMU and a software TPM, so Windows 11 installs) and two kernel options. Restart when it says so, then open Virtual Machine Manager. Your VMs run as your own user (this image has no system-wide VM service). Turning it off removes only what Forge set up. The same section has a memory cap and CPU priority for all VMs together.
+
+**Windows, tuned for games:** after creating a Windows VM in Virtual Machine Manager (choose Windows 11 or 10 as the OS), shut it down and run `forge-vm windows-tune NAME`. It sets the host's own CPU with a matching core and thread layout, all the Hyper-V enlightenments Windows uses, Windows-friendly clocks and no memory balloon. It saves a backup first (`forge-vm undo NAME` puts it back) and never changes disks, networks, the TPM or the display. `--dry-run` only shows the changes.
+
+Honest limits: without a second graphics card given to the VM (GPU passthrough), Windows in a VM has no real 3D acceleration, so modern games run poorly. Many online games with anti-cheat refuse to run in a VM at all. Most Windows games run better directly on Forge OS through Steam (Proton). GPU passthrough needs two GPUs (for example the processor's built-in graphics plus a graphics card) and a system-wide VM service, which is not in this image. `forge-doctor` shows whether your GPU could be passed through.
 
 Not included: Aseprite (paid, not on Flathub). Install your own copy after setup.
 

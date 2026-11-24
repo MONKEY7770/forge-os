@@ -1,0 +1,238 @@
+#!/usr/bin/python3
+"""Forge OS: tune a Windows virtual machine made in Virtual Machine Manager.
+
+  forge-vm list                       your VMs and whether they run
+  forge-vm windows-tune NAME          apply the Windows performance settings (backup first)
+  forge-vm windows-tune NAME --dry-run   only show what would change
+  forge-vm undo NAME                  put back the VM as it was before the last tune
+
+What it sets (the usual Windows-on-KVM settings): the host's own CPU with a matching core and thread
+layout, every Hyper-V enlightenment Windows uses, Windows-friendly clocks, and no memory balloon.
+It never changes disks, networks, the TPM or the display: changing a disk's bus can stop Windows
+from booting. Shut the VM down first, or the changes apply at its next start.
+
+Limits (honest): without a second graphics card given to the VM (GPU passthrough), Windows in a VM
+has no real 3D acceleration, so modern games run poorly; many online games with anti-cheat refuse to
+run in a VM at all. Most Windows games run better directly on Forge OS through Steam (Proton).
+Works with the VMs of Virtual Machine Manager (the Flatpak): your own user's VMs first, then the
+system-wide ones if a system VM service exists.
+"""
+import copy
+import datetime
+import os
+import re
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+
+VIRSH = ["flatpak", "run", "--command=virsh", "org.virt_manager.virt-manager"]
+# Your own VMs first (Virtual Machine Manager's default here), then the system-wide ones (if a
+# system VM service exists and you are allowed to use it).
+URIS = ("qemu:///session", "qemu:///system")
+BACKUP_DIR = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "forge-vm")
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}")
+LIBOSINFO = "{http://libosinfo.org/xmlns/libvirt/domain/1.0}"
+HYPERV = ("relaxed", "vapic", "spinlocks", "vpindex", "runtime", "synic", "stimer", "reset",
+          "frequencies", "reenlightenment", "tlbflush", "ipi")
+TIMERS = {"rtc": {"tickpolicy": "catchup"}, "pit": {"tickpolicy": "delay"},
+          "hpet": {"present": "no"}, "hypervclock": {"present": "yes"}}
+
+ET.register_namespace("libosinfo", LIBOSINFO[1:-1])
+
+
+def virsh(args, input_text=None, uri=URIS[0]):
+    try:
+        r = subprocess.run(VIRSH + ["--connect", uri] + args, input=input_text, capture_output=True, text=True,
+                           timeout=120)
+        return r.returncode, r.stdout + (r.stderr if r.returncode else "")
+    except (OSError, subprocess.SubprocessError) as e:
+        return -1, str(e)
+
+
+def smt_active():
+    try:
+        with open("/sys/devices/system/cpu/smt/active") as f:
+            return f.read().strip() == "1"
+    except OSError:
+        return False
+
+
+def _child(parent, tag, changes, label, **attrs):
+    el = parent.find(tag)
+    if el is None:
+        el = ET.SubElement(parent, tag)
+        changes.append(f"added {label}")
+    for k, v in attrs.items():
+        if el.get(k) != v:
+            el.set(k, v)
+            changes.append(f"{label}: {k}={v}")
+    return el
+
+
+def is_windows(dom):
+    os_el = dom.find(f"metadata/{LIBOSINFO}libosinfo/{LIBOSINFO}os")
+    return os_el is not None and (os_el.get("id") or "").startswith("http://microsoft.com/win/")
+
+
+def tune_windows_xml(text, smt):
+    """(new XML, list of changes). ValueError for anything that is not a Windows VM."""
+    # libvirt never writes a DOCTYPE or entities: refusing them rules out the known XML attacks.
+    if "<!" in text:
+        raise ValueError("unexpected XML declarations")
+    # B314: libvirt's own XML for your own VM, without declarations (checked above).
+    dom = ET.fromstring(text)  # nosec B314
+    if dom.tag != "domain" or not is_windows(dom):
+        raise ValueError("not a Windows VM (Virtual Machine Manager did not mark it as Windows)")
+    dom = copy.deepcopy(dom)
+    changes = []
+    features = _child(dom, "features", changes, "features")
+    hv = _child(features, "hyperv", changes, "Hyper-V", mode="custom")
+    for name in HYPERV:
+        el = _child(hv, name, changes, f"Hyper-V {name}", state="on")
+        if name == "spinlocks":
+            _child(hv, name, changes, "Hyper-V spinlocks", retries="8191")
+        if name == "stimer":
+            _child(el, "direct", changes, "Hyper-V stimer direct", state="on")
+    try:
+        vcpus = int((dom.findtext("vcpu") or "1").strip())
+    except ValueError:
+        vcpus = 1
+    threads = 2 if smt and vcpus >= 2 and vcpus % 2 == 0 else 1
+    cpu = _child(dom, "cpu", changes, "CPU", mode="host-passthrough", check="none", migratable="on")
+    for attr in ("match",):
+        if attr in cpu.attrib:
+            del cpu.attrib[attr]
+            changes.append(f"CPU: removed {attr}")
+    for model in cpu.findall("model"):
+        cpu.remove(model)
+        changes.append("CPU: removed the named model")
+    _child(cpu, "topology", changes, "CPU topology", sockets="1", dies="1", cores=str(vcpus // threads),
+           threads=str(threads))
+    _child(cpu, "cache", changes, "CPU cache", mode="passthrough")
+    clock = _child(dom, "clock", changes, "clock")
+    if clock.get("offset") is None:
+        clock.set("offset", "localtime")
+        changes.append("clock: offset=localtime")
+    have = {t.get("name"): t for t in clock.findall("timer")}
+    for name, attrs in TIMERS.items():
+        t = have.get(name)
+        if t is None:
+            t = ET.SubElement(clock, "timer", name=name)
+            changes.append(f"added timer {name}")
+        for k, v in attrs.items():
+            if t.get(k) != v:
+                t.set(k, v)
+                changes.append(f"timer {name}: {k}={v}")
+    devices = _child(dom, "devices", changes, "devices")
+    balloon = devices.find("memballoon")
+    if balloon is None or balloon.get("model") != "none":
+        if balloon is not None:
+            devices.remove(balloon)
+        ET.SubElement(devices, "memballoon", model="none")
+        changes.append("memory balloon: off")
+    return ET.tostring(dom, encoding="unicode"), changes
+
+
+def backup_path(name):
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    return os.path.join(BACKUP_DIR, f"{name}-{stamp}.xml")
+
+
+def define(text, uri):
+    # Through standard input: the Flatpak's sandbox has its own /tmp and can't see host files.
+    return virsh(["define", "/dev/stdin"], input_text=text, uri=uri)
+
+
+def find_vm(name):
+    """(uri, saved XML with passwords) of the VM, or (None, error)."""
+    last = ""
+    for uri in URIS:
+        # The saved settings (not a running VM's live state), with display passwords kept.
+        rc, text = virsh(["dumpxml", "--inactive", "--security-info", name], uri=uri)
+        if rc == 0:
+            return uri, text
+        last = text
+    return None, last
+
+
+def cmd_tune(name, dry_run):
+    uri, text = find_vm(name)
+    if uri is None:
+        print(f"Could not find the VM {name!r}: {text.strip()[-300:]}", file=sys.stderr)
+        return 1
+    try:
+        new, changes = tune_windows_xml(text, smt_active())
+    except (ValueError, ET.ParseError) as e:
+        print(f"Not changed: {e}.", file=sys.stderr)
+        return 1
+    if not changes:
+        print(f"{name} already has the Windows performance settings.")
+        return 0
+    for c in changes:
+        print("  " + c)
+    if dry_run:
+        print("Dry run: nothing was changed.")
+        return 0
+    os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)
+    path = backup_path(name)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    rc, out = define(new, uri)
+    if rc != 0:
+        print(f"Not changed: libvirt refused the new settings: {out.strip()[-300:]}", file=sys.stderr)
+        return 1
+    _, state = virsh(["domstate", name], uri=uri)
+    print(f"Done. Backup: {path} (undo with: forge-vm undo {name}).")
+    if "shut off" not in state:
+        print("The VM is running: the changes apply when it next starts.")
+    return 0
+
+
+def cmd_undo(name):
+    try:
+        mine = sorted(f for f in os.listdir(BACKUP_DIR) if f.startswith(name + "-") and f.endswith(".xml")
+                      and re.fullmatch(re.escape(name) + r"-\d{8}-\d{6}-\d{6}\.xml", f))
+    except FileNotFoundError:
+        mine = []
+    if not mine:
+        print(f"No backup of {name} to put back.", file=sys.stderr)
+        return 1
+    with open(os.path.join(BACKUP_DIR, mine[-1])) as f:
+        text = f.read()
+    uri, _ = find_vm(name)
+    rc, out = define(text, uri or URIS[0])
+    if rc != 0:
+        print(f"Not changed: {out.strip()[-300:]}", file=sys.stderr)
+        return 1
+    os.rename(os.path.join(BACKUP_DIR, mine[-1]), os.path.join(BACKUP_DIR, mine[-1] + ".restored"))
+    print(f"Put back {name} as it was before {mine[-1][len(name) + 1:-4]}.")
+    return 0
+
+
+def main(argv):
+    if argv == ["list"]:
+        ok = False
+        for uri in URIS:
+            rc, out = virsh(["list", "--all"], uri=uri)
+            if rc == 0:
+                ok = True
+                print(f"{uri}:\n{out.rstrip()}")
+        return 0 if ok else 1
+    if len(argv) in (2, 3) and argv[0] == "windows-tune" and argv[2:] in ([], ["--dry-run"]):
+        if not NAME.fullmatch(argv[1]):
+            print("Not changed: give the VM's name as Virtual Machine Manager shows it.", file=sys.stderr)
+            return 2
+        return cmd_tune(argv[1], argv[2:] == ["--dry-run"])
+    if len(argv) == 2 and argv[0] == "undo":
+        if not NAME.fullmatch(argv[1]):
+            print("Not changed: give the VM's name as Virtual Machine Manager shows it.", file=sys.stderr)
+            return 2
+        return cmd_undo(argv[1])
+    print(__doc__.strip().split("\n\n")[0] if argv in ([], ["--help"], ["-h"]) else "Unknown command. See forge-vm --help.",
+          file=sys.stderr if argv not in ([], ["--help"], ["-h"]) else sys.stdout)
+    return 0 if argv in ([], ["--help"], ["-h"]) else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -14,7 +14,8 @@ chmod 0755 /usr/bin/forge-mode /usr/bin/forge-health /usr/bin/forge-config \
   /usr/libexec/forge-appearance-theme \
   /usr/bin/forge-game /usr/libexec/forge-mode-apply /usr/libexec/forge-first-user \
   /usr/lib/greenboot/check/required.d/60_forge_boot_health.sh /usr/lib/greenboot/green.d/60_forge_boot_health.sh \
-  /usr/libexec/forge/powerprofilesctl /usr/libexec/forge-model-guard
+  /usr/libexec/forge/powerprofilesctl /usr/libexec/forge-model-guard \
+  /usr/libexec/forge-apps /usr/bin/forge-vm
 # sudo ignores rule files unless they are owner-only
 chmod 0440 /etc/sudoers.d/forge-core
 # Claude Desktop is in the image now and updates with it, so its repo is turned off (as Bazzite does

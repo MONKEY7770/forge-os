@@ -1,0 +1,9 @@
+[Unit]
+Description=Forge OS optional apps: check after boot and every 30 minutes (offline installs are tried again)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+
+[Install]
+WantedBy=timers.target

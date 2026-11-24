@@ -193,8 +193,12 @@ class SystemUserTests(unittest.TestCase):
 
 class PreinstalledAppTests(unittest.TestCase):
     def test_prism_launcher_is_preinstalled(self):
-        # Minecraft Java Edition (and mods), next to the Bedrock launcher.
-        apps = [a for m in modules() if m.get("type") == "default-flatpaks"
-                for c in m.get("configurations", []) for a in c.get("install", [])]
-        self.assertIn("org.prismlauncher.PrismLauncher", apps)
-        self.assertIn("io.mrarm.mcpelauncher", apps)
+        # Minecraft Java Edition (and mods), next to the Bedrock launcher: optional apps that are
+        # on unless unticked in setup (forge-apps installs them).
+        import json
+        with open(os.path.join(ROOT, "files/system/usr/share/forge/apps.json")) as f:
+            apps = {it.get("flatpak"): it["key"] for it in json.load(f)["optional"]}
+        with open(os.path.join(ROOT, "files/system/usr/share/forge/settings.json")) as f:
+            defaults = {x["key"]: x["default"] for x in json.load(f)["settings"]}
+        for app in ("org.prismlauncher.PrismLauncher", "io.mrarm.mcpelauncher"):
+            self.assertIs(defaults[apps[app]], True, app)

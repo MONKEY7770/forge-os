@@ -93,6 +93,8 @@ modules:
         - forge-mode-switch.socket   # gaming mode's root step (forge-game), no password
         - forge-model-guard.timer    # AI model storage limit, checked every 30 s
         - forge-setup-storage.path   # saves the first-boot wizard's AI model storage choice
+        - forge-apps.timer           # optional apps: installs the ones switched on, deletes the ones switched off
+        - forge-setup-apps.path      # saves the first-boot wizard's choice of apps
     user:
       enabled:
         - forge-health.timer
@@ -102,42 +104,17 @@ modules:
         - forge-game-overlay.path      # MangoHud overlay file follows Forge Settings
         - forge-game-overlay.service
 
-  # 5. Desktop apps (Flatpaks, installed on first boot, updated separately).
+  # 5. Desktop apps (Flatpaks). Only the always-on apps are here: BlueBuild installs this list again
+  #    at every boot. Every other app is optional (setup wizard, Forge Settings, Apps): see
+  #    /usr/share/forge/apps.json and forge-apps, which installs them after setup and deletes the
+  #    ones switched off.
   - type: default-flatpaks
     configurations:
       - scope: system
         notify: true
         install:
-          # Essentials
           - org.mozilla.firefox
-          - com.discordapp.Discord
-          - com.visualstudio.code
-          - io.github.shiftey.Desktop        # GitHub Desktop
-          - org.videolan.VLC
-          - com.obsproject.Studio            # recording and streaming
-          - org.kde.kdenlive                 # video editing (game trailers, promos)
-          - org.localsend.localsend_app      # send files between phone and PCs
-          # Privacy
-          - com.bitwarden.desktop            # password manager
           - com.github.tchx84.Flatseal       # control what each app can access
-          # Roblox
-          - org.vinegarhq.Sober       # Roblox Player
-          - org.vinegarhq.Vinegar     # Roblox Studio
-          # Creative apps (same apps your MCP hub talks to)
-          - org.blender.Blender
-          - net.blockbench.Blockbench
-          - org.kde.krita                    # textures, UI art, thumbnails
-          - org.audacityteam.Audacity        # sound effects
-          - com.orama_interactive.Pixelorama # free pixel art (Aseprite is paid, get it on Steam)
-          # Minecraft Bedrock (for the realm); needs the game bought on Google Play
-          - io.mrarm.mcpelauncher
-          # Minecraft Java Edition, with mods and modpacks (needs a Microsoft account that owns Java Edition)
-          - org.prismlauncher.PrismLauncher
-          # Remote access
-          - com.moonlight_stream.Moonlight
-          - com.rustdesk.RustDesk
-          # System tools
           - io.missioncenter.MissionCenter   # see CPU, GPU, VRAM per app
-          - com.dec05eba.gpu_screen_recorder # low-overhead clips with NVENC; note: this Flatpak has full access to your files and devices
 
   - type: signing

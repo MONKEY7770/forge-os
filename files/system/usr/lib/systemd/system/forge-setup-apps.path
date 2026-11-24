@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for the first-boot wizard's choice of apps
+
+[Path]
+PathExists=/var/lib/forge-setup/apps.ini
+Unit=forge-setup-apps.service
+
+[Install]
+WantedBy=paths.target

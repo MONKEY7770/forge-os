@@ -1,0 +1,15 @@
+{
+    "KPlugin": {
+        "Id": "org.forgeos.setup.apps",
+        "Name": "Apps",
+        "Name[th]": "แอป",
+        "Description": "Choose the optional apps to install: games, creative apps, tools, virtual machines, retro gaming and Android.",
+        "Description[th]": "เลือกแอปเสริมที่จะติดตั้ง: เกม แอปสร้างสรรค์ เครื่องมือ เครื่องเสมือน เกมย้อนยุค และ Android",
+        "License": "Apache-2.0",
+        "Version": "1.0"
+    },
+    "KPackageStructure": "KDE/PlasmaSetup",
+    "X-KDE-Weight": 46,
+    "NoDisplay": true,
+    "X-KDE-ParentApp": "org.kde.plasmasetup"
+}

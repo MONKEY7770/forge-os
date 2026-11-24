@@ -77,6 +77,13 @@ jobs:
       - name: Boot it and wait for the first account wizard
         run: python3 .github/scripts/forge_screenshot.py firstboot --disk work/disk.raw --out firstboot
 
+      # Temporary: our wizard page in the real wizard (any QML or package message about it).
+      - name: Wizard page messages
+        if: ${{ always() }}
+        run: |
+          ls -la firstboot/ || true
+          grep -rhaiE "aistorage|forgeos|\.qml:|qrc:|ReferenceError|TypeError|module .* is not installed|kpackage|plugin" firstboot/ | grep -viE "kirigami.platform" | sort | uniq -c | sort -rn | head -80 || true
+
       # result.txt holds only text made on the runner (fixed words and checked numbers).
       - name: Summary
         if: ${{ always() }}

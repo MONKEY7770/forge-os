@@ -1,0 +1,26 @@
+name: diag
+# Temporary, test branch only: the apps built into the image (menu entries and their packages). No secrets.
+on:
+  push:
+    branches: [forge-test]
+    paths: [.github/workflows/diag.yml]
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Apps in the image
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin >/dev/null
+          docker run --rm --entrypoint bash ghcr.io/monkey7770/forge-os-universal:br-forge-test-candidate-45 -c '
+            for f in /usr/share/applications/*.desktop; do
+              grep -qiE "^NoDisplay=true|^Hidden=true" "$f" && continue
+              grep -q "^OnlyShowIn=" "$f" && ! grep -q "^OnlyShowIn=.*KDE" "$f" && continue
+              n=$(grep -m1 "^Name=" "$f" | cut -d= -f2-); c=$(grep -m1 "^Categories=" "$f" | cut -d= -f2-)
+              p=$(rpm -qf --qf "%{NAME}" "$f" 2>/dev/null || echo "(no package)")
+              printf "%s | %s | %s | %s\n" "$p" "$n" "$(basename "$f")" "$c"
+            done | sort' 2>&1 | grep -vE "Pulling|Waiting|Verifying|Download|Extracting|Digest|Status:|Pull complete|Already exists|Unable to find"

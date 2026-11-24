@@ -411,7 +411,10 @@ def find_fixes(root, run, hw):
     """Which fixes apply. Each answer is a constant entry from FIXES, never text from the system."""
     ids = []
     on = _toggles(root) or {}
-    if on.get("ai.ollama") is True and _state(run, "is-active", "ollama.service") in ("inactive", "failed"):
+    # Gaming mode's "Wait" choice stops Ollama on purpose while a game runs.
+    paused = os.path.lexists(root + "/run/forge/gaming/ollama-paused")
+    if (on.get("ai.ollama") is True and not paused
+            and _state(run, "is-active", "ollama.service") in ("inactive", "failed")):
         ids.append("restart-ollama")
     if on.get("core.enabled") is True and _state(run, "is-active", "forge-core.service") in ("inactive", "failed"):
         ids.append("restart-forge-core")

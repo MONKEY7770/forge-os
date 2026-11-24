@@ -10,6 +10,8 @@ ExecStart=/usr/libexec/forge-mode-apply --serve
 CapabilityBoundingSet=CAP_SYS_ADMIN
 NoNewPrivileges=yes
 ProtectSystem=strict
+# The one place it may write: AI while you play (Ollama paused, or its CPU-only setting).
+ReadWritePaths=-/run/forge/gaming
 ProtectHome=yes
 # Other processes are hidden; loginctl and systemctl only talk D-Bus, they don't read /proc.
 ProtectProc=invisible

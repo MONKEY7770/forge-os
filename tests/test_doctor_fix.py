@@ -143,6 +143,12 @@ class DetectionTest(Box):
         self.answers = {"systemctl is-active ollama.service": (3, "failed\n"), **self.answers}
         self.assertEqual(self.ids(), ["restart-ollama"])
 
+    def test_ollama_paused_for_a_game_is_not_a_problem(self):
+        # Gaming mode's "Wait" choice stops Ollama on purpose and starts it after the game.
+        self.answers = {"systemctl is-active ollama.service": (3, "inactive\n"), **self.answers}
+        write(os.path.join(self.root, "run/forge/gaming/ollama-paused"), "")
+        self.assertEqual(self.ids(), [])
+
     def test_fixable_problems_count_in_the_summary(self):
         self.answers = {"systemctl is-active forge-core.service": (3, "inactive\n"), **self.answers}
         rep = self.report()

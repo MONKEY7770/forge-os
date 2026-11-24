@@ -744,9 +744,14 @@ def apply(v):
     run("systemctl", "--no-block", "start", "forge-virt.service")
     run("systemctl", "try-reload-or-restart", "systemd-resolved.service")
     run("systemctl", "try-reload-or-restart", "NetworkManager.service")
-    service("ollama.service", v["ai.ollama"])
-    if v["ai.ollama"]:
-        run("systemctl", "restart", "ollama.service")
+    # Gaming mode's "Wait" choice stops Ollama during a game: keep it stopped until the game ends
+    # (forge-mode-apply starts it then); only its "on at boot" state follows the setting now.
+    if v["ai.ollama"] and os.path.lexists(ROOT + "/run/forge/gaming/ollama-paused"):
+        run("systemctl", "enable", "ollama.service")
+    else:
+        service("ollama.service", v["ai.ollama"])
+        if v["ai.ollama"]:
+            run("systemctl", "restart", "ollama.service")
 
     # Forge Core API (last, because this may be running inside Forge Core itself)
     core_conf = ("[Service]\n"

@@ -116,6 +116,10 @@
      "label": "Gaming: power profile", "tags": ["modes", "gaming", "power"], "help": ""},
     {"key": "modes.gaming.unload_models", "group": "modes", "type": "toggle", "default": true,
      "label": "Gaming: unload AI models", "tags": ["modes", "gaming", "vram", "ai"], "help": ""},
+    {"key": "modes.gaming.ai", "group": "modes", "machine": true, "type": "select", "default": "wait",
+     "options": ["wait", "cpu", "free"],
+     "label": "Gaming: AI while you play", "tags": ["modes", "gaming", "ai", "ollama", "gpu", "vram"],
+     "help": "Wait pauses local AI models (Ollama) while a game runs and starts them again when it closes. CPU keeps them running on the processor only, so the graphics card stays free for the game (much slower). No limit changes nothing. Models from cloud providers (like OpenAI) are not affected."},
 
     {"key": "modes.agents.cpu_weight", "group": "modes", "type": "number", "default": 100, "min": 1, "max": 10000,
      "label": "Agents: agent CPU priority", "tags": ["modes", "agents", "cpu"], "help": ""},

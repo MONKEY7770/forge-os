@@ -42,6 +42,11 @@ REQUEST_MAX = 16          # bytes: the longest word plus a newline
 RATE_MAX = 10             # requests per user per RATE_WINDOW_S
 RATE_WINDOW_S = 60
 SESSION_ID = re.compile(r"[A-Za-z0-9]{1,32}")
+# AI while you play (modes.gaming.ai). Root-owned, made by tmpfiles; the only place this service
+# may write. ollama.service reads ollama.env (60-forge-gaming.conf) when it starts.
+GAMING_DIR = (os.environ.get("FORGE_MODE_GAMING_DIR") if TEST else None) or "/run/forge/gaming"
+# Ollama's documented way to force the CPU: an invalid GPU id (NVIDIA, AMD, Vulkan).
+CPU_ENV = "CUDA_VISIBLE_DEVICES=-1\nROCR_VISIBLE_DEVICES=-1\nGGML_VK_VISIBLE_DEVICES=-1\n"
 
 
 def apply(mode):
@@ -61,7 +66,63 @@ def apply(mode):
         return False, f"systemctl could not run ({e})"
     if r.returncode != 0:
         return False, f"systemctl set-property failed: {r.stderr.strip()[-300:]}"
-    return True, f"Agent limits set for {mode} mode: CPU priority {cpu}, memory soft limit {mem}%."
+    note = ai_while_gaming(mode, vals.get("modes.gaming.ai", "wait"), vals.get("ai.ollama", True) is True)
+    return True, f"Agent limits set for {mode} mode: CPU priority {cpu}, memory soft limit {mem}%." + note
+
+
+def systemctl(*args):
+    try:
+        return subprocess.run(["systemctl", *args], stdin=subprocess.DEVNULL, capture_output=True,
+                              timeout=120).returncode
+    except (OSError, subprocess.SubprocessError):
+        return -1
+
+
+def _put(name, text):
+    """A file in GAMING_DIR (never through a link), replaced in one step."""
+    tmp = os.path.join(GAMING_DIR, f".{name}.tmp")
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, os.path.join(GAMING_DIR, name))
+
+
+def _take(name):
+    """Removes a file from GAMING_DIR; True if it was there."""
+    try:
+        os.unlink(os.path.join(GAMING_DIR, name))
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def ai_while_gaming(mode, choice, ollama_on=True):
+    """Local AI models (Ollama) during a game: paused (wait), on the CPU only (cpu) or left alone
+    (free). Any other mode undoes whatever gaming mode did; Ollama is started again only while it is
+    still turned on in Forge Settings. Returns a note for the reply. The service changes are queued
+    (--no-block): a slow Ollama never makes forge-game's request time out."""
+    try:
+        if mode == "gaming":
+            if choice == "wait" and systemctl("is-active", "--quiet", "ollama.service") == 0:
+                _put("ollama-paused", "")       # first, so a crash in between still starts it again later
+                systemctl("--no-block", "stop", "ollama.service")
+                return " Local AI models are paused until the game closes."
+            if choice == "cpu":
+                _put("ollama.env", CPU_ENV)
+                systemctl("--no-block", "try-restart", "ollama.service")
+                return " Local AI models use the CPU only until the game closes."
+            return ""
+        if _take("ollama.env"):
+            systemctl("--no-block", "try-restart", "ollama.service")
+        if _take("ollama-paused") and ollama_on:
+            systemctl("--no-block", "start", "ollama.service")
+        return ""
+    except OSError as e:
+        return f" AI models could not be changed ({e.strerror})."
 
 
 # ---------- the service ----------

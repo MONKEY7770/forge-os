@@ -692,6 +692,26 @@ class ForgeHealthNotifyTest(unittest.TestCase):
         r, calls = self.run_health()            # still the same one waiting: no new notice
         self.assertEqual(self.approval_calls(calls), [], calls)
 
+    def test_ollama_paused_for_a_game_is_not_a_health_problem(self):
+        cfg = {"monitor.gpu_temp_warn": "200", "monitor.disk_warn_pct": "101", "monitor.mem_warn_gb": "0",
+               "ai.ollama": "on", "monitor.check_ollama": "on", "core.enabled": "off", "monitor.notify": "on"}
+        cases = "\n".join(f'  {k}) echo "{v}" ;;' for k, v in cfg.items())
+        write_exec(os.path.join(self.fake, "forge-config"), f'#!/bin/sh\ncase "$2" in\n{cases}\nesac\n')
+        write_exec(os.path.join(self.fake, "systemctl"), "#!/bin/sh\nexit 3\n")      # Ollama is stopped
+        gaming = os.path.join(self.fake, "gaming")
+        os.makedirs(gaming)
+        self.env["FORGE_GAMING_DIR"] = gaming
+        _, calls = self.run_health()
+        self.assertIn("Ollama is not running", json.dumps(self.health_calls(calls)))
+        os.remove(self.log)
+        self.env["XDG_STATE_HOME"] = os.path.join(self.fake, "state2")   # nothing shown before
+        open(os.path.join(gaming, "ollama-paused"), "w").close()     # paused for a game, on purpose
+        _, calls = self.run_health()
+        self.assertNotIn("Ollama is not running", json.dumps(calls))
+        os.remove(os.path.join(gaming, "ollama-paused"))             # the same fresh state, not paused
+        _, calls = self.run_health()
+        self.assertIn("Ollama is not running", json.dumps(self.health_calls(calls)))
+
     def test_hot_gpu_shows_degrees(self):
         with open(os.path.join(ROOT, "files/system/usr/bin/forge-health")) as f:
             self.assertIn("GPU is hot: ${temp}°C", f.read())

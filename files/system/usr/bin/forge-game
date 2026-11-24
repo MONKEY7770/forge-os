@@ -391,18 +391,30 @@ def enter(vals, games):
     print(f"A game started ({st['game']}): switched to gaming mode.", flush=True)
 
 
+GAMING_DIR = os.environ.get("FORGE_GAMING_DIR", "/run/forge/gaming")
+
+
+def ai_changed():
+    """Gaming mode paused AI models or moved them to the CPU (files of the root service)."""
+    return any(os.path.lexists(os.path.join(GAMING_DIR, n)) for n in ("ollama-paused", "ollama.env"))
+
+
 def leave(st):
     """Back to the mode from before the game, unless you picked another mode meanwhile."""
     stamp = st.get("mode_mtime_ns")
     # No stamp: the switch to gaming never finished (a crash in the middle), so always switch back.
     if isinstance(stamp, int) and (current_mode() != "gaming" or mode_mtime() != stamp):
+        # forge-mode only sets the agent limits: tell the root service the mode you picked, so it
+        # also undoes what gaming mode did to AI models (best effort; it answers for your session).
+        if current_mode() != "gaming":
+            root_step(current_mode() if current_mode() in BACK_MODES else "default")
         drop_state()
         print("The game ended. You changed the mode during it, so it stays as it is.", flush=True)
         return
     prev = st.get("prev") if st.get("prev") in BACK_MODES else "default"
     power = st.get("prev_power") if st.get("prev_power") in PROFILES else None
     # The limits were never changed when the game started (the service refused): nothing to undo there.
-    never_set = st.get("limits_set") is False
+    never_set = st.get("limits_set") is False and not ai_changed()
     if not never_set and not root_step(prev)[0]:
         # The agents still have the gaming limits: keep saying gaming, and try again on every look
         # (about every 15 seconds) and at the next login, until it works.

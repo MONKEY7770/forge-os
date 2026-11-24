@@ -54,8 +54,9 @@ fi
 mem_avail=$(awk '/MemAvailable/ {print int($2/1024/1024)}' /proc/meminfo)
 [ "$mem_avail" -lt "$MEM_WARN" ] && problems+=("Low memory: ${mem_avail} GB free")
 
-# Ollama (only if it's turned on)
-if [ "$(cfg ai.ollama)" = "on" ] && [ "$(cfg monitor.check_ollama)" = "on" ]; then
+# Ollama (only if it's turned on). Gaming mode's "Wait" choice stops it on purpose during a game.
+GAMING_DIR=${FORGE_GAMING_DIR:-/run/forge/gaming}
+if [ "$(cfg ai.ollama)" = "on" ] && [ "$(cfg monitor.check_ollama)" = "on" ] && [ ! -e "$GAMING_DIR/ollama-paused" ]; then
   systemctl is-active --quiet ollama || problems+=("Ollama is not running")
 fi
 

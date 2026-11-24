@@ -224,6 +224,24 @@ class RouterTests(Base):
         self.assertEqual(rows[0]["model"], "qwen3:8b")
         self.assertEqual((rows[0]["prompt_tokens"], rows[0]["completion_tokens"], rows[0]["requests"]), (7, 5, 1))
 
+    def test_local_models_paused_for_a_game_say_so(self):
+        # Gaming mode's "Wait" choice stops Ollama while a game runs.
+        flag = os.path.join(self.tmp, "ollama-paused")
+        open(flag, "w").close()
+        self.gw.paused_flag = flag
+        h = self.key()
+        r = self.c.post("/v1/chat/completions", json={"model": "qwen3:8b", "messages": []}, headers=h)
+        self.assertEqual(r.status_code, 503)
+        self.assertIn("paused while you play", r.json()["error"]["message"])
+        self.assertEqual(r.headers.get("retry-after"), "60")
+        with self.assertRaisesRegex(RuntimeError, "paused while you play"):
+            self.gw.chat({"model": "qwen3:8b", "messages": []})
+        # Only Ollama is stopped: another local provider (like LM Studio) keeps working.
+        self.assertFalse(self.gw.paused({"name": "lmstudio", "local": True}))
+        os.remove(flag)
+        r = self.c.post("/v1/chat/completions", json={"model": "qwen3:8b", "messages": []}, headers=h)
+        self.assertEqual(r.status_code, 200)
+
     def test_streaming_passthrough(self):
         h = self.key()
         with self.c.stream("POST", "/v1/chat/completions",

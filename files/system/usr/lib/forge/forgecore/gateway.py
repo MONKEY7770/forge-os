@@ -215,6 +215,11 @@ def show_says_remote(data) -> bool:
     return False
 
 
+# Gaming mode's "Wait" choice (forge-mode-apply) stops Ollama while a game runs and leaves this file.
+PAUSED_FLAG = "/run/forge/gaming/ollama-paused"
+PAUSED_TEXT = "Local AI models are paused while you play. They come back when the game closes."
+
+
 class Gateway:
     def __init__(self, secrets: SecretStore, db_path: str, providers: list[dict] | None = None,
                  transport: "httpx.BaseTransport | None" = None, async_transport=None):
@@ -224,6 +229,7 @@ class Gateway:
         self._by_name = {p["name"]: p for p in self.providers}
         self.transport = transport
         self.async_transport = async_transport
+        self.paused_flag = PAUSED_FLAG
         self._db_lock = threading.Lock()
         self._rate_lock = threading.Lock()
         self._hits = {}
@@ -247,6 +253,11 @@ class Gateway:
         return _Locked(self._db_lock, self.db_path)
 
     # Routing
+
+    def paused(self, provider) -> bool:
+        """Ollama's models are paused for a game (it is stopped on purpose). Other local providers
+        (added in the providers file) keep working."""
+        return provider.get("name") == "ollama" and os.path.lexists(self.paused_flag)
 
     def route(self, model: str) -> tuple[dict, str]:
         if not isinstance(model, str) or not model.strip():
@@ -446,6 +457,8 @@ class Gateway:
         if not isinstance(payload, dict):
             raise ValueError("payload must be a dict")
         provider, name = self.route(payload.get("model"))
+        if self.paused(provider):
+            raise RuntimeError(PAUSED_TEXT)
         body = dict(payload, model=name, stream=False)
         start = time.monotonic()
         status, data = 0, None
@@ -547,6 +560,11 @@ def make_v1_router(gw: Gateway) -> APIRouter:
             provider, name = gw.route(body.get("model"))
         except LookupError as e:
             return None, None, None, None, _oai_error(400, str(e))
+        if gw.paused(provider):
+            gw.record_usage(key["id"], key["name"], provider["name"], name, 0, 0, 503, 0)
+            out = _oai_error(503, PAUSED_TEXT, "provider_error")
+            out.headers["Retry-After"] = "60"
+            return None, None, None, None, out
         if not key["allow_cloud"] and (not provider.get("local") or is_ollama_cloud(name)):
             where = "Ollama cloud models" if provider.get("local") else provider["name"]
             return None, None, None, None, _oai_error(

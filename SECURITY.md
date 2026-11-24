@@ -291,6 +291,7 @@ New parts and their threat notes:
 - **Sound.** In virtual machines only, PipeWire uses larger buffers (min quantum 2048) to stop crackling notification sounds. Real PCs keep their defaults except a cap of 2048.
 - **Fonts and colours.** IBM Plex Sans, Plex Sans Thai and Plex Mono (Fedora packages, checked in this image with a dry-run install), Forge's own KDE colour schemes. Added key by key to Bazzite's /etc/xdg files, never replacing them.
 - **Prism Launcher** (Flatpak, Flathub) is preinstalled.
+- **AI while you play** (Settings, Modes; default Wait). The root mode service (forge-mode-switch) now also stops Ollama during a game and starts it after (Wait), or restarts it with the graphics card hidden (CPU). Its sandbox gains write access to one root-owned folder, /run/forge/gaming, and nothing else; it still only acts for an administrator at this PC's own screen. While paused, the gateway answers 503 with a plain reason, and health checks and the doctor do not report the stop as a problem.
 
 Independent review of this round (no High findings; the root-run parts held up):
 
@@ -306,6 +307,18 @@ Independent review of this round (no High findings; the root-run parts held up):
 | Low | Logs | The 30 s timer adds start and finish lines to the journal | Accepted: hiding them would also hide the guard's own messages |
 
 bandit (11-24): no High findings; 15 Medium, all from earlier rounds and checked by hand (the patterns listed under Scanners, plus 0755 on public folders and launchers).
+
+Independent review of "AI while you play" (no High findings; nothing an unprivileged user could use):
+
+| Sev. | Finding | Status |
+|---|---|---|
+| Medium | A mode picked by hand during a game (forge-mode) left Ollama paused after the game | Fixed: when the game ends, the root service is told the mode you picked and undoes the pause |
+| Medium | Settings Apply during a game started Ollama again but left the pause in place (the gateway said "paused" while Ollama ran) | Fixed: Apply keeps a paused Ollama stopped until the game ends |
+| Medium | Ollama turned off in Settings during a game was started again afterwards | Fixed: started again only while it is still on |
+| Low | A slow Ollama stop could time out the request, and then the pause was never undone | Fixed: service changes are queued (no waiting), and the pause is always undone when its files exist |
+| Low | Other local providers (added by hand) were reported as paused too | Fixed: only Ollama |
+
+The first-boot test ran again with a step that prints any wizard message about our page: none (the wizard logged an error from KDE's own language page, so page errors do reach that log). Not yet clicked through by hand.
 
 Accepted and open (this round):
 - **Ollama on 127.0.0.1 has no password.** Any program on the PC can use it directly, around the gateway's limits and logs. Planned: make the gateway the only way in.

@@ -636,6 +636,33 @@ class ApplyDropInTest(unittest.TestCase):
         self.assertIn("ReadWritePaths=-/var/mnt/games/models\n", text)
 
 
+class ApplyWhilePausedTest(unittest.TestCase):
+    def run_apply(self, paused):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, True)
+        conf = os.path.join(root, "etc/forge/settings.json")
+        os.makedirs(os.path.dirname(conf))
+        with open(conf, "w") as f:
+            json.dump({"ai.ollama": True}, f)
+        if paused:
+            os.makedirs(os.path.join(root, "run/forge/gaming"))
+            open(os.path.join(root, "run/forge/gaming/ollama-paused"), "w").close()
+        env = dict(os.environ, FORGE_ROOT=root, FORGE_DRYRUN="1", FORGE_CONF=conf, PYTHONPATH=LIB)
+        r = subprocess.run([sys.executable, APPLY], env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def test_settings_apply_during_a_paused_game_keeps_ollama_paused(self):
+        # Review: an Apply during a game restarted Ollama but left the pause in place.
+        out = self.run_apply(paused=True)
+        self.assertIn("would run: systemctl enable ollama.service", out)
+        self.assertNotIn("restart ollama.service", out)
+        self.assertNotIn("enable --now ollama.service", out)
+        out = self.run_apply(paused=False)
+        self.assertIn("would run: systemctl enable --now ollama.service", out)
+        self.assertIn("would run: systemctl restart ollama.service", out)
+
+
 class ReportTest(unittest.TestCase):
     def test_doctor_storage_section_has_ai_lines(self):
         from forgecore import doctor as D

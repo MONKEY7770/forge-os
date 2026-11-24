@@ -97,6 +97,8 @@ class Base(unittest.TestCase):
             f.write(f'#!/bin/sh\necho publish >> "{self.calls_file}"\n')
         os.chmod(self.publish, 0o755)
         self.sock_path = os.path.join(self.t, "mode.sock")
+        self.gaming_dir = os.path.join(self.t, "run-forge-gaming")
+        os.makedirs(self.gaming_dir)
         self.start_switch_server()
         self.old_env = dict(os.environ)
         self.addCleanup(self.restore_env)
@@ -138,7 +140,8 @@ class Base(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k not in ("XDG_CONFIG_HOME", "XDG_STATE_HOME")}
         env.update(HOME=self.home, FORGE_LIB=LIB, FORGE_SCHEMA=SCHEMA, FORGE_CONF=self.conf,
                    FORGE_GAME_PROC=self.proc, FAKE_CALLS=self.calls_file, FAKE_POWER=self.power,
-                   FORGE_ACTIVITY_PUBLISH=self.publish, FORGE_MODE_SOCKET=self.sock_path, PATH=self.bin + ":" + self.old_env.get("PATH", ""))
+                   FORGE_ACTIVITY_PUBLISH=self.publish, FORGE_MODE_SOCKET=self.sock_path,
+                   FORGE_GAMING_DIR=self.gaming_dir, PATH=self.bin + ":" + self.old_env.get("PATH", ""))
         env.update(extra)
         return env
 
@@ -459,6 +462,24 @@ class AutoModeTest(Base):
             w.tick()
         self.assertEqual(self.mode(), "creative")
         self.assertEqual([c for c in self.apply_calls() if c.endswith(" agents")], [])
+        # The root service hears the mode you picked, so whatever gaming mode did to AI is undone.
+        self.assertIn("mode-switch creative", self.apply_calls())
+
+    def test_ai_paused_by_the_game_is_undone_even_if_entry_looked_refused(self):
+        # Review: a slow Ollama stop made the entry time out, so leave() never asked the service.
+        os.environ["FAKE_SYSTEMCTL_RC"] = "1"
+        self.set_mode("agents")
+        game, w = self.watcher()
+        self.steam_game()
+        w.tick()
+        os.environ["FAKE_SYSTEMCTL_RC"] = "0"
+        with open(os.path.join(self.gaming_dir, "ollama-paused"), "w"):
+            pass
+        self.clear_calls()
+        self.end_game()
+        for _ in range(game.EXIT_POLLS):
+            w.tick()
+        self.assertIn("mode-switch agents", self.apply_calls())
 
     def test_models_stay_when_the_gaming_mode_keeps_them(self):
         self.settings(modes__gaming__unload_models=False)
@@ -656,9 +677,14 @@ class ModeApplyHelperTest(unittest.TestCase):
         self.log = os.path.join(self.t, "calls")
         p = os.path.join(self.bin, "systemctl")
         with open(p, "w") as f:
-            f.write(f'#!/bin/sh\necho "systemctl $*" >> {self.log}\n')
+            # "is-active" answers from FAKE_ACTIVE (1 = Ollama runs).
+            f.write(f'#!/bin/sh\necho "systemctl $*" >> {self.log}\n'
+                    'if [ "$1" = is-active ]; then [ "$FAKE_ACTIVE" = 1 ]; exit $?; fi\n')
         os.chmod(p, 0o755)
         self.conf = os.path.join(self.t, "settings.json")
+        self.gdir = os.path.join(self.t, "run-forge-gaming")
+        os.makedirs(self.gdir)
+        self.active = "1"
         self.settings({})
 
     def settings(self, vals):
@@ -667,7 +693,8 @@ class ModeApplyHelperTest(unittest.TestCase):
 
     def run_helper(self, *args):
         env = dict(os.environ, FORGE_LIB=LIB, FORGE_SCHEMA=SCHEMA, FORGE_CONF=self.conf,
-                   PATH=self.bin + ":" + os.environ["PATH"])
+                   PATH=self.bin + ":" + os.environ["PATH"], FORGE_MODE_SWITCH_TEST="1",
+                   FORGE_MODE_GAMING_DIR=self.gdir, FAKE_ACTIVE=self.active)
         return subprocess.run([sys.executable, HELPER, *args], env=env, capture_output=True, text=True, timeout=30)
 
     def calls(self):
@@ -677,11 +704,88 @@ class ModeApplyHelperTest(unittest.TestCase):
         except FileNotFoundError:
             return []
 
-    def test_each_mode_sets_only_the_agent_limits(self):
-        self.settings({"modes.gaming.cpu_weight": 15, "modes.gaming.memory_high_pct": 20})
+    def test_each_mode_sets_the_agent_limits(self):
+        self.settings({"modes.gaming.cpu_weight": 15, "modes.gaming.memory_high_pct": 20, "modes.gaming.ai": "free"})
         r = self.run_helper("gaming")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.calls(), ["systemctl set-property --runtime agents.slice CPUWeight=15 MemoryHigh=20%"])
+
+    # AI while you play (modes.gaming.ai): wait (default), cpu, or free.
+
+    def test_wait_pauses_ollama_during_the_game_and_starts_it_after(self):
+        self.assertEqual(self.run_helper("gaming").returncode, 0)
+        self.assertIn("systemctl --no-block stop ollama.service", self.calls())
+        self.assertTrue(os.path.exists(os.path.join(self.gdir, "ollama-paused")))
+        open(self.log, "w").close()
+        self.active = "0"
+        r = self.run_helper("default")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("systemctl --no-block start ollama.service", self.calls())
+        self.assertFalse(os.path.exists(os.path.join(self.gdir, "ollama-paused")))
+
+    def test_ollama_turned_off_during_the_game_stays_off(self):
+        self.assertEqual(self.run_helper("gaming").returncode, 0)
+        self.settings({"ai.ollama": False})
+        self.active = "0"
+        open(self.log, "w").close()
+        self.run_helper("default")
+        self.assertNotIn("start", " ".join(self.calls()).replace("try-restart", ""))
+        self.assertFalse(os.path.exists(os.path.join(self.gdir, "ollama-paused")))
+
+    def test_service_changes_never_wait_for_ollama(self):
+        # A slow stop must not make the request time out (forge-game waits 90 s for an answer).
+        self.run_helper("gaming")
+        self.settings({"modes.gaming.ai": "cpu"})
+        self.run_helper("gaming")
+        self.run_helper("default")
+        for c in self.calls():
+            if any(w in c.split() for w in ("stop", "start", "try-restart")):
+                self.assertIn("--no-block", c, c)
+
+    def test_wait_never_starts_an_ollama_that_was_not_running(self):
+        self.active = "0"
+        self.run_helper("gaming")
+        self.assertNotIn("systemctl --no-block stop ollama.service", self.calls())
+        self.run_helper("default")
+        self.assertNotIn("systemctl --no-block start ollama.service", self.calls())
+
+    def test_cpu_hides_the_gpu_from_ollama_during_the_game(self):
+        self.settings({"modes.gaming.ai": "cpu"})
+        self.assertEqual(self.run_helper("gaming").returncode, 0)
+        env = open(os.path.join(self.gdir, "ollama.env")).read()
+        # Ollama's documented way to force the CPU: an invalid GPU id, for NVIDIA, AMD and Vulkan.
+        self.assertEqual(env, "CUDA_VISIBLE_DEVICES=-1\nROCR_VISIBLE_DEVICES=-1\nGGML_VK_VISIBLE_DEVICES=-1\n")
+        self.assertIn("systemctl --no-block try-restart ollama.service", self.calls())
+        self.assertNotIn("systemctl --no-block stop ollama.service", self.calls())
+        open(self.log, "w").close()
+        self.run_helper("default")
+        self.assertFalse(os.path.exists(os.path.join(self.gdir, "ollama.env")))
+        self.assertIn("systemctl --no-block try-restart ollama.service", self.calls())
+
+    def test_free_leaves_ollama_alone(self):
+        self.settings({"modes.gaming.ai": "free"})
+        self.run_helper("gaming")
+        self.run_helper("default")
+        self.assertFalse([c for c in self.calls() if "ollama" in c])
+
+    def test_leaving_undoes_what_an_earlier_choice_did(self):
+        # The choice changed during the game (wait, then cpu): both are undone afterwards.
+        with open(os.path.join(self.gdir, "ollama-paused"), "w"):
+            pass
+        with open(os.path.join(self.gdir, "ollama.env"), "w") as f:
+            f.write("CUDA_VISIBLE_DEVICES=-1\n")
+        self.active = "0"
+        self.run_helper("quiet")
+        self.assertEqual(os.listdir(self.gdir), [])
+        self.assertIn("systemctl --no-block start ollama.service", self.calls())
+
+    def test_ollama_reads_the_gaming_file_and_the_service_may_write_only_there(self):
+        with open(os.path.join(ROOT, "files/system/etc/systemd/system/ollama.service.d/60-forge-gaming.conf")) as f:
+            self.assertEqual(f.read().split("\n[Service]\n")[1], "EnvironmentFile=-/run/forge/gaming/ollama.env\n")
+        with open(SWITCH_UNIT) as f:
+            self.assertIn("ReadWritePaths=-/run/forge/gaming\n", f.read())
+        with open(os.path.join(ROOT, "files/system/usr/lib/tmpfiles.d/forge-ai-storage.conf")) as f:
+            self.assertIn("d /run/forge/gaming 0755 root root -\n", f.read())
 
     def test_default_uses_the_agent_settings(self):
         self.settings({"agents.cpu_weight": 70, "agents.memory_high_pct": 60})
@@ -802,7 +906,8 @@ class ModeSwitchServerTest(unittest.TestCase):
             os.chmod(p, 0o755)
         self.conf = os.path.join(self.t, "settings.json")
         with open(self.conf, "w") as f:
-            json.dump({"modes.gaming.cpu_weight": 15, "modes.gaming.memory_high_pct": 20}, f)
+            # These tests are about who may switch; the AI choice is tested in ModeApplyHelperTest.
+            json.dump({"modes.gaming.cpu_weight": 15, "modes.gaming.memory_high_pct": 20, "modes.gaming.ai": "free"}, f)
         self.path = os.path.join(self.t, "mode.sock")
         self.proc = None
 
@@ -817,7 +922,8 @@ class ModeSwitchServerTest(unittest.TestCase):
         os.chmod(self.path, 0o666)
         srv.listen(16)
         e = {"PATH": self.bin + ":/usr/bin:/bin", "FORGE_LIB": LIB, "FORGE_SCHEMA": SCHEMA, "FORGE_CONF": self.conf,
-             "FAKE_CALLS": self.log, "FORGE_MODE_SWITCH_GROUP": "root", "FORGE_MODE_SWITCH_IDLE_S": "20"}
+             "FAKE_CALLS": self.log, "FORGE_MODE_SWITCH_GROUP": "root", "FORGE_MODE_SWITCH_IDLE_S": "20",
+             "FORGE_MODE_GAMING_DIR": os.path.join(self.t, "gaming")}
         if test_marker:
             e["FORGE_MODE_SWITCH_TEST"] = "1"
         e.update(env)

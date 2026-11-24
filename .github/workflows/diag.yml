@@ -19,13 +19,8 @@ jobs:
           printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           docker run --rm --entrypoint bash ghcr.io/monkey7770/forge-os-universal:br-forge-test-candidate-45 -c '
             set +e
-            echo "== flatpak manager"; F=$(command -v bluebuild-flatpak-manager); echo "$F"; file "$F"; head -c 400 "$F" | strings | head -5
-            ls /usr/share/bluebuild/default-flatpaks/ /usr/libexec/bluebuild* 2>/dev/null
-            for u in $(ls /usr/lib/systemd/system/*flatpak* /usr/lib/systemd/user/*flatpak* 2>/dev/null); do echo "--- $u"; cat "$u"; done
-            echo "== strings (state/hash/reinstall)"; strings "$F" 2>/dev/null | grep -iE "hash|state|already|installed|/var/lib|checksum|previous|remove" | sort -u | head -40
-            echo "== android"; rpm -q waydroid lxc waydroid-selinux 2>&1; ls /usr/share/ublue-os/just/ 2>/dev/null
-            grep -rlE "waydroid|virt|retro|emudeck|looking" /usr/share/ublue-os/just/ 2>/dev/null
-            echo "== waydroid recipes"; grep -rhE "^[a-z-]*waydroid[a-z-]*:|^setup-virtualization|^[a-z-]*looking[a-z-]*:|^[a-z-]*vfio[a-z-]*:|^[a-z-]*retro[a-z-]*:|^[a-z-]*emudeck[a-z-]*:" /usr/share/ublue-os/just/ 2>/dev/null
-            echo "== virt pkgs"; rpm -q libvirt qemu-kvm edk2-ovmf swtpm looking-glass-client virt-manager kvmfr 2>&1 | head
-            echo "== kvmfr"; modinfo kvmfr 2>&1 | head -3
+            for f in /usr/libexec/bluebuild/default-flatpaks/system-flatpak-setup /usr/libexec/bazzite-flatpak-manager; do echo "=== $f"; cat "$f"; done
+            echo "=== config"; head -60 /usr/share/bluebuild/default-flatpaks/configuration.yaml
+            for f in 82-bazzite-waydroid 86-bazzite-windows 82-bazzite-apps; do echo "=== $f"; cat /usr/share/ublue-os/just/$f.just; done
+            echo "=== virt"; head -150 /usr/share/ublue-os/just/84-bazzite-virt.just
           '

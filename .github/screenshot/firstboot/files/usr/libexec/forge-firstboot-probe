@@ -180,6 +180,15 @@ def log_commands(setup_uid):
              "-n", "600"]]
     if setup_uid is not None:
         cmds.append([JOURNALCTL, "-b", f"_UID={int(setup_uid)}", "--no-pager", "-o", "short-monotonic", "-n", "300"])
+    # Temporary (Firefox diagnosis): the app installers and what got installed.
+    cmds += [["/usr/bin/flatpak", "list", "--system", "--columns=application,origin"],
+             ["/usr/bin/flatpak", "remotes", "--system", "--show-disabled"],
+             [SYSTEMCTL, "list-timers", "--all", "--no-pager"],
+             [SYSTEMCTL, "status", "system-flatpak-setup.service", "system-flatpak-setup.timer", "forge-apps.service",
+              "bazzite-flatpak-manager.service", "--no-pager", "--full", "--lines=0"],
+             [JOURNALCTL, "-b", "-u", "system-flatpak-setup.service", "-u", "bazzite-flatpak-manager.service",
+              "-u", "forge-apps.service", "-u", "forge-apply-firstboot.service", "--no-pager", "-o", "short-monotonic",
+              "-n", "400"]]
     return cmds
 
 

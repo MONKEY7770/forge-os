@@ -27,3 +27,15 @@ grep -qx 'enabled=0' /etc/yum.repos.d/forge-claude-desktop.repo
 rm -f /etc/skel/.config/autostart/bazzite-portal.desktop
 # tuned-ppd has power-profiles-daemon's D-Bus API but no powerprofilesctl: Forge's stand-in fills in.
 [ -e /usr/bin/powerprofilesctl ] || ln -s /usr/libexec/forge/powerprofilesctl /usr/bin/powerprofilesctl
+
+# check-builtin-apps: every built-in app that Forge Settings can hide must still have its menu entry
+# (if Bazzite renames one, hiding it would quietly do nothing).
+python3 - <<'PY'
+import json, os, sys
+cat = json.load(open("/usr/share/forge/apps.json"))
+missing = [d for it in cat["optional"] if it["kind"] == "builtin" for d in it["desktop"]
+           if not os.path.exists(os.path.join("/usr/share/applications", d))]
+if missing:
+    sys.exit("check-builtin-apps: menu entries not in the image: " + ", ".join(missing))
+print("check-builtin-apps: all built-in menu entries found")
+PY

@@ -1,34 +1,316 @@
 {
-  "_comment": "Forge OS apps. 'always' is installed by BlueBuild at every boot (recipe). Each 'optional' entry is one checkbox in the setup wizard and one switch in Forge Settings, Apps (its settings key). forge-apps installs it while the switch is on and deletes it once when you turn the switch off. kind: flatpak (one Flathub app), waydroid (Android, set up by forge-apps), virt (virtual machines, set up by forge-virt).",
-  "always": ["org.mozilla.firefox", "com.github.tchx84.Flatseal", "io.missioncenter.MissionCenter"],
+  "_comment": "Forge OS apps. Each 'optional' entry is one checkbox in the setup wizard and one switch in Forge Settings, Apps (its settings key). kind: flatpak (one Flathub app: forge-apps installs it while the switch is on and deletes it once when you turn the switch off), builtin (part of the system image, which is read-only: turning the switch off hides it from menus and search, turning it on shows it again), waydroid (Android, set up by forge-apps; its menu entries are hidden while off), virt (virtual machines, set up by forge-virt).",
   "sections": [
-    {"id": "gaming", "label": "Gaming"},
-    {"id": "create", "label": "Creating"},
-    {"id": "work", "label": "Work and tools"}
+    {
+      "id": "essentials",
+      "label": "Essentials"
+    },
+    {
+      "id": "gaming",
+      "label": "Gaming"
+    },
+    {
+      "id": "create",
+      "label": "Creating"
+    },
+    {
+      "id": "work",
+      "label": "Work and tools"
+    }
   ],
   "optional": [
-    {"key": "apps.discord", "section": "gaming", "kind": "flatpak", "flatpak": "com.discordapp.Discord", "name": "Discord"},
-    {"key": "apps.sober", "section": "gaming", "kind": "flatpak", "flatpak": "org.vinegarhq.Sober", "name": "Roblox (Sober)"},
-    {"key": "apps.vinegar", "section": "gaming", "kind": "flatpak", "flatpak": "org.vinegarhq.Vinegar", "name": "Roblox Studio (Vinegar)"},
-    {"key": "apps.prism", "section": "gaming", "kind": "flatpak", "flatpak": "org.prismlauncher.PrismLauncher", "name": "Minecraft Java (Prism Launcher)"},
-    {"key": "apps.mcpelauncher", "section": "gaming", "kind": "flatpak", "flatpak": "io.mrarm.mcpelauncher", "name": "Minecraft Bedrock"},
-    {"key": "apps.moonlight", "section": "gaming", "kind": "flatpak", "flatpak": "com.moonlight_stream.Moonlight", "name": "Moonlight (play games from another PC)"},
-    {"key": "apps.gpu_recorder", "section": "gaming", "kind": "flatpak", "flatpak": "com.dec05eba.gpu_screen_recorder", "name": "GPU Screen Recorder"},
-    {"key": "apps.retrodeck", "section": "gaming", "kind": "flatpak", "flatpak": "net.retrodeck.retrodeck", "name": "Retro gaming (RetroDECK)"},
-    {"key": "apps.android", "section": "gaming", "kind": "waydroid", "name": "Android apps (Waydroid)"},
-    {"key": "virt.enabled", "section": "gaming", "kind": "virt", "name": "Virtual machines (Windows gaming ready)"},
-    {"key": "apps.blender", "section": "create", "kind": "flatpak", "flatpak": "org.blender.Blender", "name": "Blender"},
-    {"key": "apps.blockbench", "section": "create", "kind": "flatpak", "flatpak": "net.blockbench.Blockbench", "name": "Blockbench"},
-    {"key": "apps.krita", "section": "create", "kind": "flatpak", "flatpak": "org.kde.krita", "name": "Krita"},
-    {"key": "apps.audacity", "section": "create", "kind": "flatpak", "flatpak": "org.audacityteam.Audacity", "name": "Audacity"},
-    {"key": "apps.pixelorama", "section": "create", "kind": "flatpak", "flatpak": "com.orama_interactive.Pixelorama", "name": "Pixelorama"},
-    {"key": "apps.kdenlive", "section": "create", "kind": "flatpak", "flatpak": "org.kde.kdenlive", "name": "Kdenlive (video editing)"},
-    {"key": "apps.obs", "section": "create", "kind": "flatpak", "flatpak": "com.obsproject.Studio", "name": "OBS Studio (recording and streaming)"},
-    {"key": "apps.vscode", "section": "work", "kind": "flatpak", "flatpak": "com.visualstudio.code", "name": "Visual Studio Code"},
-    {"key": "apps.github_desktop", "section": "work", "kind": "flatpak", "flatpak": "io.github.shiftey.Desktop", "name": "GitHub Desktop"},
-    {"key": "apps.vlc", "section": "work", "kind": "flatpak", "flatpak": "org.videolan.VLC", "name": "VLC (videos and music)"},
-    {"key": "apps.localsend", "section": "work", "kind": "flatpak", "flatpak": "org.localsend.localsend_app", "name": "LocalSend (send files to your phone)"},
-    {"key": "apps.bitwarden", "section": "work", "kind": "flatpak", "flatpak": "com.bitwarden.desktop", "name": "Bitwarden (passwords)"},
-    {"key": "apps.rustdesk", "section": "work", "kind": "flatpak", "flatpak": "com.rustdesk.RustDesk", "name": "RustDesk (remote desktop)"}
+    {
+      "key": "apps.firefox",
+      "section": "essentials",
+      "kind": "flatpak",
+      "flatpak": "org.mozilla.firefox",
+      "name": "Firefox (web browser)"
+    },
+    {
+      "key": "apps.flatseal",
+      "section": "essentials",
+      "kind": "flatpak",
+      "flatpak": "com.github.tchx84.Flatseal",
+      "name": "Flatseal (what each app may access)"
+    },
+    {
+      "key": "apps.missioncenter",
+      "section": "essentials",
+      "kind": "flatpak",
+      "flatpak": "io.missioncenter.MissionCenter",
+      "name": "Mission Center (CPU, GPU and memory per app)"
+    },
+    {
+      "key": "apps.discord",
+      "section": "gaming",
+      "kind": "flatpak",
+      "flatpak": "com.discordapp.Discord",
+      "name": "Discord"
+    },
+    {
+      "key": "apps.sober",
+      "section": "gaming",
+      "kind": "flatpak",
+      "flatpak": "org.vinegarhq.Sober",
+      "name": "Roblox (Sober)"
+    },
+    {
+      "key": "apps.vinegar",
+      "section": "gaming",
+      "kind": "flatpak",
+      "flatpak": "org.vinegarhq.Vinegar",
+      "name": "Roblox Studio (Vinegar)"
+    },
+    {
+      "key": "apps.prism",
+      "section": "gaming",
+      "kind": "flatpak",
+      "flatpak": "org.prismlauncher.PrismLauncher",
+      "name": "Minecraft Java (Prism Launcher)"
+    },
+    {
+      "key": "apps.mcpelauncher",
+      "section": "gaming",
+      "kind": "flatpak",
+      "flatpak": "io.mrarm.mcpelauncher",
+      "name": "Minecraft Bedrock"
+    },
+    {
+      "key": "apps.moonlight",
+      "section": "gaming",
+      "kind": "flatpak",
+      "flatpak": "com.moonlight_stream.Moonlight",
+      "name": "Moonlight (play games from another PC)"
+    },
+    {
+      "key": "apps.gpu_recorder",
+      "section": "gaming",
+      "kind": "flatpak",
+      "flatpak": "com.dec05eba.gpu_screen_recorder",
+      "name": "GPU Screen Recorder"
+    },
+    {
+      "key": "apps.retrodeck",
+      "section": "gaming",
+      "kind": "flatpak",
+      "flatpak": "net.retrodeck.retrodeck",
+      "name": "Retro gaming (RetroDECK)"
+    },
+    {
+      "key": "apps.android",
+      "section": "gaming",
+      "kind": "waydroid",
+      "name": "Android apps (Waydroid)",
+      "desktop": [
+        "Waydroid.desktop",
+        "waydroid-container-restart.desktop"
+      ]
+    },
+    {
+      "key": "virt.enabled",
+      "section": "gaming",
+      "kind": "virt",
+      "name": "Virtual machines (Windows gaming ready)"
+    },
+    {
+      "key": "apps.steam",
+      "section": "gaming",
+      "kind": "builtin",
+      "desktop": [
+        "steam.desktop",
+        "bazzite-steam-bpm.desktop"
+      ],
+      "name": "Steam (built in)"
+    },
+    {
+      "key": "apps.lutris",
+      "section": "gaming",
+      "kind": "builtin",
+      "desktop": [
+        "net.lutris.Lutris.desktop"
+      ],
+      "name": "Lutris (built in)"
+    },
+    {
+      "key": "apps.input_remapper",
+      "section": "gaming",
+      "kind": "builtin",
+      "desktop": [
+        "input-remapper-gtk.desktop"
+      ],
+      "name": "Input Remapper (built in)"
+    },
+    {
+      "key": "apps.blender",
+      "section": "create",
+      "kind": "flatpak",
+      "flatpak": "org.blender.Blender",
+      "name": "Blender"
+    },
+    {
+      "key": "apps.blockbench",
+      "section": "create",
+      "kind": "flatpak",
+      "flatpak": "net.blockbench.Blockbench",
+      "name": "Blockbench"
+    },
+    {
+      "key": "apps.krita",
+      "section": "create",
+      "kind": "flatpak",
+      "flatpak": "org.kde.krita",
+      "name": "Krita"
+    },
+    {
+      "key": "apps.audacity",
+      "section": "create",
+      "kind": "flatpak",
+      "flatpak": "org.audacityteam.Audacity",
+      "name": "Audacity"
+    },
+    {
+      "key": "apps.pixelorama",
+      "section": "create",
+      "kind": "flatpak",
+      "flatpak": "com.orama_interactive.Pixelorama",
+      "name": "Pixelorama"
+    },
+    {
+      "key": "apps.kdenlive",
+      "section": "create",
+      "kind": "flatpak",
+      "flatpak": "org.kde.kdenlive",
+      "name": "Kdenlive (video editing)"
+    },
+    {
+      "key": "apps.obs",
+      "section": "create",
+      "kind": "flatpak",
+      "flatpak": "com.obsproject.Studio",
+      "name": "OBS Studio (recording and streaming)"
+    },
+    {
+      "key": "apps.vscode",
+      "section": "work",
+      "kind": "flatpak",
+      "flatpak": "com.visualstudio.code",
+      "name": "Visual Studio Code"
+    },
+    {
+      "key": "apps.github_desktop",
+      "section": "work",
+      "kind": "flatpak",
+      "flatpak": "io.github.shiftey.Desktop",
+      "name": "GitHub Desktop"
+    },
+    {
+      "key": "apps.vlc",
+      "section": "work",
+      "kind": "flatpak",
+      "flatpak": "org.videolan.VLC",
+      "name": "VLC (videos and music)"
+    },
+    {
+      "key": "apps.localsend",
+      "section": "work",
+      "kind": "flatpak",
+      "flatpak": "org.localsend.localsend_app",
+      "name": "LocalSend (send files to your phone)"
+    },
+    {
+      "key": "apps.bitwarden",
+      "section": "work",
+      "kind": "flatpak",
+      "flatpak": "com.bitwarden.desktop",
+      "name": "Bitwarden (passwords)"
+    },
+    {
+      "key": "apps.rustdesk",
+      "section": "work",
+      "kind": "flatpak",
+      "flatpak": "com.rustdesk.RustDesk",
+      "name": "RustDesk (remote desktop)"
+    },
+    {
+      "key": "apps.claude",
+      "section": "work",
+      "kind": "builtin",
+      "desktop": [
+        "claude-desktop-unofficial.desktop"
+      ],
+      "name": "Claude (built in)"
+    },
+    {
+      "key": "apps.kate",
+      "section": "work",
+      "kind": "builtin",
+      "desktop": [
+        "org.kde.kate.desktop"
+      ],
+      "name": "Kate (code and text editor, built in)"
+    },
+    {
+      "key": "apps.kwrite",
+      "section": "work",
+      "kind": "builtin",
+      "desktop": [
+        "org.kde.kwrite.desktop"
+      ],
+      "name": "KWrite (simple text editor, built in)"
+    },
+    {
+      "key": "apps.spectacle",
+      "section": "work",
+      "kind": "builtin",
+      "desktop": [
+        "org.kde.spectacle.desktop"
+      ],
+      "name": "Spectacle (screenshots, built in)"
+    },
+    {
+      "key": "apps.filelight",
+      "section": "work",
+      "kind": "builtin",
+      "desktop": [
+        "org.kde.filelight.desktop"
+      ],
+      "name": "Filelight (what fills your disk, built in)"
+    },
+    {
+      "key": "apps.kfind",
+      "section": "work",
+      "kind": "builtin",
+      "desktop": [
+        "org.kde.kfind.desktop"
+      ],
+      "name": "KFind (find files, built in)"
+    },
+    {
+      "key": "apps.krdc",
+      "section": "work",
+      "kind": "builtin",
+      "desktop": [
+        "org.kde.krdc.desktop"
+      ],
+      "name": "KRDC (connect to other PCs, built in)"
+    },
+    {
+      "key": "apps.krfb",
+      "section": "work",
+      "kind": "builtin",
+      "desktop": [
+        "org.kde.krfb.desktop"
+      ],
+      "name": "Krfb (share this screen, built in)"
+    },
+    {
+      "key": "apps.webapps",
+      "section": "work",
+      "kind": "builtin",
+      "desktop": [
+        "webapp-manager.desktop"
+      ],
+      "name": "Web Apps (websites as apps, built in)"
+    }
   ]
 }

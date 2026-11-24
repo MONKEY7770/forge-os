@@ -295,7 +295,23 @@ New parts and their threat notes:
 
 - **Optional apps (forge-apps, root).** Installs the Flathub apps whose switch is on and deletes an app only when its switch goes from on to off. An app installed by hand while its switch is off is never touched; once its switch is on, it is treated like the others (so switching it off deletes it). After an update from an older Forge OS, apps you had deleted stay deleted (their switches are turned off). If many apps seem to vanish at once, the list is not trusted and nothing is switched off. The wizard's file is accepted only until about 2 hours after the first choice. The wizard's Apps page writes /var/lib/forge-setup/apps.ini as Plasma Setup's user; a root service reads it once without following links, accepts only "[apps]" and known names set to true or false (ASCII, size-capped), deletes it, and saves the choice through forge-apply's normal import. Android: turning it on downloads Waydroid's Android images from ota.waydro.id (the same source as Bazzite's own setup), or runs Bazzite's waydroid-nvidia-setup on NVIDIA; turning it off deletes /var/lib/waydroid only after Waydroid stopped and nothing is mounted there (a link there is removed, never followed). Its own record is in /var/lib/forge-apps (root only).
 - **forge-vm (your user).** Edits only VMs your user may manage (Virtual Machine Manager's own virsh; your session first, then the system connection if one exists), only Windows VMs, refuses XML with declarations, saves a backup first (with display passwords, readable only by you), and never changes disks, networks, the TPM or the display.
-- **BlueBuild's boot-time installer** now lists only Firefox, Flatseal and Mission Center: it installs its whole list again at every boot, so optional apps could not be deleted while they were in it.
+- **BlueBuild's boot-time installer is no longer used**: it installs its whole list again at every boot, so an app could not be deleted for good. Every app, Firefox included, is installed by forge-apps (tried again 3 minutes after a failure, then less often, up to every 30 minutes; a failure is not shown as a broken service).
+- **Built-in apps** (part of the read-only image) are hidden, not deleted: forge-apps writes a same-named menu file with Hidden=true in /usr/local/share/applications (root-owned). It never replaces a file there that it did not write (marked X-Forge-Hidden), never follows a link, and removes only its own files to show an app again.
+
+Independent review of hiding built-in apps and the warning fixes (no High findings; nothing exploitable found):
+
+| Sev. | Finding | Status |
+|---|---|---|
+| Medium | Retries ended with forge-apps marked failed (a health alert) and refused your own changes for up to 2 hours | Fixed: "not done yet" is not a failure; retries slow down to every 30 minutes and never stop |
+| Medium | After the update, a Waydroid set up by hand (ujust) was hidden | Fixed: hidden only while Android is off and not set up at all |
+| Medium | After the update, Firefox (or Flatseal, Mission Center) came back if you had turned off "Reinstall at boot" and deleted it | Fixed: those stay deleted (their switches turn off) |
+| Medium (suspected) | The Flathub source might be missing without BlueBuild's module | Fixed: added if missing |
+| Medium (suspected) | A menu entry renamed by Bazzite would make hiding quietly do nothing | Fixed: the image build fails if a built-in app's menu entry is missing |
+| Medium (suspected) | Hiding might show only after the next login | Fixed: the folder exists from boot and open menus are refreshed |
+| Low | Side effects of hiding (file types, steam:// links, pinned launchers) not documented | Documented in the README |
+| Low | The RAM setting was capped at 10% even on big PCs | Fixed: only when the setting is half the memory or more |
+| Low | Models under 0.5 GB counted as none in the saved state | Fixed: the exact size is kept |
+| Low | A test name said the opposite of what it checked | Fixed |
 
 Independent review of optional apps and forge-vm (no High findings; the root-side file handling held up):
 

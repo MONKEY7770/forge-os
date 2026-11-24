@@ -108,7 +108,7 @@ def qemu_argv(qemu, disk, code, nvram, serial, qmp, probe, kvm, memory_mb, cpus)
             "-drive", f"if=pflash,format=raw,unit=0,readonly=on,file={code}",
             "-drive", f"if=pflash,format=raw,unit=1,file={nvram}",
             "-drive", f"file={disk},format=raw,if=virtio",
-            "-vga", "virtio", "-display", "none", "-nic", "user,model=virtio-net-pci",
+            "-vga", "virtio", "-display", "none", "-nic", "none",
             "-device", "virtio-serial-pci",
             "-chardev", f"socket,id=probe,path={probe},server=on,wait=off",
             "-device", "virtserialport,chardev=probe,name=org.forgeos.probe",
@@ -246,7 +246,7 @@ class FirstbootSession:
     verdict the screen is saved, then the probe is asked for the guest logs ("send-logs") and the run
     ends when they are in ("logs-end") or after logs_timeout."""
 
-    def __init__(self, start, wizard_timeout, shots=((30, "wizard"), (90, "wizard-2"), (600, "wizard-3")), logs_timeout=180,
+    def __init__(self, start, wizard_timeout, shots=((30, "wizard"), (90, "wizard-2")), logs_timeout=120,
                  max_frames=150):
         self.start, self.wizard_timeout, self.shots = start, wizard_timeout, shots
         self.logs_timeout, self.max_frames = logs_timeout, max_frames

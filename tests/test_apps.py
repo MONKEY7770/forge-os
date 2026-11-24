@@ -54,6 +54,7 @@ class Base(unittest.TestCase):
         self.a.WAYDROID_DIR = os.path.join(self.t, "waydroid")
         self.a.SPOOL_DIR = os.path.join(self.t, "spool")
         os.makedirs(self.a.SPOOL_DIR, mode=0o700)
+        self.a.HIDE_DIR = os.path.join(self.t, "usrlocal-applications")
         self.a.TMP_DIR = os.path.join(self.t, "run")
         os.makedirs(self.a.TMP_DIR, mode=0o755)
         self.vals = defaults()
@@ -61,7 +62,7 @@ class Base(unittest.TestCase):
         self.users = [1000]
         self.a.regular_users = lambda: list(self.users)
         self.installed = set()
-        self.fail = set()
+        self.failing = set()
         self.calls = []
         self.imported = []
         self.notes = []
@@ -76,6 +77,10 @@ class Base(unittest.TestCase):
         self.now = 1_000_000.0
         self.a.now = lambda: self.now
         self.setup_fails = False
+        self.overrides = {}
+        self.a.saved_overrides = lambda: dict(self.overrides)
+        self.sessions_refreshed = []
+        self.a.refresh_menus = lambda: self.sessions_refreshed.append(1)
 
     def fake_run(self, cmd, timeout=60):
         self.calls.append(list(cmd))
@@ -83,7 +88,7 @@ class Base(unittest.TestCase):
             return 0, "".join(a + "\n" for a in sorted(self.installed))
         if cmd[:2] == ["flatpak", "install"]:
             app = cmd[-1]
-            if app in self.fail:
+            if app in self.failing:
                 return 1, "error: network"
             self.installed.add(app)
             return 0, ""
@@ -238,10 +243,10 @@ class InstallRemoveTest(Base):
         self.assertIn({"apps.krita": False}, self.imported)    # its switch now says off
 
     def test_a_failed_install_is_tried_again_next_time(self):
-        self.fail.add("org.blender.Blender")
-        self.a.main([])
+        self.failing.add("org.blender.Blender")
+        self.assertEqual(self.a.main([]), 75)        # systemd starts it again in a few minutes
         self.assertFalse(self.state()["installed"].get("apps.blender"))
-        self.fail.clear()
+        self.failing.clear()
         self.calls.clear()
         self.a.main([])
         self.assertIn("org.blender.Blender", self.flatpak_calls("install"))
@@ -250,7 +255,7 @@ class InstallRemoveTest(Base):
 
     def test_you_are_told_what_changed(self):
         self.a.main([])
-        self.assertTrue(any(b.startswith("Installed: Discord") for _, b in self.notes), self.notes)
+        self.assertTrue(any(b.startswith("Installed: Firefox") for _, b in self.notes), self.notes)
         self.notes.clear()
         self.a.main([])
         self.assertEqual(self.notes, [])             # nothing changed, nothing to say
@@ -264,6 +269,115 @@ class InstallRemoveTest(Base):
         self.a.settings = lambda: None
         self.assertEqual(self.a.main([]), 1)
         self.assertEqual(self.calls, [])
+
+
+class BuiltinTest(Base):
+    def hidden(self):
+        try:
+            return sorted(os.listdir(self.a.HIDE_DIR))
+        except FileNotFoundError:
+            return []
+
+    def test_unticked_built_in_apps_are_hidden_and_shown_again(self):
+        self.vals["apps.steam"] = False
+        self.a.main([])
+        steam = [f for f in self.hidden() if "steam" in f]
+        self.assertEqual(steam, ["bazzite-steam-bpm.desktop", "steam.desktop"])
+        with open(os.path.join(self.a.HIDE_DIR, "steam.desktop")) as f:
+            text = f.read()
+        self.assertIn("\nHidden=true\n", text)
+        self.assertIn("\nX-Forge-Hidden=true\n", text)
+        self.assertFalse([c for c in self.calls if "steam" in " ".join(c).lower()])   # nothing removed
+        self.vals["apps.steam"] = True
+        self.a.main([])
+        self.assertEqual([f for f in self.hidden() if "steam" in f], [])
+
+    def test_your_own_menu_files_are_never_touched(self):
+        os.makedirs(self.a.HIDE_DIR)
+        mine = os.path.join(self.a.HIDE_DIR, "org.kde.kate.desktop")
+        with open(mine, "w") as f:
+            f.write("[Desktop Entry]\nName=My Kate\nExec=kate --mine\n")
+        self.vals["apps.kate"] = False
+        self.a.main([])
+        self.vals["apps.kate"] = True
+        self.a.main([])
+        with open(mine) as f:
+            self.assertIn("My Kate", f.read())
+
+    def test_a_link_in_place_of_a_menu_file_is_not_followed(self):
+        os.makedirs(self.a.HIDE_DIR)
+        target = os.path.join(self.t, "elsewhere")
+        open(target, "w").close()
+        os.symlink(target, os.path.join(self.a.HIDE_DIR, "org.kde.kfind.desktop"))
+        self.vals["apps.kfind"] = False
+        self.a.main([])
+        with open(target) as f:
+            self.assertEqual(f.read(), "")
+
+    def test_android_menu_entries_are_hidden_while_android_is_off(self):
+        self.a.main([])                                  # off by default
+        self.assertIn("Waydroid.desktop", self.hidden())
+        self.vals["apps.android"] = True
+        self.a.main([])
+        self.assertNotIn("Waydroid.desktop", self.hidden())
+
+    def test_nothing_is_hidden_before_setup_is_finished(self):
+        # Hiding downloads nothing, but it still waits for the choice like everything else.
+        self.users = []
+        self.vals["apps.steam"] = False
+        self.a.main([])
+        self.assertEqual(self.hidden(), [])
+
+
+class Review8Test(Base):
+    def test_waydroid_set_up_by_hand_stays_visible(self):
+        # ujust setup-waydroid on an older Forge: Android's switch is off (the default), but its menu
+        # entries must not vanish after the update.
+        os.makedirs(os.path.join(self.a.WAYDROID_DIR, "images"))
+        self.a.main([])
+        self.assertFalse(os.path.exists(os.path.join(self.a.HIDE_DIR, "Waydroid.desktop")))
+
+    def test_firefox_you_removed_on_purpose_stays_removed_after_the_update(self):
+        # Previous round: "Reinstall the always-on apps at boot" was off and Firefox was deleted.
+        self.a.save_state({"applied": {"apps.discord": True}, "installed": {"apps.discord": True}})
+        self.installed.update({"com.discordapp.Discord", "com.github.tchx84.Flatseal"})
+        self.overrides = {"apps.auto_reinstall": False}
+        self.a.main([])
+        self.assertNotIn("org.mozilla.firefox", self.flatpak_calls("install"))
+        self.assertIn({"apps.firefox": False, "apps.missioncenter": False}, self.imported)
+        self.assertNotIn("com.github.tchx84.Flatseal", self.flatpak_calls("uninstall"))
+
+    def test_firefox_that_failed_to_install_before_is_installed_now(self):
+        # Same update, but the old boot install had simply failed (the setting was never turned off).
+        self.a.save_state({"applied": {"apps.discord": True}, "installed": {"apps.discord": True}})
+        self.installed.add("com.discordapp.Discord")
+        self.a.main([])
+        self.assertIn("org.mozilla.firefox", self.flatpak_calls("install"))
+
+    def test_the_flathub_source_is_added_if_missing(self):
+        self.a.main([])
+        add = [c for c in self.calls if c[:2] == ["flatpak", "remote-add"]]
+        self.assertEqual(add, [["flatpak", "remote-add", "--system", "--if-not-exists", "flathub",
+                                "https://dl.flathub.org/repo/flathub.flatpakrepo"]])
+        first_install = next(i for i, c in enumerate(self.calls) if c[:2] == ["flatpak", "install"])
+        self.assertLess(self.calls.index(add[0]), first_install)
+
+    def test_open_menus_are_refreshed_after_hiding(self):
+        self.vals["apps.kate"] = False
+        self.a.main([])
+        self.assertEqual(self.sessions_refreshed, [1])
+        self.sessions_refreshed.clear()
+        self.a.main([])
+        self.assertEqual(self.sessions_refreshed, [])                  # nothing changed
+
+    def test_the_hide_folder_exists_from_boot(self):
+        with open(os.path.join(ROOT, "files/system/usr/lib/tmpfiles.d/forge-ai-storage.conf")) as f:
+            self.assertIn("d /var/usrlocal/share/applications 0755 root root -\n", f.read())
+
+    def test_every_built_in_menu_entry_is_checked_when_the_image_is_built(self):
+        with open(os.path.join(ROOT, "files/scripts/finalize.sh")) as f:
+            text = f.read()
+        self.assertIn("check-builtin-apps", text)
 
 
 class AndroidTest(Base):
@@ -367,7 +481,7 @@ class SetupSpoolTest(Base):
 
     def test_anything_unexpected_is_refused(self):
         for bad in ("[apps]\nnot_an_app=true\n", "[apps]\ndiscord=yes\n", "discord=true\n",
-                    "[apps]\ndiscord=true\n[other]\nx=1\n", "[apps]\nfirefox=false\n", "[apps]\nก=true\n",
+                    "[apps]\ndiscord=true\n[other]\nx=1\n", "[apps]\ndolphin=false\n", "[apps]\nก=true\n",
                     "[apps]\n" + "discord=true\n" * 600):
             self.imported.clear()
             self.spool(bad)
@@ -397,16 +511,30 @@ class ConsistencyTest(unittest.TestCase):
             s = schema[it["key"]]
             self.assertEqual(s["type"], "toggle")
             self.assertTrue(s.get("machine"), it["key"])
-            # Agreed: today's apps start on; VMs, retro gaming and Android start off.
+            # Agreed: every app starts on except VMs, retro gaming and Android.
             self.assertEqual(s["default"], it["key"] not in ("apps.retrodeck", "apps.android", "virt.enabled"), it["key"])
 
-    def test_the_boot_installer_only_has_the_always_on_apps(self):
+    def test_no_boot_installer_puts_apps_back(self):
+        # BlueBuild's default-flatpaks installs its whole list again at every boot: not used at all,
+        # so every app (Firefox included) can be unticked for good.
         import yaml
         with open(os.path.join(ROOT, "recipes/common-modules.yml")) as f:
             mods = yaml.safe_load(f)["modules"]
-        lists = [c.get("install", []) for m in mods if m.get("type") == "default-flatpaks"
-                 for c in m.get("configurations", [])]
-        self.assertEqual(lists, [catalog()["always"]])
+        self.assertEqual([m for m in mods if m.get("type") == "default-flatpaks"], [])
+        self.assertIn("org.mozilla.firefox", {it.get("flatpak") for it in catalog()["optional"]})
+
+    def test_a_failed_install_is_retried_within_minutes(self):
+        # Offline first boot, or Wi-Fi joined later in the wizard: the first session must still get
+        # its browser soon (limited, so a lasting failure does not retry forever).
+        with open(os.path.join(UNITS, "forge-apps.service")) as f:
+            svc = f.read()
+        self.assertIn("[Unit]\n", svc)
+        # Review: a burst limit left the unit "failed" (a health alert) and refused your own changes.
+        # 75 counts as success, but still restarts, slower each time, up to every 30 minutes.
+        self.assertNotIn("StartLimitBurst", svc)
+        for line in ("SuccessExitStatus=75", "RestartForceExitStatus=75", "Restart=on-failure", "RestartSec=3min",
+                     "RestartSteps=4", "RestartMaxDelaySec=30min"):
+            self.assertIn(line + "\n", svc)
 
     def test_units_and_triggers(self):
         with open(os.path.join(UNITS, "forge-apps.service")) as f:

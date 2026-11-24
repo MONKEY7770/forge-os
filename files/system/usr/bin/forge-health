@@ -50,9 +50,20 @@ if command -v nvidia-smi >/dev/null; then
   gpu_line="gpu=${temp:-?}C vram=${used:-?}/${total:-?}MB"
 fi
 
-# Memory
-mem_avail=$(awk '/MemAvailable/ {print int($2/1024/1024)}' /proc/meminfo)
-[ "$mem_avail" -lt "$MEM_WARN" ] && problems+=("Low memory: ${mem_avail} GB free")
+# Memory. Warned below the setting (GB). If the setting is half the memory or more (an 8 GB PC or VM
+# with the default 4 GB, where a normal desktop often leaves less than that free), the warning starts
+# at 10% of the memory instead (at least 1 GB). 0 means never.
+read -r mem_total_mb mem_avail_mb < <(awk '/^MemTotal:/ {t=int($2/1024)} /^MemAvailable:/ {a=int($2/1024)}
+  END {print t+0, a+0}' "${FORGE_MEMINFO:-/proc/meminfo}" 2>/dev/null)
+if [ "${mem_total_mb:-0}" -gt 0 ]; then
+  mem_limit_mb=$(( MEM_WARN * 1024 ))
+  mem_small_mb=$(( mem_total_mb / 10 ))
+  [ "$mem_small_mb" -lt 1024 ] && mem_small_mb=1024
+  [ $(( mem_limit_mb * 2 )) -ge "$mem_total_mb" ] && [ "$mem_small_mb" -lt "$mem_limit_mb" ] && mem_limit_mb=$mem_small_mb
+  if [ "$mem_avail_mb" -lt "$mem_limit_mb" ]; then
+    problems+=("Low memory: $(awk -v a="$mem_avail_mb" 'BEGIN {printf "%.1f", a / 1024}') GB free of $(( (mem_total_mb + 512) / 1024 )) GB")
+  fi
+fi
 
 # Ollama (only if it's turned on). Gaming mode's "Wait" choice stops it on purpose during a game.
 GAMING_DIR=${FORGE_GAMING_DIR:-/run/forge/gaming}
@@ -143,7 +154,7 @@ fi
 # problem not shown before brings the alert back. A healthy run forgets what was shown.
 SHOWN="$STATE_DIR/health-shown"
 if [ ${#problems[@]} -eq 0 ]; then
-  echo "$(date -Is) ok ${gpu_line:-} mem_free=${mem_avail}G" >> "$LOG"
+  echo "$(date -Is) ok ${gpu_line:-} mem_free=$(awk -v a="${mem_avail_mb:-0}" 'BEGIN {printf "%.1f", a / 1024}')G" >> "$LOG"
   rm -f "$SHOWN"
 else
   msg=$(printf '%s\n' "${problems[@]}")

@@ -4,6 +4,7 @@ import ipaddress
 import json
 import io
 import os
+import re
 import shutil
 import socket
 import stat
@@ -638,8 +639,11 @@ class ForgeHealthNotifyTest(unittest.TestCase):
         self.hw = os.path.join(f, "hardware-notice.json")
         with open(self.hw, "w") as fh:
             json.dump({"changes": ["-x <b>Evil USB</b> & <a href='http://x'>more</a>"]}, fh)
+        # A PC with 8 GB of memory and 200 MB free (so "999999" warns and "0" never does).
+        self.meminfo = os.path.join(f, "meminfo")
+        self.set_mem(8 * 1024 * 1024, 200 * 1024)
         self.env = dict(os.environ, PATH=f + ":" + os.environ["PATH"], HOME=f, XDG_STATE_HOME=os.path.join(f, "state"),
-                        FORGE_VIEWER_TOKEN=self.viewer, FORGE_HW_NOTICE=self.hw)
+                        FORGE_VIEWER_TOKEN=self.viewer, FORGE_HW_NOTICE=self.hw, FORGE_MEMINFO=self.meminfo)
 
     def run_health(self):
         r = subprocess.run(["bash", os.path.join(BIN, "forge-health")], env=self.env,
@@ -711,6 +715,38 @@ class ForgeHealthNotifyTest(unittest.TestCase):
         os.remove(os.path.join(gaming, "ollama-paused"))             # the same fresh state, not paused
         _, calls = self.run_health()
         self.assertIn("Ollama is not running", json.dumps(self.health_calls(calls)))
+
+    def set_mem(self, total_kb, avail_kb):
+        with open(self.meminfo, "w") as fh:
+            fh.write(f"MemTotal:       {total_kb} kB\nMemFree:        {avail_kb} kB\nMemAvailable:   {avail_kb} kB\n")
+
+    def mem_problem(self, total_gb, avail_mb, setting="4"):
+        write_exec(os.path.join(self.fake, "forge-config"),
+                   re.sub(r'mem_warn_gb\) echo "[0-9]+"', f'mem_warn_gb) echo "{setting}"',
+                          open(os.path.join(self.fake, "forge-config")).read()))
+        self.set_mem(total_gb * 1024 * 1024, avail_mb * 1024)
+        self.env["XDG_STATE_HOME"] = os.path.join(self.fake, f"state-{total_gb}-{avail_mb}-{setting}")
+        if os.path.exists(self.log):
+            os.remove(self.log)
+        _, calls = self.run_health()
+        return [c for c in calls if "Low memory" in json.dumps(c)]
+
+    def test_small_pcs_warn_only_when_memory_is_really_low(self):
+        # An 8 GB PC or VM with 3 GB free is normal desktop use, not a problem (the old rule said 4 GB).
+        self.assertEqual(self.mem_problem(8, 3 * 1024), [])
+        self.assertEqual(self.mem_problem(8, 1500), [])
+        self.assertTrue(self.mem_problem(8, 700))                  # under 1 GB: warned
+        # A 64 GB PC keeps the setting (4 GB).
+        self.assertTrue(self.mem_problem(64, 3 * 1024))
+        self.assertEqual(self.mem_problem(64, 5 * 1024), [])
+        self.assertEqual(self.mem_problem(8, 100, setting="0"), [])  # 0: never
+        # Review: a setting that fits the PC is kept (32 GB PC set to 8 GB warns at 8 GB, not 3.2).
+        self.assertTrue(self.mem_problem(32, 5 * 1024, setting="8"))
+        self.assertTrue(self.mem_problem(16, 3 * 1024))               # 16 GB keeps the 4 GB default
+
+    def test_the_memory_warning_says_how_much_is_free(self):
+        calls = self.mem_problem(8, 700)
+        self.assertIn("Low memory: 0.7 GB free of 8 GB", json.dumps(calls))
 
     def test_hot_gpu_shows_degrees(self):
         with open(os.path.join(ROOT, "files/system/usr/bin/forge-health")) as f:

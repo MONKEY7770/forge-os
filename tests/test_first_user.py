@@ -132,21 +132,6 @@ class FirstUserGuardTests(unittest.TestCase):
             self.assertIn("/usr/libexec/forge-first-user", f.read())
 
 
-class FlatpakRetryTests(unittest.TestCase):
-    """Review finding: the first-boot app install (Firefox and the other Flatpaks) ran once,
-    30 seconds after boot. Offline, or on Wi-Fi joined later in the setup wizard, it failed and only
-    tried again at the next boot, so the first session had no browser."""
-
-    def test_retries_until_it_works(self):
-        path = os.path.join(ROOT, "files/system/usr/lib/systemd/system/system-flatpak-setup.service.d/forge-retry.conf")
-        with open(path) as f:
-            text = f.read()
-        # Limited (review finding): a lasting failure, such as an app removed from Flathub or a full
-        # disk, must not download and notify again every few minutes forever.
-        self.assertIn("[Unit]\nStartLimitIntervalSec=2h\nStartLimitBurst=20\n", text)
-        self.assertIn("[Service]\nRestart=on-failure\nRestartSec=3min\n", text)
-
-
 class UserUnitTests(unittest.TestCase):
     """Review finding: Forge's user units also ran for system accounts (Plasma Setup's temporary
     user, the login screen's user). Like Bazzite's own user units, they only run for real people."""

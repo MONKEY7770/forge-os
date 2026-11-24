@@ -133,6 +133,16 @@ class RuleTest(unittest.TestCase):
         self.assertEqual(r["status"], "off")
         self.assertEqual(r["problems"], [])
 
+    def test_small_disks_without_models_are_not_a_problem(self):
+        # A fresh install in a 64 GB or 128 GB VM: no room for models, but no models either. Nothing to
+        # warn about (a download is still refused with the reason).
+        for total, free in ((64, 30), (128, 90)):
+            r = S.compute(total * GB, free * GB, 0, 0, defaults())
+            self.assertEqual(S.problem_lines(r), [], total)
+            self.assertLessEqual(r["room"], 0)                       # downloads still blocked
+        r = S.compute(128 * GB, 20 * GB, 5 * GB, 0, defaults())       # with models: still told
+        self.assertTrue(S.problem_lines(r))
+
     def test_problem_lines(self):
         self.assertEqual(S.problem_lines(S.compute(1000 * GB, 200 * GB, 750 * GB, 0, defaults())),
                          ["AI models use 750 GB, more than their limit of 700 GB"])
@@ -680,6 +690,19 @@ class ReportTest(unittest.TestCase):
         with mock.patch.object(S, "current", return_value=None):
             sec = D.storage(root, run=lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError()))
         self.assertTrue(any("not sure" in i for i in sec["items"]), sec)
+
+    def test_state_keeps_small_models_counted(self):
+        # Review: a 0.4 GB model rounded to 0 GB in the state would hide "too full" warnings.
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        rep = S.compute(128 * GB, 20 * GB, int(0.4 * GB), 0, defaults())
+        with open(os.path.join(tmp, "ai-storage.json"), "w") as f:
+            json.dump(S.state_doc(rep, "/var/lib/ollama/models", time.time()), f)
+        with mock.patch.object(S, "load_settings", return_value=None), \
+                mock.patch.object(S, "STATE_PATH", os.path.join(tmp, "ai-storage.json")):
+            cur = S.current()
+        self.assertEqual(cur["models"], int(0.4 * GB))
+        self.assertTrue(S.problem_lines(cur))
 
     def test_state_keeps_the_space_kept_for_normal_use(self):
         # A user who can't read the model folder gets the numbers from the watcher's state; the

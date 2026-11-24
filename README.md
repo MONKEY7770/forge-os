@@ -37,15 +37,18 @@ On first login, a **Forge Welcome** page shows this report and helps with locati
 
 ## Apps (always on, and optional)
 
-**Always installed:** Firefox, Flatseal and Mission Center. Built into the image: Steam (from Bazzite), Claude Desktop, Ollama, Tailscale, KDE Connect, disk health and temperature sensors.
+Every app is a choice. The setup wizard's **Apps** page lists them with a checkbox each, and Forge Settings, **Apps** has the same switches for later. Ticked apps download in the background after setup (nothing is downloaded before you choose; if the PC is offline, or Wi-Fi is joined later, it tries again every few minutes). Turning a switch off **deletes** that app; your own files and the app's saved data in your home folder stay. An app you install yourself (for example from Bazaar, the app store) is never deleted unless you turn its switch from on to off, and an app you delete yourself is not put back (its switch turns off).
 
-**Optional:** the setup wizard's **Apps** page lists the rest with a checkbox each, and Forge Settings, **Apps** has the same switches for later. Ticked apps download in the background after setup (nothing optional is downloaded before you choose). Turning a switch off **deletes** that app; your own files and the app's saved data in your home folder stay. An app you install yourself (for example from Discover) is never deleted unless you turn its switch from on to off, and an app you delete yourself is not put back (its switch turns off).
+Apps that are **part of the system image** (Steam, Lutris, Claude, Kate and the other "built in" ones) can't be deleted, because the system is read-only: unticking one **hides** it from menus and search instead, and ticking it shows it again. System tools (Dolphin, Konsole, System Settings, Bazaar) always stay. Also built in and always on: Ollama, Tailscale, KDE Connect, disk health and temperature sensors.
 
 | Area | Optional apps (ticked at first unless noted) |
 |---|---|
-| Gaming | Discord, Sober (Roblox), Vinegar (Roblox Studio), Prism Launcher (Minecraft Java), Minecraft Bedrock launcher, Moonlight, GPU Screen Recorder; **unticked at first:** Retro gaming (RetroDECK), Android apps (Waydroid), Virtual machines |
+| Essentials | Firefox, Flatseal, Mission Center |
+| Gaming | Discord, Sober (Roblox), Vinegar (Roblox Studio), Prism Launcher (Minecraft Java), Minecraft Bedrock launcher, Moonlight, GPU Screen Recorder; built in: Steam, Lutris, Input Remapper; **unticked at first:** Retro gaming (RetroDECK), Android apps (Waydroid), Virtual machines |
 | Creating | Blender, Blockbench, Krita, Audacity, Pixelorama, Kdenlive, OBS Studio |
-| Work and tools | VS Code, GitHub Desktop, VLC, LocalSend, Bitwarden, RustDesk |
+| Work and tools | VS Code, GitHub Desktop, VLC, LocalSend, Bitwarden, RustDesk; built in: Claude, Kate, KWrite, Spectacle, Filelight, KFind, KRDC, Krfb, Web Apps |
+
+What hiding also does: a hidden app no longer opens files or links for you (hide both Kate and KWrite and text files have no default editor; hide Steam and steam:// links stop working), the Print Screen key no longer opens a hidden Spectacle, and a hidden app's launcher pinned to the dock or panel may disappear (not sure). Hiding Steam does not stop it from starting by itself if you set it to.
 
 - **Retro gaming (RetroDECK):** emulators for older consoles in one app with a controller-friendly menu. Add your own games (ROMs) and, for some consoles, BIOS files you own.
 - **Android apps (Waydroid):** turning it on downloads Android (about 1 GB) and sets it up (on NVIDIA, with Bazzite's `waydroid-nvidia` in its default mode, set up again by itself after kernel or driver updates). Some apps and games won't run. Turning it off deletes the Android system (`/var/lib/waydroid`); each user's Android data in their home folder stays.

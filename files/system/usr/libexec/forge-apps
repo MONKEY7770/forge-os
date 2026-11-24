@@ -38,8 +38,14 @@ SPOOL_NAME = "apps.ini"
 SPOOL_MAX = 4096
 APPLY_CMD = ["/usr/libexec/forge-apply"]
 WAYDROID_DIR = "/var/lib/waydroid"
+# Built-in apps are hidden by a same-named menu file here, which comes before /usr/share in the
+# search path (XDG_DATA_DIRS). Only files carrying HIDE_MARK are ever changed or removed.
+HIDE_DIR = "/usr/local/share/applications"
+HIDE_MARK = "X-Forge-Hidden=true"
 OTA = ["-c", "https://ota.waydro.id/system", "-v", "https://ota.waydro.id/vendor"]
 FIRST_UID, LAST_UID = 1000, 60513
+# The apps the previous Forge OS installed at every boot (BlueBuild), unless turned off.
+OLD_BOOT_APPS = ("apps.firefox", "apps.flatseal", "apps.missioncenter")
 CHOICE_WINDOW_S = 2 * 3600      # the wizard may change its choice (Back, Next) for this long
 RESETUP_WAIT_S = 6 * 3600       # a failed Android re-setup is tried again after this
 MAX_VANISHED = 2                # more apps gone at once: the list is not trusted this time
@@ -77,6 +83,11 @@ def run_cmd(cmd, timeout=60):
 def settings():
     vals, errors = forgecfg.validate(forgecfg.values())
     return None if errors else vals
+
+
+def saved_overrides():
+    """Your saved settings as written (also keys that no longer exist, for one-time updates)."""
+    return forgecfg.load_overrides()
 
 
 def load_catalog():
@@ -140,7 +151,8 @@ def set_switches(changes):
 
 # ---------- telling the desktop users ----------
 
-def notify_users(summary, body):
+def desktop_sessions():
+    """(uid, name) of each active local desktop session of a person."""
     rc, out = run_cmd(["loginctl", "list-sessions", "--no-legend"], timeout=10)
     if rc != 0:
         return
@@ -159,9 +171,21 @@ def notify_users(summary, body):
             name = pwd.getpwuid(int(uid)).pw_name
         except KeyError:
             continue
+        yield int(uid), name
+
+
+def notify_users(summary, body):
+    for uid, name in desktop_sessions():
         run_cmd(["runuser", "-u", name, "--", "env", f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
                  "notify-send", "-a", "Forge OS", "-i", "system-software-install", "--",
                  html.escape(summary), html.escape(body)], timeout=15)
+
+
+def refresh_menus():
+    """Open menus and search pick up hidden or shown apps now, not at the next login."""
+    for uid, name in desktop_sessions():
+        run_cmd(["runuser", "-u", name, "--", "env", f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+                 "kbuildsycoca6"], timeout=120)
 
 
 # ---------- Flatpak apps ----------
@@ -177,7 +201,7 @@ def flatpak_item(it, want, st, have, report):
     present = app in have
     if want:
         if st["installed"].get(key) and not present:
-            # Deleted by you (for example in Discover): not put back; its switch is turned off below
+            # Deleted by you (for example in Bazaar): not put back; its switch is turned off below
             # (all such switches in one save), unless too many vanished at once.
             report["vanished"][key] = it["name"]
             return
@@ -200,6 +224,60 @@ def flatpak_item(it, want, st, have, report):
             report["failed"].append(it["name"])
             return          # tried again next time (still "on" in the state)
     st["applied"][key], st["installed"][key] = False, False
+
+
+# ---------- built-in apps (hidden or shown) ----------
+
+def _ours(path):
+    """True if path is a regular file written by set_hidden (never followed as a link)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return False
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            return False
+        return HIDE_MARK.encode() in f.read(4096).splitlines()
+
+
+def set_hidden(desktop_ids, name, hidden):
+    """Hides (or shows again) menu entries. A file there that Forge did not write is left alone."""
+    changed = False
+    for did in desktop_ids:
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}\.desktop", did):
+            continue
+        path = os.path.join(HIDE_DIR, did)
+        if hidden:
+            if os.path.lexists(path):
+                continue            # already hidden by Forge, or a file of yours: not touched
+            os.makedirs(HIDE_DIR, mode=0o755, exist_ok=True)
+            tmp = os.path.join(HIDE_DIR, f".{did}.{os.urandom(4).hex()}")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
+            with os.fdopen(fd, "w") as f:
+                f.write("[Desktop Entry]\nType=Application\n"
+                        f"Name={name}\nHidden=true\nNoDisplay=true\n{HIDE_MARK}\n"
+                        "# Hidden by Forge OS (Forge Settings, Apps). Turn its switch on to show it again.\n")
+            try:
+                os.link(tmp, path)  # fails if a file appeared meanwhile: never replaces one
+                changed = True
+            except FileExistsError:
+                pass
+            finally:
+                os.unlink(tmp)
+        elif _ours(path):
+            os.unlink(path)
+            changed = True
+    return changed
+
+
+def builtin_item(it, want, report, hide=None):
+    try:
+        if set_hidden(it["desktop"], it["name"], (not want) if hide is None else hide):
+            report["shown" if want else "hidden"].append(it["name"])
+            report["menus"] = True
+    except OSError as e:
+        report["failed"].append(it["name"])
+        print(f"{it['name']}: menu entry not changed ({e.strerror})", flush=True)
 
 
 # ---------- Android (Waydroid) ----------
@@ -320,7 +398,10 @@ def apply_all():
         print("Not changed: flatpak list failed.", file=sys.stderr)
         return 1
     st = load_state()
-    report = {"installed": [], "removed": [], "failed": [], "vanished": {}}
+    report = {"installed": [], "removed": [], "failed": [], "vanished": {}, "hidden": [], "shown": [], "menus": False}
+    # The Flathub source (Bazzite normally has it; added here if it is missing).
+    run_cmd(["flatpak", "remote-add", "--system", "--if-not-exists", "flathub",
+             "https://dl.flathub.org/repo/flathub.flatpakrepo"], timeout=120)
     flatpaks = [it for it in cat["optional"] if it["kind"] == "flatpak"]
     if st["new"] and not os.path.lexists(os.path.join(STATE_DIR, "chosen")) \
             and any(it["flatpak"] in have for it in flatpaks):
@@ -336,13 +417,31 @@ def apply_all():
                 st["applied"][it["key"]], st["installed"][it["key"]] = True, True
         print(f"Updated from an older Forge OS: kept the installed apps, switched off {len(gone)} you had deleted.",
               flush=True)
+    if not st["new"] and saved_overrides().get("apps.auto_reinstall") is False:
+        # From the previous Forge OS, where Firefox, Flatseal and Mission Center came from the boot
+        # installer and "Reinstall ... at boot" was turned off: the ones you had deleted stay deleted.
+        gone = {it["key"]: False for it in flatpaks if it["key"] in OLD_BOOT_APPS and it["key"] not in st["applied"]
+                and vals.get(it["key"]) is True and it["flatpak"] not in have}
+        if gone and set_switches(gone):
+            vals.update(gone)
+            for key in gone:
+                st["applied"][key], st["installed"][key] = False, False
     for it in cat["optional"]:
         want = vals.get(it["key"]) is True
         if it["kind"] == "flatpak":
             flatpak_item(it, want, st, have, report)
         elif it["kind"] == "waydroid":
             android_item(it, want, st, report)
+            # Hidden only while Android is off and not set up at all (a Waydroid you set up yourself,
+            # for example with ujust, stays visible).
+            quiet = {"hidden": [], "shown": [], "failed": report["failed"]}
+            builtin_item({**it, "name": "Waydroid"}, want, quiet, hide=not want and not android_ready())
+            report["menus"] = report["menus"] or quiet.get("menus", False)
+        elif it["kind"] == "builtin":
+            builtin_item(it, want, report)
         save_state(st)
+    if report.pop("menus"):
+        refresh_menus()
     vanished = report.pop("vanished")
     if len(vanished) > MAX_VANISHED:
         print(f"{len(vanished)} apps seem gone at once: not trusted this time (nothing changed for them).", flush=True)
@@ -358,13 +457,19 @@ def apply_all():
         parts.append("Installed: " + ", ".join(report["installed"]) + ".")
     if report["removed"]:
         parts.append("Deleted: " + ", ".join(report["removed"]) + ".")
+    if report["hidden"]:
+        parts.append("Hidden: " + ", ".join(report["hidden"]) + ".")
+    if report["shown"]:
+        parts.append("Shown again: " + ", ".join(report["shown"]) + ".")
     if report["failed"]:
         parts.append("Not done yet (tried again later): " + ", ".join(report["failed"]) + ".")
-    if report["installed"] or report["removed"]:
+    if report["installed"] or report["removed"] or report["hidden"] or report["shown"]:
         notify_users("Forge OS: apps updated", " ".join(parts) + " Change them in Forge Settings, Apps.")
     for p in parts:
         print(p, flush=True)
-    return 0
+    # 75 (try again later): systemd starts this again in a few minutes (Restart=on-failure), so an
+    # offline first boot, or Wi-Fi joined later in the wizard, still gets its apps soon.
+    return 75 if report["failed"] else 0
 
 
 # ---------- the wizard's choice ----------

@@ -2,7 +2,7 @@
 Description=Forge OS optional apps (install the ones switched on, delete the ones switched off)
 Documentation=file:///usr/libexec/forge-apps
 Wants=network-online.target
-After=network-online.target forge-apply-firstboot.service system-flatpak-setup.service
+After=network-online.target forge-apply-firstboot.service
 
 [Service]
 Type=oneshot
@@ -15,3 +15,11 @@ TimeoutStartSec=3h
 Nice=10
 IOSchedulingClass=idle
 PrivateTmp=yes
+# Exit 75 means "something is not done yet" (offline, Flathub down): not a failure, but it runs
+# again after 3 minutes, then waits longer each time, up to every 30 minutes.
+SuccessExitStatus=75
+RestartForceExitStatus=75
+Restart=on-failure
+RestartSec=3min
+RestartSteps=4
+RestartMaxDelaySec=30min

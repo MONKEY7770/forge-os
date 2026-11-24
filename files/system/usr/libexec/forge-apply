@@ -705,8 +705,6 @@ def apply(v):
     service("smartd.service", v["monitor.smart"])
 
     # Apps: default Flatpaks (not sure of the exact command name on every BlueBuild version)
-    if shutil.which("bluebuild-flatpak-manager"):
-        run("bluebuild-flatpak-manager", "enable" if v["apps.auto_reinstall"] else "disable", "all")
     # Optional apps (Forge Settings, Apps): installed or deleted in the background by forge-apps.
     run("systemctl", "--no-block", "start", "forge-apps.service")
 

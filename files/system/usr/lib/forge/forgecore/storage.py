@@ -115,9 +115,13 @@ def compute(total: int, free: int, models: int, pending: int, s: dict) -> dict:
 
 
 def problem_lines(r: dict) -> list[str]:
-    """One line per problem, for forge-health and the doctor (numbers rounded to whole GB)."""
+    """One line per problem, for forge-health and the doctor (numbers rounded to whole GB). With no
+    models on the PC, "too full" and "little room" are not problems (a small disk, such as a VM's, is
+    normal); a download is still refused with its reason."""
     out = []
     for p in r.get("problems") or []:
+        if p in ("reserve", "low") and r.get("models", 0) <= 0:
+            continue
         if p == "over_budget":
             out.append(f"AI models use {gb_int(r['models'])} GB, more than their limit of {gb_int(r['budget'])} GB")
         elif p == "reserve":
@@ -245,7 +249,7 @@ def state_doc(r: dict, models_dir: str, ts: float) -> dict:
     return {"ts": int(ts), "status": r["status"], "limit": r["limit"], "models_dir": models_dir,
             "disk_total_gb": gb_int(r["total"]), "disk_free_gb": gb_int(r["free"]),
             "reserve_gb": gb_int(r["reserve"]), "budget_gb": gb_int(r["budget"]),
-            "models_gb": gb_int(r["models"]), "room_gb": gb_int(r["room"]),
+            "models_gb": gb_int(r["models"]), "models_bytes": int(r["models"]), "room_gb": gb_int(r["room"]),
             "min_free_gb": gb_int(r["min_free"]), "need_free_gb": gb_int(r["need_free"]),
             "room_bytes": int(r["room"]),
             "problems": list(r["problems"]), "messages": problem_lines(r)}
@@ -283,8 +287,8 @@ def current(root: str = "") -> dict | None:
         n = {k: st[k] * GB for k in ("disk_total_gb", "disk_free_gb", "reserve_gb", "budget_gb", "models_gb",
                                      "min_free_gb")}
         return {"total": n["disk_total_gb"], "free": n["disk_free_gb"], "reserve": n["reserve_gb"],
-                "budget": n["budget_gb"], "models": n["models_gb"], "min_free": n["min_free_gb"],
-                "room": int(st["room_bytes"]), "status": str(st["status"]), "limit": str(st["limit"]),
+                "budget": n["budget_gb"], "models": int(st.get("models_bytes", n["models_gb"])),
+                "min_free": n["min_free_gb"], "room": int(st["room_bytes"]), "status": str(st["status"]), "limit": str(st["limit"]),
                 "problems": [p for p in st.get("problems", []) if p in ("over_budget", "reserve", "low")],
                 "need_free": int(st.get("need_free_gb", 0)) * GB, "models_dir": str(st.get("models_dir", "")), "from_state": True}
     except (KeyError, TypeError, ValueError):

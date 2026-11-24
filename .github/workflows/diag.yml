@@ -19,8 +19,12 @@ jobs:
           printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           docker run --rm --entrypoint bash ghcr.io/monkey7770/forge-os-universal:br-forge-test-candidate-45 -c '
             set +e
-            for f in /usr/libexec/bluebuild/default-flatpaks/system-flatpak-setup /usr/libexec/bazzite-flatpak-manager; do echo "=== $f"; cat "$f"; done
-            echo "=== config"; head -60 /usr/share/bluebuild/default-flatpaks/configuration.yaml
-            for f in 82-bazzite-waydroid 86-bazzite-windows 82-bazzite-apps; do echo "=== $f"; cat /usr/share/ublue-os/just/$f.just; done
-            echo "=== virt"; head -150 /usr/share/ublue-os/just/84-bazzite-virt.just
+            echo "== virt rpms"; rpm -qa | grep -iE "libvirt|qemu|swtpm|edk2|virt-|virglrenderer|looking|kvmfr|virtio" | sort
+            echo "== bins"; ls -l /usr/bin/virsh /usr/bin/virt-install /usr/bin/qemu-system-x86_64 /usr/libexec/qemu-kvm /usr/bin/swtpm 2>&1
+            echo "== ovmf"; ls /usr/share/edk2/ovmf/ 2>&1 | head; ls /usr/share/qemu/firmware/ 2>&1 | head
+            echo "== bazzite-libvirtd-setup"; cat /usr/lib/systemd/system/bazzite-libvirtd-setup.service 2>&1; cat /usr/libexec/bazzite-libvirtd-setup 2>/dev/null | head -40
+            echo "== waydroid nvidia (universal image)"; rpm -q waydroid-nvidia 2>&1; ls -l /usr/bin/waydroid-nvidia-setup 2>&1
           '
+      - name: NVIDIA image Waydroid
+        run: |
+          docker run --rm --entrypoint bash ghcr.io/monkey7770/forge-os:br-forge-test-candidate-45 -c 'rpm -q waydroid waydroid-nvidia 2>&1; ls -l /usr/bin/waydroid-nvidia-setup 2>&1; /usr/bin/waydroid-nvidia-setup --help 2>&1 | head -30'

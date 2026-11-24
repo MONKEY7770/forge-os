@@ -1,6 +1,6 @@
 name: diag
-# Temporary, test branch only: how the Flatpak installer decides what to install, and what Bazzite
-# ships for Android, virtual machines and retro gaming. No secrets.
+# Temporary, test branch only: what the virt-manager Flatpak and its QEMU extension contain, and the
+# NVIDIA image's Waydroid. No secrets.
 on:
   push:
     branches: [forge-test]
@@ -12,19 +12,20 @@ jobs:
       contents: read
       packages: read
     steps:
-      - name: Inspect the image
+      - name: virt-manager Flatpak contents
+        run: |
+          set +e
+          sudo apt-get -qq update >/dev/null && sudo apt-get -qq install -y flatpak >/dev/null
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive flathub org.virt_manager.virt-manager org.virt_manager.virt_manager.Extension.Qemu >/dev/null 2>&1; echo "install rc=$?"
+          A=$(flatpak info --user --show-location org.virt_manager.virt-manager); E=$(flatpak info --user --show-location org.virt_manager.virt_manager.Extension.Qemu)
+          echo "== app bin"; ls "$A/files/bin" | head -60
+          echo "== ext"; find "$E/files" -maxdepth 2 -type f -path '*bin*' | sed "s#$E/files/##" | head -60
+          echo "== swtpm/virsh/qemu anywhere"; find "$A/files" "$E/files" -name 'swtpm*' -o -name 'virsh' -o -name 'qemu-system-x86_64' -o -name 'virtqemud' -o -name 'libvirtd' | sed "s#$HOME##"
+          echo "== metadata"; flatpak info --user --show-metadata org.virt_manager.virt-manager | head -40
+      - name: NVIDIA image Waydroid
         env:
           REGISTRY_TOKEN: ${{ github.token }}
         run: |
-          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          docker run --rm --entrypoint bash ghcr.io/monkey7770/forge-os-universal:br-forge-test-candidate-45 -c '
-            set +e
-            echo "== virt rpms"; rpm -qa | grep -iE "libvirt|qemu|swtpm|edk2|virt-|virglrenderer|looking|kvmfr|virtio" | sort
-            echo "== bins"; ls -l /usr/bin/virsh /usr/bin/virt-install /usr/bin/qemu-system-x86_64 /usr/libexec/qemu-kvm /usr/bin/swtpm 2>&1
-            echo "== ovmf"; ls /usr/share/edk2/ovmf/ 2>&1 | head; ls /usr/share/qemu/firmware/ 2>&1 | head
-            echo "== bazzite-libvirtd-setup"; cat /usr/lib/systemd/system/bazzite-libvirtd-setup.service 2>&1; cat /usr/libexec/bazzite-libvirtd-setup 2>/dev/null | head -40
-            echo "== waydroid nvidia (universal image)"; rpm -q waydroid-nvidia 2>&1; ls -l /usr/bin/waydroid-nvidia-setup 2>&1
-          '
-      - name: NVIDIA image Waydroid
-        run: |
-          docker run --rm --entrypoint bash ghcr.io/monkey7770/forge-os:br-forge-test-candidate-45 -c 'rpm -q waydroid waydroid-nvidia 2>&1; ls -l /usr/bin/waydroid-nvidia-setup 2>&1; /usr/bin/waydroid-nvidia-setup --help 2>&1 | head -30'
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin >/dev/null
+          docker run --rm --entrypoint bash ghcr.io/monkey7770/forge-os:br-forge-test-candidate-45 -c 'rpm -q waydroid waydroid-nvidia 2>&1; ls -l /usr/bin/waydroid-nvidia-setup 2>&1; /usr/bin/waydroid-nvidia-setup --help 2>&1 | head -30' 2>&1 | grep -vE "Pulling|Waiting|Verifying|Download|Extracting|Digest|Status:|Pull complete|Already exists"
